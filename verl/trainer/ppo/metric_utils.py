@@ -222,6 +222,17 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    if "overlong_reward" in batch.non_tensor_batch:
+        import numpy as np
+
+        overlong_rewards = batch.non_tensor_batch["overlong_reward"]
+        metrics["reward/overlong_reward_mean"] = float(np.mean(overlong_rewards))
+        metrics["reward/overlong_reward_min"] = float(np.min(overlong_rewards))
+    if "overlong" in batch.non_tensor_batch:
+        import numpy as np
+
+        metrics["reward/overlong_rate"] = float(np.mean(batch.non_tensor_batch["overlong"]))
+
     return metrics
 
 

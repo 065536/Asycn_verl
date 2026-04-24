@@ -91,6 +91,10 @@ entropy_coeff: 0
 # When true, the actor forward will request entropy from the model
 calculate_entropy: false
 
+# Entropy bonus weighting mode: 'uniform' applies equal weight to all states.
+# 'advantage_variance' weights by per-prompt advantage variance (directed exploration).
+entropy_bonus_mode: uniform
+
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
 
@@ -158,6 +162,17 @@ optim:
   # Prioritized. None, 0 or Negative values mean delegating to lr_warmup_steps_ratio.
   lr_warmup_steps: -1
 
+  # LR scheduler type: "constant", "cosine", or "entropy_adaptive"
+  lr_scheduler_type: constant
+
+  # Minimum LR ratio floor for entropy_adaptive scheduler
+  entropy_adaptive_min_ratio: 0.1
+
+  # EMA smoothing factor for entropy_adaptive scheduler reference entropy (higher = smoother)
+  entropy_adaptive_ema_beta: 0.95
+
+  # Entropy-adaptive reference mode: "ema" (H_t/H_ref_ema) or "initial" (H_t/H_0)
+  entropy_adaptive_reference_mode: ema
 
 # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
 use_fused_kernels: ${oc.select:actor_rollout_ref.model.use_fused_kernels,false}

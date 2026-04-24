@@ -1170,7 +1170,10 @@ class RayPPOTrainer:
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
-            calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            calculate_entropy = (
+                self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+                or self.config.actor_rollout_ref.actor.optim.lr_scheduler_type == "entropy_adaptive"
+            )
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
@@ -1430,7 +1433,7 @@ class RayPPOTrainer:
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
-                                metrics.update(calculate_debug_metrics(batch))
+                                metrics.update(calculate_debug_metrics(batch, tokenizer=getattr(self, "tokenizer", None)))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
@@ -1594,6 +1597,27 @@ class RayPPOTrainer:
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+
+                # Fallback: compute ratio/ppo_kl percentile metrics from batch when not already
+                # logged by the actor update step (e.g., bypass_mode=False sync training where
+                # _build_ratio_kl_metrics results may not flow through the legacy worker dispatch).
+                # Uses old_log_probs (pre-update training model) vs rollout_log_probs to measure
+                # π_training / π_rollout staleness — ≈1 for sync, larger for async with staleness.
+                if (
+                    "actor/ratio_mean" not in metrics
+                    and "old_log_probs" in batch.batch
+                    and "rollout_log_probs" in batch.batch
+                ):
+                    import torch as _torch
+
+                    from verl.trainer.ppo.core_algos import _build_ratio_kl_metrics
+
+                    _old_lp = batch.batch["old_log_probs"]
+                    _rollout_lp = batch.batch["rollout_log_probs"]
+                    _response_mask = batch.batch["response_mask"]
+                    _neg_kl = _torch.clamp(_old_lp - _rollout_lp, min=-20.0, max=20.0)
+                    _ratio = _torch.exp(_neg_kl)
+                    metrics.update(_build_ratio_kl_metrics(_ratio, -_neg_kl, _response_mask))
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import json
 import logging
 import os
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -317,6 +319,42 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
 
+        # region agent log
+        try:
+            if torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info()
+                mem = {
+                    "cuda_mem_free_gib": round(free_b / (1024**3), 3),
+                    "cuda_mem_total_gib": round(total_b / (1024**3), 3),
+                    "cuda_allocated_gib": round(torch.cuda.memory_allocated() / (1024**3), 3),
+                    "cuda_reserved_gib": round(torch.cuda.memory_reserved() / (1024**3), 3),
+                }
+            else:
+                mem = {}
+            payload = {
+                "sessionId": "dc2587",
+                "runId": os.environ.get("VERL_DEBUG_RUN_ID", "pre-fix"),
+                "hypothesisId": "H1/H2/H3/H4",
+                "location": "verl/workers/engine_workers.py:EngineWorker.train_batch:entry",
+                "message": "train_batch entry stats",
+                "data": {
+                    "disable_auto_offload": bool(disable_auto_offload),
+                    "use_remove_padding": tu.get(data, "use_remove_padding", default=None),
+                    "use_dynamic_bsz": tu.get(data, "use_dynamic_bsz", default=None),
+                    "max_token_len_per_gpu": tu.get(data, "max_token_len_per_gpu", default=None),
+                    "micro_batch_size_per_gpu": tu.get(data, "micro_batch_size_per_gpu", default=None),
+                    "loss_mask_tokens": int(data["loss_mask"].sum().item()) if "loss_mask" in data.keys() else None,
+                    "num_seqs_global_token_num": len(global_token_num) if global_token_num is not None else None,
+                    **mem,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            with open("/data/250010176/codes/verl/.cursor/debug-dc2587.log", "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        # endregion
+
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
@@ -329,6 +367,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
         if update_lr_scheduler:
+            # For entropy-adaptive LR: feed current entropy into scheduler before stepping
+            if hasattr(self.engine, "update_entropy_for_lr"):
+                raw_metrics = output.get("metrics", {})
+                entropy_vals = raw_metrics.get("actor/entropy", None)
+                if entropy_vals is not None:
+                    if isinstance(entropy_vals, list) and len(entropy_vals) > 0:
+                        current_entropy = sum(entropy_vals) / len(entropy_vals)
+                    else:
+                        current_entropy = float(entropy_vals)
+                    self.engine.update_entropy_for_lr(current_entropy)
             lr = self.engine.lr_scheduler_step()
         else:
             lr = None

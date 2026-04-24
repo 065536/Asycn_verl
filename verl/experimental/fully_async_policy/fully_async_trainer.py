@@ -125,6 +125,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        from verl.utils.tracking import ValidationGenerationsLogger
+
+        self.validation_generations_logger = ValidationGenerationsLogger(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+        )
+
         # ==================== fully async config ====================
 
         self.message_queue_client = None
@@ -596,6 +603,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 )
         self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
 
+        if val_metrics.val_samples:
+            self.validation_generations_logger.log(
+                self.config.trainer.logger, val_metrics.val_samples, self.current_param_version
+            )
+
     def _fit_save_checkpoint(self, force=False):
         if self.current_param_version == self.last_ckpt_version:
             return
@@ -752,6 +764,28 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await self.colocate_checkpoint_manager.sleep_replicas()
 
         return self.current_param_version
+
+    def _fit_collect_metrics(self, batch):
+        super()._fit_collect_metrics(batch)
+        if "rollout_log_probs" in batch.batch and "old_log_probs" in batch.batch:
+            from verl.utils.debug.metrics import calculate_debug_metrics
+
+            self.metrics.update(calculate_debug_metrics(batch, tokenizer=getattr(self, "tokenizer", None)))
+
+        # When algorithm.rollout_correction.bypass_mode=True (FA default), the old_log_prob
+        # recomputation step is skipped, so actor/entropy is never logged.
+        # Approximate it as the negative mean log-prob of sampled response tokens:
+        #   -E[log π(a|s)] over valid tokens ≈ empirical entropy of the policy.
+        # As the policy peaks (entropy collapses), sampled token log-probs rise toward 0,
+        # so this proxy decreases in sync with true entropy.
+        if "actor/entropy" not in self.metrics and "old_log_probs" in batch.batch:
+            lp_key = "old_log_probs"
+            if "response_mask" in batch.batch:
+                lp = batch.batch[lp_key]
+                mask = batch.batch["response_mask"].bool()
+                valid_lp = lp[mask].float()
+                if valid_lp.numel() > 0:
+                    self.metrics["actor/entropy"] = (-valid_lp.mean()).item()
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """

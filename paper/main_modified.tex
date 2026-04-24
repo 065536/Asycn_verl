@@ -1,0 +1,646 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{setspace}
+\usepackage{titlesec}
+
+\setstretch{1.15}
+\setlist[itemize]{topsep=3pt,itemsep=2pt,leftmargin=2em}
+\setlist[enumerate]{topsep=3pt,itemsep=2pt,leftmargin=2.2em}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.75em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.75em}{}
+
+\title{Reconstructed Project Logic\\[0.4em]
+\large Fixed Update Rules, Effective Learning Information, and Bidirectional Learning-Rate Control}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{One-paragraph version}
+
+The problem should no longer be framed as ``entropy decreases, so the learning rate should also decrease,'' nor as a story centered on support. A more accurate formulation is the following:
+
+\begin{quote}
+In RL, the objective itself does not change, but every update can only be approximated through policy-induced samples. Therefore, training quality depends on how much \textbf{effective learning information} the current batch contains. This quantity is not constant; it changes across training phases. Fixed update rules, especially a fixed learning rate together with hard clipping, ignore that change and can therefore harm both stability and performance.
+\end{quote}
+
+Accordingly, the method should not be described as ``entropy-based monotone learning-rate decay.'' Instead, it should be framed as:
+
+\begin{quote}
+\textbf{phase-aware, bidirectional learning-rate control}: use online signals to determine whether the current update budget is underestimated or overestimated, and then adjust update aggressiveness in both directions.
+\end{quote}
+
+Within this framework, \textbf{learning rate is the controller, clipping is the detector, and entropy is at most a phase signal.}
+
+\section{A new starting point: RL as sample-based optimization under policy-induced sampling}
+
+The central difficulty of RL is not that the objective is ill-defined, but that the objective cannot be computed exactly. In practice, every update is built from samples induced by the current policy, and then used to update the parameters:
+\[
+\theta_{t+1}=\theta_t+\alpha_t \hat g_t.
+\]
+
+Here, $\hat g_t$ is not the exact gradient. It is an estimate constructed from the current batch.
+
+This immediately gives the first basic principle:
+
+\begin{quote}
+\textbf{Whether an update is reliable depends first on whether the sample-based evidence behind that step is reliable enough.}
+\end{quote}
+
+In other words, RL training is first and foremost an \textbf{optimization problem under evidence constraints}.
+
+\section{Formal derivation: signal fraction and optimal learning rate}
+
+This section derives, without gaps, the quantity that determines how large a learning rate is safe at each step of training.
+The derivation proceeds in four stages: gradient estimation quality, per-step improvement bound, the signal fraction, and a practical estimator.
+
+\subsection{Mean squared error of the gradient estimator}
+
+Let $X_i := A_i \nabla_\theta \log \pi_{\theta_t}(\tau_i) \in \mathbb{R}^d$ be the $i$-th per-sample gradient contribution, where $\tau_i \overset{\text{i.i.d.}}{\sim} \pi_{\theta_t}$ and $A_i = R(\tau_i) - b_t$ is the advantage with baseline $b_t$.
+The batch estimator is
+\[
+    \hat{g}_t = \frac{1}{n}\sum_{i=1}^n X_i,
+    \qquad \mathbb{E}[\hat{g}_t] = g_t \quad \text{(unbiased)}.
+\]
+Since the $X_i$ are i.i.d.\ with mean $g_t$, the centered variables $X_i - g_t$ are independent and mean-zero.
+Expanding the squared norm and using independence to eliminate cross-terms ($i \neq j$):
+\[
+    \mathbb{E}\bigl[\|\hat{g}_t - g_t\|^2\bigr]
+    = \frac{1}{n^2}\sum_{i=1}^n \mathbb{E}\bigl[\|X_i - g_t\|^2\bigr]
+    = \frac{1}{n}\,\mathbb{E}\bigl[\|X - g_t\|^2\bigr]
+    = \frac{\sigma_t^2}{n},
+\]
+where $\sigma_t^2 := \operatorname{tr}(\Sigma_t)$ is the total per-sample variance and $\Sigma_t = \operatorname{Cov}_{\pi_{\theta_t}}[X]$.
+
+\paragraph{Effective sample size.}
+The derivation above assumes all $n$ draws are statistically independent.
+When the policy is concentrated, many rollouts are identical, contributing no additional information.
+The effective number of independent samples is
+\[
+    n_\mathrm{eff}(t) \;:=\; \mathbb{E}[K_n] \;\approx\; \min\bigl(n,\; e^{H(\pi_{\theta_t})}\bigr),
+\]
+where $K_n$ is the number of \emph{distinct} trajectories among the $n$ draws and $H(\pi_{\theta_t})$ is the response-level entropy.
+Replacing $n$ with $n_\mathrm{eff}$ gives the effective MSE:
+\begin{equation}
+    \mathbb{E}\bigl[\|\hat{g}_t - g_t\|^2\bigr] \;\approx\; \frac{\sigma_t^2}{n_\mathrm{eff}(t)}.
+    \label{eq:mse}
+\end{equation}
+
+\subsection{Per-step expected improvement bound}
+
+Assume $J(\theta)$ is $L$-smooth.
+The descent lemma states that for any $\theta, \theta'$:
+\[
+    J(\theta') \geq J(\theta) + \nabla J(\theta)^\top(\theta' - \theta) - \frac{L}{2}\|\theta'-\theta\|^2.
+\]
+Substituting $\theta' = \theta_t + \alpha \hat{g}_t$ and $\nabla J(\theta_t) = g_t$:
+\[
+    J(\theta_{t+1}) \geq J(\theta_t) + \alpha\, g_t^\top \hat{g}_t - \frac{\alpha^2 L}{2}\|\hat{g}_t\|^2.
+\]
+Taking expectation over $\hat{g}_t$ requires two quantities.
+The first uses unbiasedness:
+\[
+    \mathbb{E}[g_t^\top \hat{g}_t] = g_t^\top \mathbb{E}[\hat{g}_t] = \|g_t\|^2.
+\]
+The second decomposes $\hat{g}_t = g_t + (\hat{g}_t - g_t)$:
+\begin{align*}
+    \mathbb{E}[\|\hat{g}_t\|^2]
+    &= \mathbb{E}[\|g_t + (\hat{g}_t - g_t)\|^2] \\
+    &= \|g_t\|^2 + 2\,g_t^\top \underbrace{\mathbb{E}[\hat{g}_t - g_t]}_{=\,0} + \mathbb{E}[\|\hat{g}_t - g_t\|^2] \\
+    &= \|g_t\|^2 + \frac{\sigma_t^2}{n_\mathrm{eff}}.
+\end{align*}
+Assembling the two expectations:
+\begin{equation}
+    \mathbb{E}[J(\theta_{t+1})] - J(\theta_t)
+    \;\geq\;
+    \alpha\|g_t\|^2 - \frac{\alpha^2 L}{2}\!\left(\|g_t\|^2 + \frac{\sigma_t^2}{n_\mathrm{eff}}\right).
+    \label{eq:bound}
+\end{equation}
+The right-hand side is a downward-opening quadratic in $\alpha$.
+Differentiating and setting equal to zero gives the \textbf{optimal step size}:
+\begin{equation}
+    \alpha^*(t)
+    = \frac{\|g_t\|^2}{L\!\left(\|g_t\|^2 + \sigma_t^2/n_\mathrm{eff}(t)\right)}.
+    \label{eq:alphaopt}
+\end{equation}
+
+\subsection{The signal fraction $r_t$}
+
+Define the \textbf{signal fraction}:
+\begin{equation}
+    r_t \;:=\; \frac{\|g_t\|^2}{\|g_t\|^2 + \sigma_t^2/n_\mathrm{eff}(t)} \;\in\; (0,\,1].
+    \label{eq:rt}
+\end{equation}
+Then $\alpha^*(t) = r_t / L$.
+
+To see why $r_t$ is the central quantity, factor the bound~\eqref{eq:bound}.
+Let $D_t := \|g_t\|^2 + \sigma_t^2/n_\mathrm{eff} > 0$; then:
+\[
+    \mathbb{E}[J(\theta_{t+1})] - J(\theta_t)
+    \;\geq\;
+    D_t \cdot \alpha \!\left[r_t - \frac{\alpha L}{2}\right].
+\]
+Since $D_t > 0$ and $\alpha > 0$, the expected improvement is positive if and only if
+\[
+    \alpha \;<\; \frac{2r_t}{L} \;=\; 2\alpha^*(t).
+\]
+The absolute magnitudes of $\|g_t\|^2$ and $\sigma_t^2/n_\mathrm{eff}$ carry no additional information:
+only their ratio enters the safe-zone condition.
+As training progresses, $n_\mathrm{eff}(t)$ decreases, $r_t$ decreases, and $\alpha^*(t)$ decreases proportionally.
+A fixed learning rate therefore eventually exceeds $2\alpha^*(t)$, causing expected-negative updates.
+
+\paragraph{Connection to discriminability.}
+$r_t$ is a precise formalization of the discriminability notion introduced in Section~\ref{sec:eli}.
+When all rollouts are identical ($n_\mathrm{eff} = 1$, policy fully concentrated), $\sigma_t^2/n_\mathrm{eff}$ dominates and $r_t \to 0$: the gradient estimate is pure noise.
+When rollouts are diverse ($n_\mathrm{eff} \approx n$), $r_t \to 1$: the gradient estimate reliably points in the true direction.
+
+\subsection{Estimating $r_t$ in practice: the split-batch estimator}
+
+\paragraph{The challenge.}
+We observe $\hat{g}_t$ but not $g_t$.
+Since $\mathbb{E}[\|\hat{g}_t\|^2] = \|g_t\|^2 + \sigma_t^2/n_\mathrm{eff}$, the squared gradient norm confounds signal and noise and cannot identify $r_t$ on its own.
+
+\paragraph{Key tool: cross-term of independent estimators.}
+Suppose $\hat{g}_A$ and $\hat{g}_B$ are two \emph{independent} unbiased estimators of $g_t$.
+By independence:
+\[
+    \mathbb{E}[\hat{g}_A^\top \hat{g}_B]
+    = \mathbb{E}[\hat{g}_A]^\top \mathbb{E}[\hat{g}_B]
+    = \|g_t\|^2.
+\]
+The cross-product $\hat{g}_A^\top \hat{g}_B$ is therefore an \textbf{unbiased estimator of $\|g_t\|^2$}.
+The noise terms cancel by independence, while $\|\hat{g}_A\|^2$ and $\|\hat{g}_B\|^2$ each estimate $\|g_t\|^2 + \sigma_t^2/n_\mathrm{eff,half}$.
+
+\paragraph{Estimator.}
+Split the current batch into two non-overlapping halves A and B and compute:
+\begin{equation}
+    \hat{r}_t
+    = \frac{\hat{g}_A^\top \hat{g}_B}{\dfrac{\|\hat{g}_A\|^2 + \|\hat{g}_B\|^2}{2}}.
+    \label{eq:rt-est}
+\end{equation}
+The numerator is an unbiased estimate of $\|g_t\|^2$; the denominator estimates $\|g_t\|^2 + \sigma_t^2/n_\mathrm{eff,half}$.
+
+\paragraph{Key requirement.}
+The only condition for validity is that $\hat{g}_A$ and $\hat{g}_B$ are generated under the \emph{same} $\theta_t$.
+The two halves may contain entirely different prompts; shared prompts are not required.
+In particular, any two rollout batches generated from the same model checkpoint are valid inputs to~\eqref{eq:rt-est}, regardless of whether they share any prompts.
+Batches from \emph{different} training steps cannot be used, because updating $\theta$ changes $g_t$.
+
+\paragraph{Practical variants.}
+\begin{itemize}
+    \item \textbf{Prompt split}: assign half the prompts (and all their rollouts) to each group.
+          No additional rollout cost; each half gradient is computed from an independent subset of the existing batch.
+    \item \textbf{Two independent batches}: generate two separate batches at the same $\theta_t$.
+          Each half has full prompt diversity, yielding a more stable estimate, at the cost of roughly double the rollout generation.
+\end{itemize}
+
+\subsection{What $r_t$ solves and what it does not: shape vs.\ scale}
+\label{sec:shape-scale}
+
+The split-batch estimator gives us $\hat{r}_t$ at each step.
+Suppose we use it to set the learning rate as $\alpha(t) = \alpha(0) \cdot r_t / r_0$.
+Unrolling this:
+\[
+    \alpha(t) = \frac{\alpha(0)}{r_0} \cdot r_t =: C \cdot r_t.
+\]
+Comparing to the target $\alpha^*(t) = r_t / L$, the ratio is:
+\[
+    \frac{\alpha(t)}{\alpha^*(t)} = C \cdot L = \frac{\alpha(0) \cdot L}{r_0}.
+\]
+This ratio is \emph{constant}---it does not change over time.
+Tracking $r_t$ correctly reproduces the \textbf{shape} of $\alpha^*(t)$ (how much it decreases, and when), but the absolute \textbf{scale} is fixed by the initialization $\alpha(0)$ and the unknown $L$.
+If the initialization is wrong, the error is preserved indefinitely: pure $r_t$ tracking cannot self-correct.
+
+This gives a clean decomposition of what needs to be solved:
+\begin{enumerate}
+    \item \textbf{Shape}: how should $\alpha$ change relative to its current value as training progresses? --- answered by $\hat{r}_t$.
+    \item \textbf{Scale}: what is the correct absolute magnitude of $\alpha$? --- requires additional information about $1/L$.
+\end{enumerate}
+
+\section{The core object: effective learning information}
+\label{sec:eli}
+
+To replace the old, overly abstract support notion, we introduce a cleaner middle-layer object:
+\[
+\textbf{effective learning information}.
+\]
+
+This is not the nominal batch size, nor simply the number of samples. Even with a fixed batch size, the amount of learning information that truly supports the update may differ dramatically across training stages.
+
+A useful conceptual decomposition is:
+\[
+\text{ELI}_t \approx \text{Relevance}_t \times \text{Discriminability}_t \times \text{Coverage}_t.
+\]
+
+\subsection{Relevance}
+
+Is the current batch still relevant to the current policy update?
+
+If the data are stale, off-policy, generated by an older model version, or if the rollout policy and the training policy have drifted apart, then the batch may no longer answer the question ``what should the current policy learn next?''
+
+This is exactly where the following phenomena belong:
+\begin{itemize}
+    \item the difference between sync and async;
+    \item stale data;
+    \item sample-policy mismatch;
+    \item train--inference mismatch.
+\end{itemize}
+
+Hence, sync and async are not different diseases. They differ in degree:
+\begin{quote}
+\textbf{both affect the relevance of current evidence, but async typically degrades it more severely.}
+\end{quote}
+
+\subsection{Discriminability}
+
+Does the current batch still contain enough contrastive information to distinguish which directions are worth updating?
+
+As the policy sharpens, samples become more homogeneous, alternative branches appear less often, and gradient contributions concentrate on fewer samples or tokens. As a result, the nominal batch size may stay fixed while the amount of information that can actually change the policy direction decreases.
+
+This is more precise than simply saying ``advantage becomes less informative.'' What we really mean is:
+
+\begin{quote}
+\textbf{the fraction of contrastive, policy-shaping information in the batch decreases over training, so the effective batch size shrinks.}
+\end{quote}
+
+\subsection{Coverage}
+
+Does the current batch still cover directions that are potentially important but not yet fully developed?
+
+Some branches are not ``already clearly better but underweighted.'' Instead, their value only becomes visible after repeated visitation and further training of downstream continuations. If policy sharpening cuts off those branches too early, the system loses not only current evidence, but also the ability to continue developing their latent potential.
+
+This is the deeper meaning of exploration contraction: it is not merely ``less exploration,'' but rather \textbf{a shrinking coverage of learnable directions in future data.}
+
+\section{The real problem: fixed update rules assume stationary information}
+
+The problem can now be compressed into one sentence:
+
+\begin{quote}
+\textbf{Fixed update rules implicitly assume that the quality of learning evidence available at each step is roughly constant, but in RL this assumption is often false.}
+\end{quote}
+
+Because training is policy-coupled, the effective learning information contained in future batches changes as the policy changes:
+\begin{itemize}
+    \item relevance may degrade because of staleness or mismatch;
+    \item discriminability may decrease as sampled behavior contracts;
+    \item coverage may shrink as alternative branches disappear.
+\end{itemize}
+
+Therefore, the core problem with a fixed learning rate is not merely that it may sometimes be too large. It is that:
+
+\begin{quote}
+\textbf{a fixed learning rate is phase-mismatched.}
+\end{quote}
+
+The same step size may be too small early in training and too large later in training.
+
+\section{Why this is a performance problem, not only a stability problem}
+
+If the issue were only that a large step size may cause collapse, then the work would be mostly a stability patch. But the deeper issue is that practitioners often use a globally conservative learning rate precisely to avoid late-stage collapse.
+
+This creates a structural cost:
+\begin{itemize}
+    \item to remain safe later, the system moves too slowly in early phases where it could have optimized more aggressively;
+    \item if the global LR is increased to exploit the information-rich early phase, later optimization becomes too aggressive.
+\end{itemize}
+
+Thus a fixed learning rate hurts in two symmetric ways:
+\begin{enumerate}
+    \item it may be too large late in training, causing instability;
+    \item it may be too small early in training, suppressing achievable performance.
+\end{enumerate}
+
+Therefore, the work should not only claim improved stability. It should claim:
+
+\begin{quote}
+\textbf{an improved stability--performance frontier through phase-aware update control.}
+\end{quote}
+
+\section{Where clipping enters the story}
+
+Clipping should not be the primary method object, but it cannot be ignored. The cleanest positioning is:
+
+\begin{quote}
+\textbf{clipping is the detection point of update-rule mismatch and the mechanism window through which information truncation becomes visible.}
+\end{quote}
+
+\subsection{Why clipping matters}
+
+In PPO- or GRPO-style objectives, ratio clipping decides which sample-level updates are still trusted and which are forcibly truncated. Therefore, clipping statistics are not merely measures of policy movement. They directly measure:
+
+\begin{quote}
+\textbf{how much of the proposed update has already moved outside the region that the algorithm itself still considers trustworthy.}
+\end{quote}
+
+By contrast, KL is more of a geometric distance measure. Clipping is closer to what this project actually cares about:
+\begin{quote}
+\textbf{whether effective gradient information is being systematically truncated.}
+\end{quote}
+
+\subsection{How clipping makes the failure of fixed LR visible}
+
+When a fixed LR is too large for the current phase, the following chain becomes more likely:
+\[
+\text{LR too large}
+\Rightarrow
+\text{ratio spread increases}
+\Rightarrow
+\text{more tokens are clipped}
+\Rightarrow
+\text{effective gradient information is truncated}
+\Rightarrow
+\text{performance saturates or degrades}.
+\]
+
+Therefore clipping is best viewed as:
+\begin{itemize}
+    \item a symptom of phase mismatch;
+    \item a mechanism of information loss;
+    \item a feedback signal for learning-rate control.
+\end{itemize}
+
+\section{The proposed framework: feedforward shape + feedback scale}
+
+Section~\ref{sec:shape-scale} established that $\hat{r}_t$ solves the shape problem but not the scale problem.
+Directly estimating $L$ to recover the scale is rejected for three reasons.
+First, $L$ is a global Lipschitz constant, but what training actually needs is the local effective curvature, which changes as the policy, sampling distribution, and advantage distribution all evolve.
+Second, the finite-difference estimator $\hat{L}_t \approx \|\hat{g}_t - \hat{g}_{t-1}\| / (\alpha_{t-1}\|\hat{g}_{t-1}\|)$ amplifies gradient noise directly: the numerator conflates true gradient change with the difference of two noisy estimates, and the bias is worst exactly when $n_\mathrm{eff}$ is small and accurate estimation is most needed.
+Third, Lipschitz upper bounds are inherently conservative, which would systematically suppress $\alpha_t$ below what is actually safe.
+
+The alternative is a \textbf{closed-loop} approach: use $\hat{r}_t$ as a feedforward signal for the shape, and let a feedback controller correct the absolute scale.
+
+\subsection{Feedforward + feedback decomposition}
+
+Write the learning rate as:
+\begin{equation}
+    \alpha_t = c_t \cdot \hat{r}_t,
+    \label{eq:framework}
+\end{equation}
+where:
+\begin{itemize}
+    \item $\hat{r}_t \in (0,1]$ is the split-batch signal fraction from~\eqref{eq:rt-est}, handling time-varying shape.
+    \item $c_t > 0$ is a scale factor updated by a feedback controller, targeting $c_t \to 1/L$.
+\end{itemize}
+
+Since $r_t$ handles all the systematic time variation in $\alpha^*(t)$, the scale $c_t$ should be a \textbf{slow-moving} quantity: if the controller is working correctly, $c_t$ drifts toward $1/L$ and then stays there.
+Persistent large oscillations in $c_t$ indicate either that $\hat{r}_t$ is too noisy, or that the feedback signal is not isolating the scale error.
+
+\subsection{Why clipping cannot be the feedback signal for $c_t$}
+
+Clipping fraction reflects the total magnitude of $\alpha_t\|\hat{g}_t\|$, which already incorporates $\hat{r}_t$.
+When the policy concentrates and $\hat{r}_t$ falls, $\alpha_t$ automatically shrinks and clipping pressure drops---even if $c_t$ is miscalibrated.
+Clipping therefore cannot distinguish a correctly-scaled $\alpha_t$ from one where $c_t$ is wrong but $\hat{r}_t$ is compensating.
+The feedback signal for $c_t$ must isolate the scale error from the shape variation that $\hat{r}_t$ already handles.
+
+\subsection{The held-out surrogate realization ratio $\phi_t$}
+
+The improvement bound~\eqref{eq:bound} already decomposes each step into a first-order gain and a second-order penalty.
+This decomposition can be measured directly from the existing split-batch structure, without additional rollouts.
+
+\paragraph{Setup.}
+Use half-batch $A$ to define the update direction and half-batch $B$ as a held-out evaluator:
+\[
+    \theta_{t+1} = \theta_t + \alpha_t \hat{g}_A, \qquad \alpha_t = c_t\hat{r}_t.
+\]
+
+\paragraph{Predicted gain.}
+The first-order Taylor expansion of $\mathcal{L}_B$ at $\theta_t$ gives:
+\[
+    \mathcal{L}_B(\theta_{t+1}) \approx \mathcal{L}_B(\theta_t) + \nabla\mathcal{L}_B(\theta_t)^\top(\theta_{t+1}-\theta_t)
+    = \mathcal{L}_B(\theta_t) + \alpha_t\,\hat{g}_B^\top\hat{g}_A.
+\]
+Define the \textbf{predicted gain}:
+\begin{equation}
+    p_t := \alpha_t\,\hat{g}_B^\top\hat{g}_A.
+    \label{eq:pred-gain}
+\end{equation}
+Since $\mathbb{E}[\hat{g}_B^\top\hat{g}_A] = \|g_t\|^2$ (by independence of $A$ and $B$), we have $\mathbb{E}[p_t] = \alpha_t\|g_t\|^2$, which is exactly the first-order signal term in~\eqref{eq:bound}.
+
+\paragraph{Actual gain.}
+Define the \textbf{held-out surrogate gain}:
+\begin{equation}
+    a_t := \mathcal{L}_B(\theta_{t+1}) - \mathcal{L}_B(\theta_t).
+    \label{eq:actual-gain}
+\end{equation}
+This requires one additional forward pass on batch $B$ after the update; no new rollouts are needed.
+
+\paragraph{Realization ratio.}
+Define the \textbf{realization ratio}:
+\begin{equation}
+    \phi_t := \frac{a_t}{p_t + \varepsilon},
+    \label{eq:phi}
+\end{equation}
+where $\varepsilon > 0$ is a small regularizer.
+$\phi_t$ measures what fraction of the first-order predicted gain was actually realized by the step.
+
+\subsection{Derivation of the target $\phi^* = 1/2$}
+
+We now show that $\phi^* = 1/2$ is not an empirical choice but a direct consequence of the improvement bound.
+
+\paragraph{Step 1: Rewrite the bound in terms of $r_t$.}
+Let $D_t := \|g_t\|^2 + \sigma_t^2/n_\mathrm{eff}$ and recall $r_t = \|g_t\|^2/D_t$, so $D_t = \|g_t\|^2/r_t$.
+Substituting into~\eqref{eq:bound}:
+\[
+    f(\alpha) := \alpha\|g_t\|^2 - \frac{\alpha^2 L}{2}\cdot\frac{\|g_t\|^2}{r_t}
+    = \alpha\|g_t\|^2\!\left(1 - \frac{\alpha L}{2r_t}\right).
+\]
+
+\paragraph{Step 2: Express $\phi_t$ from the bound.}
+Using $p_t \approx \alpha_t\|g_t\|^2$ and $a_t \approx f(\alpha_t)$:
+\[
+    \phi_t \approx \frac{f(\alpha_t)}{\alpha_t\|g_t\|^2} = 1 - \frac{\alpha_t L}{2r_t}.
+\]
+
+\paragraph{Step 3: Substitute $\alpha_t = c_t\hat{r}_t \approx c_t r_t$.}
+\[
+    \phi_t \approx 1 - \frac{c_t r_t L}{2r_t} = 1 - \frac{c_t L}{2}.
+\]
+\textbf{$r_t$ cancels exactly.}
+This is not an approximation artifact: $r_t$ appears in both the curvature penalty (numerator) and the step size (via $\alpha_t = c_t r_t$) at the same order, and cancels upon division.
+The realization ratio $\phi_t$ reflects only the scale mismatch $c_t L$, not the time-varying shape $r_t$.
+
+\paragraph{Step 4: Fixed point.}
+Setting $c_t = 1/L$ (the target scale):
+\begin{equation}
+    \phi^* = 1 - \frac{(1/L) \cdot L}{2} = 1 - \frac{1}{2} = \frac{1}{2}.
+    \label{eq:phi-star}
+\end{equation}
+The target $\phi^* = 1/2$ is determined entirely by the improvement bound structure.
+
+\subsection{$\phi_t$ as a position encoding of step quality}
+
+More generally, if $\alpha_t = \beta \cdot \alpha^*(t)$ for some $\beta > 0$, then:
+\[
+    \phi_t \approx 1 - \frac{\beta}{2}.
+\]
+
+\begin{center}
+\begin{tabular}{cll}
+\toprule
+$\beta = \alpha_t/\alpha^*(t)$ & $\phi_t$ & Interpretation \\
+\midrule
+$< 1$ & $> 1/2$ & Step too conservative \\
+$= 1$ & $= 1/2$ & Optimal step \\
+$> 1$ & $< 1/2$ & Step too aggressive \\
+$= 2$ & $= 0$ & Boundary of positive expected improvement \\
+$> 2$ & $< 0$ & Overshoot: expected improvement negative \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+$\phi_t$ is a monotone function of $\alpha_t/\alpha^*(t)$: it encodes where the current step sits relative to the optimal step, independent of training phase.
+
+\subsection{The scale controller}
+
+The complete update rule for $c_t$ is:
+\begin{equation}
+    c_{t+1} = c_t \cdot \exp\!\bigl(\eta_c\,(\bar\phi_t - \phi^*)\bigr),
+    \label{eq:ct-update}
+\end{equation}
+where $\phi^* = 1/2$, $\eta_c > 0$ is small, and $\bar\phi_t$ is a smoothed version of $\phi_t$.
+
+\paragraph{Why multiplicative.}
+$c_t$ is a scale factor and must remain positive.
+A multiplicative update ensures $c_t > 0$ always, and is the natural analogue of gradient descent on $\log c_t$.
+Additive updates would make the correction magnitude independent of the current scale, which is undesirable.
+
+\paragraph{Why $c_t$ must be slow.}
+Since $L$ is approximately constant, $c_t$ should converge once and remain stable.
+The time scale of $c_t$ should be much slower than $\hat{r}_t$ (which refreshes every step).
+A small $\eta_c$ naturally enforces this; $\bar\phi_t$ should additionally be smoothed with an EMA to suppress batch noise.
+
+\paragraph{Fixed point verification.}
+At the fixed point $\bar\phi_t = \phi^* = 1/2$, equation~\eqref{eq:ct-update} gives $c_{t+1} = c_t$.
+From $\phi_t \approx 1 - c_t L/2 = 1/2$, we obtain $c_t = 1/L$, confirming that the controller's fixed point is exactly the target scale.
+
+\subsection{Practical protections}
+\label{sec:protections}
+
+Three safeguards are necessary for stable operation.
+
+\textbf{Protection 1: Skip updates when $p_t$ is unreliable.}
+When $p_t = \alpha_t\hat{g}_B^\top\hat{g}_A \leq p_\mathrm{min}$ (near zero or negative), the ratio $\phi_t$ is dominated by noise.
+This occurs when $n_\mathrm{eff}$ is small and the two half-batch gradient estimates are poorly aligned.
+In such cases, skip the $c_t$ update for that step.
+
+\textbf{Protection 2: Clip and smooth $\phi_t$ before use.}
+\[
+    \tilde\phi_t = \mathrm{clip}(\phi_t,\,\phi_\mathrm{min},\,\phi_\mathrm{max}),
+    \qquad
+    \bar\phi_t = (1-\beta)\bar\phi_{t-1} + \beta\tilde\phi_t.
+\]
+The EMA $\bar\phi_t$ prevents $c_t$ from chasing step-level noise.
+
+\textbf{Protection 3: Bound $c_t$ away from zero.}
+Enforce $c_t \in [c_\mathrm{min}, c_\mathrm{max}]$ to prevent collapse or explosion of the scale factor.
+
+\subsection{Why $\phi^*$ should not depend on $r_t$}
+
+Step 3 above shows that $r_t$ cancels in $\phi_t$ precisely because $\hat{r}_t$ is already absorbing the shape variation.
+If $\phi^*$ were made to depend on $r_t$, it would re-introduce shape information into the scale controller, breaking the clean separation between feedforward and feedback.
+$r_t$ handles shape; $\phi_t$ handles scale; keeping them separate is the design principle.
+
+If $\phi_t$ is observed to drift in experiments, the correct interpretation is not that $\phi^*$ should vary with $r_t$, but that the effective local curvature $L_\mathrm{eff,t}$ is itself drifting slowly.
+In that case, $c_t$ is correctly tracking $1/L_\mathrm{eff,t}$, which is exactly the intended behavior.
+
+\subsection{What entropy can still do}
+
+Entropy does not need to disappear completely, but it should no longer directly determine the learning rate.
+A more appropriate role is as a \textbf{phase signal} that modulates the controller's tolerance bands ($c_\mathrm{min}$, $c_\mathrm{max}$, or the EMA decay $\beta$): in a high-entropy early phase a wider band may be acceptable; in a low-entropy late phase the band can be tightened.
+Entropy is demoted from primary controller to auxiliary phase signal.
+
+\section{The unified causal chain}
+
+After reconstruction, the complete logic should read as a continuous chain:
+
+\begin{enumerate}
+    \item RL optimizes a fixed trajectory-expectation objective.
+    \item Because this objective cannot be computed exactly, every update must rely on policy-induced samples.
+    \item Therefore, update quality depends on how much effective learning information the current batch contains.
+    \item This information is not constant; it changes through relevance degradation and discriminability/coverage contraction.
+    \item A fixed learning rate ignores this phase change, and may therefore be too small in some phases and too large in others.
+    \item When the fixed LR is too large for the current phase, PPO-style optimization enters a high-clipping regime.
+    \item In that regime, informative gradients are increasingly truncated, so training may still appear active while useful policy improvement saturates.
+    \item Therefore, the correct intervention is not one-way learning-rate decay as entropy falls, but bidirectional adaptation of update aggressiveness based on online evidence.
+\end{enumerate}
+
+\section{How the contributions should now be stated}
+
+Under this reconstruction, the contributions can be written in three parts.
+
+\subsection*{Contribution 1: Problem reformulation}
+
+We reformulate RL training instability and optimization inefficiency as:
+\begin{quote}
+\textbf{a mismatch problem between fixed update rules and changing batch information quality}
+\end{quote}
+rather than as a support-shrinkage problem.
+
+\subsection*{Contribution 2: Mechanistic explanation}
+
+We identify two contraction channels in the effective learning information of RL batches:
+\begin{itemize}
+    \item relevance degradation;
+    \item discriminability/coverage contraction.
+\end{itemize}
+This makes a fixed learning rate phase-mismatched. At the same time, clipping becomes a key observable symptom that optimization has entered a gradient-truncation regime.
+
+\subsection*{Contribution 3: Control principle}
+
+We propose:
+\begin{quote}
+\textbf{phase-aware, bidirectional learning-rate control}
+\end{quote}
+The controller should be able to both increase and decrease update aggressiveness based on online evidence. Clipping provides the main feedback, while entropy is at most an auxiliary phase-modulation signal.
+
+\section{Falsifiable predictions and experimental directions}
+
+This framework should lead to at least the following falsifiable predictions.
+
+\begin{enumerate}
+    \item Even with fixed nominal batch size, effective learning information should contract over training.
+    \item Increasing the learning rate should not improve performance monotonically: it may first alleviate under-updating, but beyond a point it should significantly increase clipping statistics and harm final performance.
+    \item A monotone entropy-decay scheduler may reduce some instability, but it should fail to correct under-updating caused by an initially too-small LR, and thus should not outperform a truly bidirectional controller.
+    \item Clipping statistics should reveal harmful update regimes earlier and more directly than entropy.
+\end{enumerate}
+
+The most important experimental reorganization should follow the chain:
+\[
+\text{LR} \uparrow
+\Rightarrow
+\text{clip fraction / clipped mass} \uparrow
+\Rightarrow
+\text{effective gradient info} \downarrow
+\Rightarrow
+\text{final performance saturates}.
+\]
+
+At the same time, four baseline types should be compared:
+\begin{itemize}
+    \item a small but stable fixed LR;
+    \item a large and aggressive fixed LR;
+    \item a monotone entropy-decay scheduler;
+    \item a bidirectional adaptive LR controller.
+\end{itemize}
+
+\section{Final abstract-style paragraph}
+
+The project can finally be compressed into the following paragraph.
+
+RL always optimizes the same trajectory-expectation objective, but every parameter update can only be approximated from policy-induced samples. Therefore, training quality depends on how much effective learning information the current batch contains. This quantity is not constant: it may lose relevance because of stale or mismatched samples, and it may lose discriminability and coverage because of policy sharpening. A fixed learning rate ignores this phase change, and therefore underestimates the update budget in some phases while overestimating it in others. In PPO-style optimization, the latter frequently becomes visible through rising clipping, indicating that informative gradients are being systematically truncated rather than productively used. As a result, fixed update rules harm both stability and performance, because they try to serve early information-rich and late information-poor regimes with one globally fixed update budget. The correct intervention is therefore not a one-way entropy scheduler, but a phase-aware, bidirectional learning-rate controller, with clipping used as a detection and feedback signal and entropy used, at most, as an auxiliary phase signal.
+
+\end{document}

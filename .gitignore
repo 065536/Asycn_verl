@@ -130,3 +130,12 @@ logs
 log
 outputs
 .history
+
+# project-specific excludes
+verl/ckpts/
+exp_data/
+.claude/
+kernelcat
+deepseek1.5b_lr/
+ds1.5b/
+verl/deepseek1.5b_lr/

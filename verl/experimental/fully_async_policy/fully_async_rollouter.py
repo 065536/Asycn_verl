@@ -209,6 +209,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
+            # Allow config override to prevent KV cache exhaustion (especially without partial_rollout)
+            max_concurrent_override = self.config.async_training.get("max_concurrent_samples", None)
+            if max_concurrent_override is not None:
+                self.max_concurrent_samples = min(self.max_concurrent_samples, max_concurrent_override)
             self.max_queue_size = self.max_required_samples
 
             print(
@@ -260,12 +264,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.step_start_time = time.time()
         return timing_raw
 
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
+        """Store val generation samples instead of logging directly (SwanLab not initialized here)."""
+        generations_to_log = self.config.trainer.log_val_generations
+        if generations_to_log == 0:
+            return
+        import numpy as np
+
+        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples.sort(key=lambda x: x[0])
+        rng = np.random.RandomState(42)
+        rng.shuffle(samples)
+        self._pending_val_samples = samples[:generations_to_log]
+
     def do_validate(self) -> ValidateMetrics:
         """Run validation and return metrics"""
+        self._pending_val_samples = []
         timing_raw = {}
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
             val_metrics: dict = self._validate()
-        return ValidateMetrics(timing_raw=timing_raw, metrics=val_metrics)
+        return ValidateMetrics(timing_raw=timing_raw, metrics=val_metrics, val_samples=self._pending_val_samples)
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -449,7 +467,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
                             for task in done_tasks:
-                                await task
+                                try:
+                                    await task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
 
                 async with self.lock:
                     while self.paused:
@@ -472,7 +493,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                             )
                             for task in done_tasks:
-                                await task
+                                try:
+                                    await task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
                 break
 
             # Check whether the number of concurrent tasks exceeds the limit
@@ -483,7 +507,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                         )
                         for task in done_tasks:
-                            await task
+                            try:
+                                await task
+                            except (asyncio.CancelledError, Exception):
+                                pass
 
             # Submit single sample processing
             async with self.lock:
@@ -616,10 +643,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Async coroutine for monitoring:
         Function 1: Log information output
         Function 2: Trigger rollout recovery
+        Function 3: Deadlock detection and recovery
         """
         last_stats_time = time.time()
         stats_interval = 60.0
         check_interval = 10.0
+        deadlock_timeout = 300.0  # seconds without new samples before declaring deadlock
+
+        last_sample_count = self.total_generated_samples
+        last_progress_time = time.time()
 
         while True:
             async with self.lock:
@@ -639,6 +671,54 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     self.paused = False
                     print("[FullyAsyncRollouter][ShouldPause] notify all wait tasks.")
                     self.condition.notify_all()
+
+            # Deadlock detection: if active tasks exist but no new samples for deadlock_timeout seconds
+            current_sample_count = self.total_generated_samples
+            if current_sample_count > last_sample_count:
+                last_sample_count = current_sample_count
+                last_progress_time = current_time
+            elif len(self.active_tasks) > 0 and (current_time - last_progress_time) > deadlock_timeout:
+                print(
+                    f"[FullyAsyncRollouter][DeadlockDetector] No new samples for "
+                    f"{current_time - last_progress_time:.0f}s with {len(self.active_tasks)} active tasks. "
+                    f"total_generated={current_sample_count}. Triggering abort recovery."
+                )
+                await self._recover_from_deadlock()
+                last_progress_time = current_time
+                last_sample_count = self.total_generated_samples
+
+    async def _recover_from_deadlock(self):
+        """Cancel all active tasks and abort all vLLM requests to break a KV cache deadlock."""
+        # Cancel all pending asyncio tasks
+        async with self.lock:
+            tasks_to_cancel = list(self.active_tasks)
+        for task in tasks_to_cancel:
+            task.cancel()
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        print(f"[FullyAsyncRollouter][DeadlockDetector] Cancelled {len(tasks_to_cancel)} active tasks.")
+
+        # Clear the active_tasks set after cancellation so stale references don't accumulate
+        async with self.lock:
+            self.active_tasks.clear()
+
+        # Abort all in-flight vLLM requests to free KV cache
+        if self.async_rollout_manager is not None:
+            for replica in self.async_rollout_manager.rollout_replicas:
+                try:
+                    result = await replica.abort_all_requests()
+                    print(f"[FullyAsyncRollouter][DeadlockDetector] Aborted vLLM requests: {result}")
+                except Exception as e:
+                    print(f"[FullyAsyncRollouter][DeadlockDetector] Failed to abort requests on replica: {e}")
+
+            # Resume generation after abort (abort_all_requests calls pause_generation on vLLM >= 0.12.0,
+            # which leaves the engine paused — without this call new requests would queue up indefinitely)
+            for replica in self.async_rollout_manager.rollout_replicas:
+                try:
+                    await replica.resume_generation()
+                    print(f"[FullyAsyncRollouter][DeadlockDetector] Resumed generation on replica.")
+                except Exception as e:
+                    print(f"[FullyAsyncRollouter][DeadlockDetector] Failed to resume generation on replica: {e}")
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""

@@ -1273,6 +1273,45 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def _masked_stats(values: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+    """Compute mean/std/p95/p99/max for masked values."""
+    if values.shape == mask.shape:
+        valid = values[mask > 0]
+    else:
+        # Some losses (e.g., geo_mean) use sequence-level tensors.
+        valid = values.reshape(-1)
+
+    if valid.numel() == 0:
+        return {"mean": 0.0, "std": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+
+    valid = valid.float()
+    return {
+        "mean": valid.mean().item(),
+        "std": valid.std(unbiased=False).item(),
+        "p95": torch.quantile(valid, 0.95).item(),
+        "p99": torch.quantile(valid, 0.99).item(),
+        "max": valid.max().item(),
+    }
+
+
+def _build_ratio_kl_metrics(
+    ratio_values: torch.Tensor, ppo_kl_values: torch.Tensor, response_mask: torch.Tensor
+) -> dict[str, float]:
+    ratio_stats = _masked_stats(ratio_values, response_mask)
+    kl_stats = _masked_stats(ppo_kl_values, response_mask)
+    return {
+        "actor/ratio_mean": ratio_stats["mean"],
+        "actor/ratio_std": ratio_stats["std"],
+        "actor/ratio_p95": ratio_stats["p95"],
+        "actor/ratio_p99": ratio_stats["p99"],
+        "actor/ratio_max": ratio_stats["max"],
+        "actor/ppo_kl_mean": kl_stats["mean"],
+        "actor/ppo_kl_p95": kl_stats["p95"],
+        "actor/ppo_kl_p99": kl_stats["p99"],
+        "actor/ppo_kl_max": kl_stats["max"],
+    }
+
+
 @register_policy_loss("vanilla")  # type: ignore[arg-type]
 def compute_policy_loss_vanilla(
     old_log_prob: torch.Tensor,
@@ -1364,6 +1403,7 @@ def compute_policy_loss_vanilla(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, -negative_approx_kl, response_mask))
     return pg_loss, pg_metrics
 
 
@@ -1445,6 +1485,7 @@ def compute_policy_loss_dppo_tv(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, -negative_approx_kl, response_mask))
     return pg_loss, pg_metrics
 
 
@@ -1530,6 +1571,7 @@ def compute_policy_loss_dppo_kl(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, -negative_approx_kl, response_mask))
     return pg_loss, pg_metrics
 
 
@@ -1606,6 +1648,7 @@ def compute_policy_loss_gspo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(seq_importance_ratio, -negative_approx_kl, response_mask))
     return pg_loss, pg_metrics
 
 
@@ -1690,6 +1733,7 @@ def compute_policy_loss_sapo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, -negative_approx_kl, response_mask))
 
     return pg_loss, pg_metrics
 
@@ -1832,6 +1876,7 @@ def compute_policy_loss_clip_cov(
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, -negative_approx_kl, response_mask))
     return pg_loss, pg_metrics
 
 
@@ -1912,6 +1957,7 @@ def compute_policy_loss_kl_cov(
     pg_metrics = {
         "actor/ppo_kl": ppo_kl_abs.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, abs_kl, response_mask))
     return pg_loss, pg_metrics
 
 
@@ -1998,6 +2044,7 @@ def compute_policy_loss_geo_mean(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, -negative_approx_kl, response_mask))
     return pg_loss, pg_metrics
 
 
@@ -2059,6 +2106,7 @@ def compute_policy_loss_cispo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, -negative_approx_kl, response_mask))
     return pg_loss, pg_metrics
 
 
@@ -2335,11 +2383,14 @@ def compute_policy_loss_reinforce(
 
     # Compute KL divergence between current and rollout policy
     negative_approx_kl = log_prob - rollout_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
     kl_divergence = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_metrics = {
         "actor/ppo_kl": kl_divergence.detach().item(),
     }
+    pg_metrics.update(_build_ratio_kl_metrics(ratio, -negative_approx_kl, response_mask))
 
     return pg_loss, pg_metrics
 

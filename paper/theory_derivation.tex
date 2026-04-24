@@ -1,0 +1,745 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsfonts}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{amsthm}
+\usepackage{mdframed}
+
+% ---- macros ----
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\mathrm{Var}}
+\newcommand{\neff}{n_{\mathrm{eff}}}
+\newcommand{\ghat}{\hat{g}_t}
+\newcommand{\gtrue}{g_t}
+\newcommand{\pith}{\pi_{\theta_t}}
+\newcommand{\alphaopt}{\alpha^*(t)}
+
+\newcommand{\gap}[1]{\textcolor{red}{\textbf{[GAP: #1]}}}
+\newcommand{\claim}[1]{\textcolor{blue}{\textit{#1}}}
+
+% ---- theorem environments ----
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+\newtheorem{assumption}{Assumption}
+\newtheorem{lemma}{Lemma}
+
+% framed box for the research question
+\newmdenv[linecolor=black,linewidth=1.5pt,innertopmargin=8pt,innerbottommargin=8pt]{rqbox}
+
+% =========================================================
+\title{Theoretical Framework:\\
+       Effective Sample Degradation in On-Policy RL\\
+       and Its Implications for Update Rule Design}
+
+\date{2026-04-19 (draft)}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We derive, without logical gaps, the following chain:
+\emph{on-policy RL training $\to$ policy concentrates over time $\to$ effective sample size
+$\neff(t)$ decreases $\to$ optimal learning rate $\alphaopt$ decreases linearly with $\neff(t)$
+$\to$ fixed LR eventually exceeds $\alphaopt$ $\to$ gradient noise dominates signal
+$\to$ unreliable updates degrade training path quality $\to$ suboptimal final performance.}
+This chain identifies a precise, well-defined research gap and motivates a family of solutions
+that go beyond learning-rate scheduling.
+Each step is derived explicitly; no step is ``by standard result'' without proof.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =========================================================
+\section{Setup}
+
+\paragraph{Objective.}
+The optimization target is the expected return under the current policy:
+\begin{equation}
+  J(\theta) = \E_{\tau \sim \pi_\theta}[R(\tau)]
+  \label{eq:objective}
+\end{equation}
+The reward function $R$, the environment, and the optimal policy $\pi^*$ are all \emph{fixed}.
+This is a stationary optimization problem in policy space.
+
+\paragraph{True gradient.}
+By the policy gradient theorem:
+\begin{equation}
+  \gtrue = \nabla_\theta J(\theta_t)
+           = \E_{\tau \sim \pith}\!\left[A_t(\tau)\,\nabla_\theta \log \pith(\tau)\right]
+  \label{eq:true-gradient}
+\end{equation}
+where $A_t(\tau) = R(\tau) - b_t$ is the advantage with baseline $b_t$.
+This expectation is over \emph{all} possible trajectories, each weighted by $\pith(\tau)$.
+
+\paragraph{Practical estimator.}
+$\gtrue$ cannot be computed exactly.
+With $n$ rollouts sampled from $\pith$, we use the Monte Carlo estimator:
+\begin{equation}
+  \ghat = \frac{1}{n}\sum_{i=1}^{n} A_i\,\nabla_\theta \log \pith(\tau_i),
+  \qquad \tau_i \overset{\mathrm{i.i.d.}}{\sim} \pith
+  \label{eq:estimator}
+\end{equation}
+Because $\E[\ghat] = \E[A\nabla\log\pith] = \gtrue$, the estimator is \emph{unbiased}.
+
+\paragraph{The actual parameter update.}
+\begin{equation}
+  \theta_{t+1} = \theta_t + \alpha\,\ghat
+               = \theta_t + \alpha\,\gtrue + \underbrace{\alpha(\ghat - \gtrue)}_{\text{estimation error}}
+  \label{eq:update}
+\end{equation}
+The estimation error $\alpha(\ghat - \gtrue)$ is a random variable with mean zero.
+Even though the update is unbiased in expectation, its \emph{variance} matters because
+the objective is nonlinear: a large random perturbation can move $\theta$ to a region of
+lower $J$ even if its expected direction is correct.
+
+% =========================================================
+\section{Gradient Estimation Quality}
+
+\subsection{Mean squared error of the gradient estimator: full derivation}
+\label{sec:mse}
+
+Let $X_i := A_i\,\nabla_\theta \log \pith(\tau_i) \in \mathbb{R}^d$ denote the $i$-th sample.
+The $X_i$ are i.i.d.\ copies of the random vector $X := A\,\nabla\log\pith(\tau)$ with $\tau\sim\pith$.
+
+\textbf{Step 1: Express ĝ − g as a sample mean of centered variables.}
+
+Since $\E[X_i] = \gtrue$, we have $X_i - \gtrue$ is mean-zero, so:
+\begin{equation}
+  \ghat - \gtrue
+  = \frac{1}{n}\sum_{i=1}^{n} X_i - \gtrue
+  = \frac{1}{n}\sum_{i=1}^{n} (X_i - \gtrue)
+  \label{eq:centered}
+\end{equation}
+
+\textbf{Step 2: Expand the squared norm.}
+
+\begin{align}
+  \E\!\left[\|\ghat - \gtrue\|^2\right]
+  &= \E\!\left[\left\|\frac{1}{n}\sum_{i=1}^{n}(X_i - \gtrue)\right\|^2\right] \notag\\
+  &= \frac{1}{n^2}\,\E\!\left[\left\|\sum_{i=1}^{n}(X_i - \gtrue)\right\|^2\right] \notag\\
+  &= \frac{1}{n^2}\,\E\!\left[\sum_{i=1}^{n}\sum_{j=1}^{n}
+       (X_i - \gtrue)^\top(X_j - \gtrue)\right]
+  \label{eq:expand}
+\end{align}
+
+\textbf{Step 3: Use i.i.d.\ to eliminate cross terms.}
+
+For $i \neq j$, the variables $X_i - \gtrue$ and $X_j - \gtrue$ are independent and each has mean zero.
+Therefore:
+\begin{equation}
+  \E\!\left[(X_i - \gtrue)^\top(X_j - \gtrue)\right]
+  = \E\!\left[X_i - \gtrue\right]^\top \E\!\left[X_j - \gtrue\right]
+  = 0^\top \cdot 0 = 0
+  \qquad (i \neq j)
+  \label{eq:cross-zero}
+\end{equation}
+
+Only the diagonal terms $i = j$ survive:
+\begin{equation}
+  \E\!\left[\|\ghat - \gtrue\|^2\right]
+  = \frac{1}{n^2}\sum_{i=1}^{n}\E\!\left[\|X_i - \gtrue\|^2\right]
+  = \frac{1}{n^2}\cdot n\cdot\E\!\left[\|X - \gtrue\|^2\right]
+  = \frac{1}{n}\,\E\!\left[\|X - \gtrue\|^2\right]
+  \label{eq:diagonal}
+\end{equation}
+where in the last equality we used the fact that all $n$ terms are equal by the i.i.d.\ assumption.
+
+\textbf{Step 4: Identify the remaining expectation as the trace of the covariance matrix.}
+
+Let $\Sigma_t := \mathrm{Cov}_{\pith}[X] = \E\!\left[(X - \gtrue)(X-\gtrue)^\top\right] \in \mathbb{R}^{d\times d}$.
+Then:
+\begin{equation}
+  \E\!\left[\|X - \gtrue\|^2\right]
+  = \E\!\left[\mathrm{tr}\!\left((X-\gtrue)(X-\gtrue)^\top\right)\right]
+  = \mathrm{tr}\!\left(\E\!\left[(X-\gtrue)(X-\gtrue)^\top\right]\right)
+  = \mathrm{tr}(\Sigma_t)
+  \label{eq:trace}
+\end{equation}
+where the second equality uses linearity of trace and linearity of expectation.
+
+\textbf{Conclusion.}
+
+Substituting \eqref{eq:trace} into \eqref{eq:diagonal}:
+\begin{equation}
+  \boxed{
+  \E\!\left[\|\ghat - \gtrue\|^2\right]
+  = \frac{\mathrm{tr}(\Sigma_t)}{n}
+  }
+  \label{eq:mse}
+\end{equation}
+We define $\sigma_t^2 := \mathrm{tr}(\Sigma_t)$, the total per-sample variance (sum of per-coordinate variances).
+Thus the mean squared error of the gradient estimator is $\sigma_t^2 / n$.
+
+\begin{remark}
+  Equation~\eqref{eq:mse} holds for any distribution $\pith$, any policy $\theta_t$,
+  and any $n \geq 1$.
+  It does not yet involve any assumption about policy concentration.
+  The factor $n$ in the denominator is exact (not approximate) when all $n$ draws are statistically independent,
+  which holds when each rollout is generated by independently sampling from $\pith$.
+\end{remark}
+
+\subsection{Effective sample size under policy concentration}
+\label{sec:neff}
+
+Equation~\eqref{eq:mse} shows the MSE decreasing as $1/n$.
+However, this analysis assumed all $n$ samples are statistically independent.
+In practice, when $\pith$ is concentrated (low entropy), many of the $n$ rollouts will be
+\emph{identical}, providing no additional information beyond what a single rollout already gives.
+We now make this intuition precise.
+
+\subsubsection{Why duplicate samples don't reduce MSE}
+
+Suppose $\pith$ assigns all probability to a single trajectory $\tau^*$: $\pith(\tau^*) = 1$.
+Then every rollout produces $\tau_i = \tau^*$, and:
+\begin{equation}
+  \ghat = \frac{1}{n}\sum_{i=1}^n A^*\nabla\log\pith(\tau^*)
+        = A^*\nabla\log\pith(\tau^*)
+\end{equation}
+This is deterministic (zero variance) but is only one point estimate of $g_t$.
+Adding more samples does not change $\ghat$ at all.
+From equation~\eqref{eq:mse}, $\mathrm{tr}(\Sigma_t) = 0$ in this case (no variance), so the formula is consistent—but the information content is the same as $n=1$.
+
+Now suppose $\pith$ is concentrated but not fully: it puts probability $1-\epsilon$ on $\tau^*$ and spreads the remaining $\epsilon$ over other trajectories.
+With $n=8$ samples, the probability that \emph{all} 8 land on $\tau^*$ is $(1-\epsilon)^8$.
+For small $\epsilon$ (e.g., $\epsilon = 0.05$), this probability is $(0.95)^8 \approx 0.66$.
+So $66\%$ of the time, all 8 samples are identical, and the effective information is still just 1 sample.
+
+\subsubsection{Distinct trajectories as a measure of information content}
+
+Let $K_n$ denote the number of \emph{distinct} trajectories among $n$ i.i.d.\ draws from $\pith$.
+
+\begin{proposition}
+  \label{prop:distinct}
+  The expected number of distinct trajectories satisfies:
+  \begin{equation}
+    \E[K_n] = \sum_{\tau} \left[1 - (1 - \pith(\tau))^n\right]
+    \label{eq:expected-K}
+  \end{equation}
+\end{proposition}
+
+\begin{proof}
+  For each trajectory $\tau$, define the indicator $\mathbf{1}[\tau \in \{\tau_1,\ldots,\tau_n\}]$,
+  which equals 1 if $\tau$ appears at least once among the $n$ draws, and 0 otherwise.
+  By linearity of expectation:
+  \begin{equation}
+    \E[K_n] = \sum_\tau \E\!\left[\mathbf{1}[\tau \in \{\tau_1,\ldots,\tau_n\}]\right]
+             = \sum_\tau \Pr(\tau \in \{\tau_1,\ldots,\tau_n\})
+  \end{equation}
+  The probability that $\tau$ is \emph{absent} from all $n$ draws is
+  $(1 - \pith(\tau))^n$ (by independence and identical distribution),
+  so the probability it appears at least once is $1 - (1 - \pith(\tau))^n$, giving \eqref{eq:expected-K}.
+\end{proof}
+
+\subsubsection{The approximation $\neff \approx \min(n, \exp(H))$}
+\label{sec:neff-approx}
+
+We now derive the approximation.
+The entropy of $\pith$ is $H(\pith) = -\sum_\tau \pith(\tau)\log\pith(\tau)$,
+and the \emph{perplexity} is $\exp(H(\pith))$.
+
+\textbf{Exact computation for a uniform distribution.}
+Suppose $\pith$ is uniform over $M$ trajectories: $\pith(\tau) = 1/M$ for each $\tau$ in the support.
+Then $H = \log M$, so $\exp(H) = M$, and by \eqref{eq:expected-K}:
+\begin{equation}
+  \E[K_n] = M\cdot\left[1 - \left(1 - \frac{1}{M}\right)^n\right]
+  \label{eq:uniform-Kn}
+\end{equation}
+Analyze the two regimes:
+\begin{itemize}
+  \item \textbf{When $n \ll M$}: By the approximation $(1 - 1/M)^n \approx e^{-n/M} \approx 1 - n/M$
+    (valid for $n/M \ll 1$), we get $\E[K_n] \approx M \cdot (n/M) = n$.
+    Each new draw lands on a fresh trajectory with high probability.
+  \item \textbf{When $n \gg M$}: We have $(1-1/M)^n \approx e^{-n/M} \to 0$,
+    so $\E[K_n] \approx M = \exp(H)$.
+    Essentially all $M$ trajectories have been seen.
+\end{itemize}
+Therefore $\E[K_n] \approx \min(n, M) = \min(n, \exp(H))$ for a uniform distribution.
+
+\textbf{Extension to non-uniform distributions.}
+For a general distribution, the perplexity $\exp(H)$ represents the effective number of
+equally-likely outcomes; it is the size of the uniform distribution with the same entropy.
+The approximation $\E[K_n] \approx \min(n, \exp(H))$ holds exactly at the two extremes:
+when $\pith$ is perfectly concentrated ($H = 0$, $\exp(H) = 1$, $\E[K_n] = 1$)
+and when $\pith$ is uniform ($H = \log M$, $\exp(H) = M$, $\E[K_n] = \min(n, M)$).
+For intermediate distributions it is an approximation,
+and it overestimates slightly when the distribution has heavy tails
+(many low-probability trajectories).
+
+\begin{definition}[Effective sample size]
+  \label{def:neff}
+  \begin{equation}
+    \neff(t) := \E[K_n] \approx \min\!\left(n,\; \exp(H(\pith))\right)
+    \label{eq:neff-def}
+  \end{equation}
+\end{definition}
+
+\textbf{Why this is the right measure of information content.}
+Equation~\eqref{eq:mse} assumes $n$ independent samples.
+When the policy is concentrated and many samples are duplicates, the effective number of
+independent pieces of information is $\neff$, not $n$.
+Replacing $n$ with $\neff$ in \eqref{eq:mse} gives the effective MSE:
+\begin{equation}
+  \E\!\left[\|\ghat - \gtrue\|^2\right]_{\mathrm{eff}}
+  \;\approx\;
+  \frac{\sigma_t^2}{\neff(t)}
+  \label{eq:mse-neff}
+\end{equation}
+
+\paragraph{Empirical anchor.}
+In our experiments, $n = 8$ rollouts per prompt (GRPO).
+At the start of training: $H(\pith) \approx 0.68$ nats, so $\exp(H) \approx 1.97$,
+giving $\neff \approx \min(8, 1.97) \approx 2$.
+After training: $H(\pith) \approx 0.07$ nats, so $\exp(H) \approx 1.07$,
+giving $\neff \approx 1$.
+The gradient estimate degrades from roughly 2 effective samples to essentially 1
+over the course of training---halving the information in the gradient estimate.
+
+\begin{remark}
+  Note: $H = 0.68$ nats is the measured entropy for a 1.5B model at the \emph{response level}.
+  The per-token entropy (as logged in experiments) is much higher and is not the quantity used here.
+  The response-level entropy measures the concentration of the distribution over complete output sequences.
+\end{remark}
+
+% =========================================================
+\section{Optimal Learning Rate as a Function of $\neff$}
+
+\subsection{Per-step expected improvement bound: full derivation}
+\label{sec:bound-derivation}
+
+We want to find the $\alpha$ that maximizes the expected improvement in $J$ per step.
+
+\textbf{Step 1: Apply the L-smoothness assumption.}
+
+Assume $J(\theta)$ is $L$-smooth, meaning $\nabla J$ is $L$-Lipschitz:
+\begin{equation}
+  \|\nabla J(\theta') - \nabla J(\theta)\| \leq L\,\|\theta' - \theta\|
+  \quad \text{for all } \theta, \theta'
+  \label{eq:lipschitz}
+\end{equation}
+A standard result in optimization (see~\cite{bottou2018optimization}, Lemma A.1) is that $L$-smoothness
+implies the following \emph{descent lemma}:
+\begin{equation}
+  J(\theta') \geq J(\theta) + \nabla J(\theta)^\top(\theta' - \theta) - \frac{L}{2}\|\theta' - \theta\|^2
+  \label{eq:descent-lemma}
+\end{equation}
+for all $\theta, \theta'$.
+(Note: for maximization we flip the inequality relative to the standard descent lemma.)
+
+\textbf{Step 2: Substitute the update rule.}
+
+Set $\theta' = \theta_{t+1} = \theta_t + \alpha\ghat$ in \eqref{eq:descent-lemma}:
+\begin{equation}
+  J(\theta_{t+1})
+  \geq J(\theta_t) + \nabla J(\theta_t)^\top(\alpha\ghat) - \frac{L}{2}\|\alpha\ghat\|^2
+  = J(\theta_t) + \alpha\,\gtrue^\top\ghat - \frac{\alpha^2 L}{2}\|\ghat\|^2
+  \label{eq:before-expectation}
+\end{equation}
+
+\textbf{Step 3: Take expectation over $\ghat$.}
+
+\begin{align}
+  \E[J(\theta_{t+1})]
+  &\geq J(\theta_t) + \alpha\,\E[\gtrue^\top\ghat] - \frac{\alpha^2 L}{2}\E[\|\ghat\|^2]
+  \label{eq:exp-step}
+\end{align}
+We compute the two remaining expectations.
+
+\emph{First expectation:} Since $\E[\ghat] = \gtrue$ (unbiased estimator):
+\begin{equation}
+  \E[\gtrue^\top\ghat] = \gtrue^\top\E[\ghat] = \gtrue^\top\gtrue = \|\gtrue\|^2
+  \label{eq:first-exp}
+\end{equation}
+
+\emph{Second expectation:}
+We decompose $\ghat = \gtrue + (\ghat - \gtrue)$:
+\begin{align}
+  \E[\|\ghat\|^2]
+  &= \E[\|\gtrue + (\ghat - \gtrue)\|^2] \notag\\
+  &= \E[\|\gtrue\|^2 + 2\gtrue^\top(\ghat-\gtrue) + \|\ghat-\gtrue\|^2] \notag\\
+  &= \|\gtrue\|^2 + 2\gtrue^\top\underbrace{\E[\ghat-\gtrue]}_{=\,0} + \E[\|\ghat-\gtrue\|^2] \notag\\
+  &= \|\gtrue\|^2 + \frac{\sigma_t^2}{\neff}
+  \label{eq:second-exp}
+\end{align}
+where in the last step we used \eqref{eq:mse-neff}.
+
+\textbf{Step 4: Assemble the bound.}
+
+Substituting \eqref{eq:first-exp} and \eqref{eq:second-exp} into \eqref{eq:exp-step}:
+\begin{equation}
+  \boxed{
+  \E[J(\theta_{t+1})] - J(\theta_t)
+  \;\geq\;
+  \alpha\,\|\gtrue\|^2 - \frac{\alpha^2 L}{2}\!\left(\|\gtrue\|^2 + \frac{\sigma_t^2}{\neff}\right)
+  }
+  \label{eq:improvement-bound}
+\end{equation}
+Call the right-hand side $f(\alpha)$.
+This is a downward-opening quadratic in $\alpha$:
+the $\alpha$ term is positive (driving improvement), and the $\alpha^2$ term is negative (penalizing large steps).
+
+\textbf{Step 5: Maximize over $\alpha$ to find the optimal step size.}
+
+Differentiate $f(\alpha)$ with respect to $\alpha$ and set equal to zero:
+\begin{align}
+  \frac{d}{d\alpha} f(\alpha)
+  &= \|\gtrue\|^2 - \alpha L\!\left(\|\gtrue\|^2 + \frac{\sigma_t^2}{\neff}\right)
+  = 0 \notag\\
+  \Rightarrow\quad
+  \alpha
+  &= \frac{\|\gtrue\|^2}{L\!\left(\|\gtrue\|^2 + \sigma_t^2/\neff\right)}
+  \label{eq:alphaopt-derivation}
+\end{align}
+Since $f''(\alpha) = -L(\|\gtrue\|^2 + \sigma_t^2/\neff) < 0$, this critical point is a maximum.
+The \textbf{optimal step size} is:
+\begin{equation}
+  \boxed{
+  \alphaopt
+  = \frac{\|\gtrue\|^2}{L\!\left(\|\gtrue\|^2 + \sigma_t^2/\neff(t)\right)}
+  }
+  \label{eq:alphaopt-full}
+\end{equation}
+
+\subsection{Monotone dependence on $\neff$: full algebra}
+\label{sec:monotone}
+
+\textbf{Step 1: Verify $\alphaopt$ is increasing in $\neff$.}
+
+Treat $\alphaopt$ as a function of $\neff$ (all other quantities held fixed).
+Write $A = \|\gtrue\|^2$, $S = \sigma_t^2$, $C = L$.
+Then:
+\begin{equation}
+  \alphaopt = \frac{A}{C(A + S/\neff)}
+\end{equation}
+Taking the derivative with respect to $\neff$:
+\begin{equation}
+  \frac{d\alphaopt}{d\neff}
+  = \frac{A \cdot C \cdot S/\neff^2}{C^2(A + S/\neff)^2}
+  = \frac{A S}{C \neff^2 (A + S/\neff)^2} > 0
+  \label{eq:monotone}
+\end{equation}
+This is strictly positive (since $A, S, C, \neff > 0$), confirming that $\alphaopt$ is strictly increasing in $\neff$.
+
+\textbf{Step 2: Noise-dominated regime.}
+
+When the gradient signal is small relative to the estimation noise,
+i.e., $\sigma_t^2/\neff \gg \|\gtrue\|^2$, we can drop the $\|\gtrue\|^2$ term in the denominator:
+\begin{align}
+  \alphaopt
+  &= \frac{\|\gtrue\|^2}{L\!\left(\|\gtrue\|^2 + \sigma_t^2/\neff\right)} \notag\\
+  &\approx \frac{\|\gtrue\|^2}{L \cdot \sigma_t^2/\neff} \notag\\
+  &= \frac{\|\gtrue\|^2 \cdot \neff}{L \cdot \sigma_t^2}
+  \label{eq:alphaopt-noisedom}
+\end{align}
+
+\textbf{Step 3: Introduce Assumption~\ref{ass:nsr} for a cleaner expression.}
+
+\begin{assumption}[Slowly-varying noise-to-signal ratio]
+  \label{ass:nsr}
+  The ratio $\sigma_t^2 / \|\gtrue\|^2$ is approximately constant throughout training:
+  \[
+    \frac{\sigma_t^2}{\|\gtrue\|^2} \approx C_0
+  \]
+  for some problem-dependent constant $C_0 > 0$.
+\end{assumption}
+
+Under Assumption~\ref{ass:nsr}, substituting $\sigma_t^2 = C_0 \|\gtrue\|^2$ into \eqref{eq:alphaopt-noisedom}:
+\begin{align}
+  \alphaopt
+  &\approx \frac{\|\gtrue\|^2 \cdot \neff}{L \cdot C_0 \|\gtrue\|^2} \notag\\
+  &= \frac{\neff}{L \cdot C_0}
+  \label{eq:alphaopt-linear}
+\end{align}
+Since $L$ and $C_0$ are constants (with respect to $t$), this gives:
+\begin{equation}
+  \boxed{\alphaopt \propto \neff(t)}
+  \label{eq:alphaopt-prop}
+\end{equation}
+The optimal learning rate decreases \emph{linearly} with the effective sample size.
+
+\begin{remark}
+  Assumption~\ref{ass:nsr} is the key non-trivial hypothesis.
+  It requires that both $\|\gtrue\|^2$ (signal) and $\sigma_t^2$ (per-sample variance) decrease
+  at similar rates as the policy concentrates.
+  This is plausible in the early-to-mid training regime when the policy has not yet converged.
+  Near convergence ($\gtrue \approx 0$), both quantities vanish and the assumption becomes less meaningful---
+  but at that point $\alphaopt \to 0$ regardless, so the qualitative conclusion holds.
+\end{remark}
+
+\begin{remark}
+  Note that the relationship is \emph{linear} ($\alphaopt \propto \neff$), not square-root.
+  An earlier (incorrect) derivation based on a signal-to-noise ratio condition
+  $\|\gtrue\| \geq \|\ghat - \gtrue\|$ gave $\alphaopt \propto \sqrt{\neff}$;
+  however, that condition constrains $\|\gtrue\| / (\sigma/\sqrt{n})$, from which $\alpha$
+  cancels entirely---it does not bound $\alpha$.
+  The correct approach, using the per-step improvement bound, gives the linear relationship.
+\end{remark}
+
+\subsection{The supervised learning baseline}
+
+In supervised learning, the dataset $\mathcal{D}$ is fixed.
+The sampling distribution does not change with $\theta$,
+so $\neff = n$ and $\sigma_t^2$ remain constant throughout training.
+Equation~\eqref{eq:alphaopt-full} then gives a fixed $\alphaopt$, consistent with
+the standard practice of using a constant or mildly decaying learning rate.
+The systematic degradation of $\neff(t)$ studied here has no analogue in supervised learning.
+
+% =========================================================
+\section{The On-Policy Feedback Loop}
+
+\subsection{The structural difference}
+\label{sec:structural}
+
+In supervised learning, the data distribution and $\neff$ are fixed external quantities.
+In on-policy RL, updating $\theta$ changes $\pith$, which changes the sampling distribution,
+which changes $\neff(t)$:
+\begin{equation}
+  \theta_t
+  \;\xrightarrow{\;+\alpha\,\ghat\;}\;
+  \theta_{t+1}
+  \;\Rightarrow\;
+  H(\pith[t+1]) < H(\pith)
+  \;\Rightarrow\;
+  \neff(t+1) < \neff(t)
+  \;\Rightarrow\;
+  \alpha^*(t+1) < \alphaopt
+  \label{eq:loop-chain}
+\end{equation}
+The middle implication holds because successful RL training concentrates the policy onto
+high-reward trajectories, which reduces entropy.
+The rightmost implication follows from \eqref{eq:alphaopt-prop}.
+
+This means $\alphaopt$ is a \emph{time-varying}, \emph{monotonically decreasing} quantity,
+while fixed-LR training holds $\alpha$ constant.
+
+\subsection{The mismatch condition}
+\label{sec:mismatch}
+
+Let $t^*$ be the first step at which $\alpha > \alpha^*(t^*)$.
+Since $\alphaopt \propto \neff(t) \to 0$ as $t \to \infty$ (policy fully concentrates),
+such a step must eventually arrive under fixed $\alpha > 0$.
+
+Once $\alpha > \alpha^*(t)$, the bound \eqref{eq:improvement-bound} is no longer positive:
+the expected per-step improvement is negative, i.e., the expected next-iterate is \emph{worse}
+than the current iterate.
+
+\begin{equation}
+  \alpha > \alphaopt
+  \;\Rightarrow\;
+  \E[J(\theta_{t+1})] < J(\theta_t)
+  \label{eq:mismatch}
+\end{equation}
+An update in this regime is dominated by estimation error: $\alpha(\ghat - \gtrue)$ is larger
+in magnitude than $\alpha\gtrue$, so the parameter moves away from the true gradient direction.
+
+\begin{remark}[Self-reinforcing collapse---empirical observation, not part of core argument]
+  \label{rem:self-reinforce}
+  In practice, the degradation after $t^*$ tends to be self-accelerating.
+  A noise-dominated update reinforces whichever trajectories happened to appear most in the sampled batch,
+  further concentrating $\pith$ and reducing $\neff(t+1)$, which decreases $\alpha^*(t+1)$
+  further, increasing the mismatch:
+  \begin{equation}
+    \alpha > \alpha^*(t)
+    \;\Rightarrow\;
+    \text{noise-dominated update}
+    \;\Rightarrow\;
+    \neff(t+1) \ll \neff(t)
+    \;\Rightarrow\;
+    \alpha \gg \alpha^*(t+1)
+    \;\Rightarrow\;
+    \cdots
+    \label{eq:feedback-loop}
+  \end{equation}
+  This is consistent with the sharp ``rise-then-fall'' collapse pattern observed experimentally
+  (e.g., \texttt{sync\_lr1e-5} peaks near step 50 then drops sharply).
+
+  However, this self-reinforcing property is \emph{not} a logical step in the core argument.
+  The mismatch condition~\eqref{eq:mismatch} alone is sufficient to conclude that updates
+  after $t^*$ are expected to be harmful.
+  The self-reinforcing loop explains the \emph{severity and speed} of collapse, not its existence.
+\end{remark}
+
+% =========================================================
+\section{Path Quality and Final Performance}
+
+\subsection{What determines the training path}
+
+The sequence of updates $\theta_0 \to \theta_1 \to \cdots \to \theta_T$ traces a path
+through parameter space.
+The quality of each step is determined by whether $\alpha \leq \alphaopt$ at that step.
+\begin{itemize}
+  \item When $\alpha \leq \alphaopt$: expected improvement is positive; the path moves reliably toward higher-reward regions.
+  \item When $\alpha > \alphaopt$: expected improvement is negative; the path moves unreliably.
+\end{itemize}
+
+\subsection{Why the same terminal entropy implies a path-dependent outcome}
+
+All stable experiments in our study converge to similar final entropy ($H \approx 0.07$--$0.10$ nats),
+yet AIME accuracy at step 300 ranges from 0.017 to 0.325---a 20$\times$ spread.
+
+Since the terminal entropy is approximately equal, all policies are similarly concentrated
+at the end of training.
+The difference must lie in \emph{which} mode the policy converged to---that is, in the path.
+
+\begin{center}
+\begin{tabular}{lrrl}
+\toprule
+Experiment & Entropy@300 & AIME@300 & Pattern \\
+\midrule
+\texttt{sync\_lr3e-6}  & 0.073 & 0.325 & Monotone increase \\
+\texttt{sync\_lr5e-6}  & 0.068 & 0.294 & Slight fluctuation \\
+\texttt{sync\_lr1e-6}  & 0.078 & 0.281 & Slow increase \\
+\texttt{cosine\_floor} & 0.067 & 0.273 & Stable \\
+\texttt{sync\_lr1e-5}  & 0.068 & 0.183 & Rise then fall \\
+\texttt{clip0.1}       & 0.099 & 0.017 & Delayed catastrophic \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The path determines which modes are reached before $\neff$ collapses.
+Once $\neff \approx 1$, the policy is effectively locked: unreliable updates cannot explore
+other regions because the gradient signal about them has vanished entirely.
+
+\begin{proposition}[Path determines outcome]
+  \label{prop:path}
+  Given a reward landscape with multiple local optima, the quality of the final policy
+  is determined by which local optimum the training path reached before $\neff(t)$ became
+  too small for reliable updates ($\alpha > \alphaopt$).
+\end{proposition}
+
+% =========================================================
+\section{The Research Gap}
+
+\subsection{What existing methods do and do not address}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Method} & \textbf{What it does} & \textbf{Gap} \\
+\midrule
+Fixed LR & $\alpha$ constant & Ignores $\neff(t) \downarrow$ entirely \\
+Cosine decay & $\alpha \downarrow$ on fixed schedule & Schedule is problem-independent \\
+PPO clipping & Limits per-step ratio & Does not track $\neff$; blind to unsampled actions \\
+Entropy bonus & Resists $H(\pith) \downarrow$ & Opposes training objective; no correct fixed $\beta$ \\
+Entropy-adaptive LR & $\alpha \propto H(t)/H(0)$ & Uses entropy as proxy for $\neff$; not yet tuned \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+No existing method \emph{directly tracks} $\neff(t)$ and sets $\alpha$ accordingly.
+The derivation in Section~\ref{sec:monotone} establishes that the correct scaling is $\alpha \propto \neff$
+(linear), but all open-loop methods use problem-independent schedules that may not match
+the actual $\neff(t)$ trajectory.
+
+\subsection{The research question}
+
+\begin{rqbox}
+\textbf{Research Question.}
+In on-policy RL for LLMs, the effective sample size $\neff(t)$ decreases systematically
+as the policy concentrates.
+This decrease implies a decreasing optimal learning rate $\alphaopt \propto \neff(t)$ (linear).
+Current training algorithms do not adapt their update scale to $\neff(t)$,
+causing the learning rate to exceed $\alphaopt$ from some step $t^*$ onward,
+leading to expected-negative updates that degrade training path quality
+and lead to suboptimal final performance.
+
+\medskip
+\textbf{How should training algorithms track and adapt to the evolution of $\neff(t)$
+throughout on-policy RL training, in order to maintain reliable gradient updates,
+preserve training path quality, and improve final performance?}
+\end{rqbox}
+
+\subsection{Solution space}
+
+This research question is intentionally solution-agnostic.
+Candidate approaches include, but are not limited to:
+
+\begin{enumerate}[noitemsep]
+  \item \textbf{Adaptive learning rate}: set $\alpha(t) \propto \hat{\neff}(t)$
+        where $\hat{\neff}$ is estimated from rollout diversity or entropy.
+  \item \textbf{Adaptive rollout count}: increase $n$ as $H(\pith)$ decreases,
+        maintaining approximately constant $\neff$ despite increasing concentration.
+  \item \textbf{Temperature-separated sampling}: generate rollouts at higher temperature
+        to maintain diversity while computing advantages under the true $\pith$;
+        this partially decouples $\neff$ from $H(\pith)$.
+  \item \textbf{Diversity-preserving replay}: retain high-diversity samples from
+        earlier training steps and mix them with current rollouts,
+        effectively boosting $\neff$ without requiring more environment interactions.
+  \item \textbf{Distributional trust region}: directly constrain the distributional
+        divergence between consecutive policies on the \emph{full} distribution
+        (not just sampled actions), preventing the unsampled-action blind spot
+        that causes PPO clipping to underestimate policy change.
+\end{enumerate}
+
+Each approach addresses the same root cause---$\neff$ degradation---through a different mechanism.
+The framework predicts that any method that successfully maintains $\neff$ at a level
+where $\alpha \leq \alphaopt$ will produce better training paths and higher final performance.
+
+% =========================================================
+\section{Open Questions}
+\label{sec:open}
+
+\begin{enumerate}
+  \item \textbf{Formal characterization of $\neff(t)$.}
+    Definition~\ref{def:neff} uses $\neff(t) = \E[K_n] \approx \min(n, \exp(H(\pith)))$.
+    The perplexity $\exp(H)$ is convenient and differentiable, but it is a response-level quantity.
+    In practice we log per-token entropy, which aggregates over template tokens, reasoning tokens,
+    and conclusion tokens differently.
+    Is per-token entropy a reliable proxy for response-level perplexity?
+    Or should response-level diversity metrics (unique response fraction) be used instead?
+
+  \item \textbf{Tightness of the linear relationship.}
+    The derivation of $\alphaopt \propto \neff$ (linear) in Section~\ref{sec:monotone}
+    relies on two conditions:
+    (a) the noise-dominated regime ($\sigma_t^2/\neff \gg \|\gtrue\|^2$) and
+    (b) Assumption~\ref{ass:nsr} (constant noise-to-signal ratio).
+    A tight bound would require characterizing how $\|\gtrue\|^2$ and $\sigma_t^2$ evolve
+    with $H(\pith)$---both are problem-dependent.
+    Under what distributional conditions does Assumption~\ref{ass:nsr} hold, and how sensitive
+    is the conclusion to violations of this assumption?
+
+  \item \textbf{Separating the ceiling problem.}
+    The framework predicts that matching $\alpha$ to $\alphaopt$ improves path quality.
+    Whether path quality improvements can push past the 32.5\% AIME ceiling
+    depends on whether that ceiling is due to path quality (solvable within this framework)
+    or model capacity and reward signal sparsity (fundamental limits).
+    New experiments with better-tuned adaptive methods are needed to distinguish these.
+
+  \item \textbf{Optimality of different proxy metrics.}
+    Entropy is a coarse proxy for $\neff$.
+    Response-level diversity metrics (unique response fraction, pairwise response distance)
+    are more direct but harder to compute and differentiate.
+    What is the minimal observable that suffices for reliable $\neff$ tracking?
+\end{enumerate}
+
+% =========================================================
+
+\begin{thebibliography}{9}
+
+\bibitem{casella2002statistical}
+G.~Casella and R.~L. Berger.
+\newblock \emph{Statistical Inference}, 2nd ed.
+\newblock Duxbury, 2002.
+\newblock (Theorem 5.2.4: variance of sample mean for i.i.d.\ vector observations;
+  Theorem 4.3.1: covariance decomposition.)
+
+\bibitem{bottou2018optimization}
+L.~Bottou, F.~E. Curtis, and J.~Nocedal.
+\newblock Optimization methods for large-scale machine learning.
+\newblock \emph{SIAM Review}, 60(2):223--311, 2018.
+\newblock (Lemma A.1: descent lemma for $L$-smooth objectives;
+  Equation (4.8): per-step improvement bound for SGD with noisy gradients.)
+
+\end{thebibliography}
+
+\end{document}

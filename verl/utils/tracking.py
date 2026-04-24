@@ -433,6 +433,9 @@ class ValidationGenerationsLogger:
         """Log samples to swanlab as text"""
         import swanlab
 
+        if swanlab.get_run() is None:
+            return
+
         swanlab_table = swanlab.echarts.Table()
 
         # Create column names

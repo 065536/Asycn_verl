@@ -1,0 +1,408 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm,bm,mathtools}
+\usepackage{booktabs,array,longtable,multirow}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{setspace}
+\usepackage{microtype}
+\usepackage{graphicx}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black,citecolor=blue!60!black}
+\setlength{\parskip}{0.45em}
+\setlength{\parindent}{1.5em}
+\setlength{\headheight}{14pt}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{Adaptive LR for GRPO: Engineering Design}
+\rhead{\thepage}
+\titleformat{\section}{\Large\bfseries\color{blue!50!black}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries\color{blue!35!black}}{\thesubsection}{0.6em}{}
+\title{\textbf{Adaptive Learning Rate for GRPO via $\hat r_t$ and $c_t$: \\ Engineering Design Document (English Version)}}
+\author{}
+\date{\today}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert_2}
+\newcommand{\ip}[2]{\left\langle #1,#2 \right\rangle}
+\newcommand{\ghat}{\hat g}
+\newcommand{\rt}{r_t}
+\newcommand{\rhat}{\hat r_t}
+\newcommand{\phit}{\phi_t}
+\newcommand{\alphaopt}{\alpha_t^{\ast}}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Purpose of This Document}
+This document focuses purely on the \textbf{engineering realization} of our adaptive learning-rate method for GRPO. The theoretical backbone is assumed to be fixed already. The remaining question is how to implement the method inside a real training loop while keeping rollout overhead, estimator variance, and GRPO-specific normalization issues under control.
+
+We take the following theoretical relations as given:
+\begin{align}
+\alphaopt &= \frac{\rt}{L}, \\
+\rt &= \frac{\norm{g_t}^2}{\norm{g_t}^2 + \sigma_t^2 / n_{\mathrm{eff}}(t)} \in (0,1].
+\end{align}
+The engineering method is built around the decomposition
+\begin{equation}
+\alpha_t = c_t\,\rhat,
+\end{equation}
+where:
+\begin{itemize}[leftmargin=2em]
+    \item $\rhat$ is a \textbf{fast variable}: it tracks the time-varying shape of the optimal learning rate;
+    \item $c_t$ is a \textbf{slow variable}: it supplies the missing absolute scale and should ideally drift toward $1/L$.
+\end{itemize}
+
+This document answers the following engineering questions:
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item Which samples should be used for parameter updates, and which samples should be used only for measurement?
+    \item How should $\rhat$ be implemented in GRPO without breaking group-based advantage normalization?
+    \item Does $c_t$ need to be updated at every step?
+    \item How should ordinary training steps and calibration steps differ?
+    \item Where does rollout overhead come from, and how can it be reduced without destroying the clean statistical structure?
+\end{enumerate}
+
+\section{Fixed Method Structure}
+\subsection{Fast part versus slow part}
+The implementation is built around
+\begin{equation}
+\alpha_t = c_t\,\rhat.
+\end{equation}
+The roles of the two factors are intentionally different:
+\begin{itemize}[leftmargin=2em]
+    \item $\rhat$ is computed from the current batch under the current policy $\theta_t$, and it tracks the \textbf{time-varying shape} of the optimal learning rate.
+    \item $c_t$ starts from an initial value $c_0$ and is updated only gradually. It is meant to absorb the unknown \textbf{absolute scale} corresponding to $1/L$.
+\end{itemize}
+This immediately implies an implementation principle:
+\begin{quote}
+$\rhat$ may be updated at high frequency, but $c_t$ does \emph{not} need to be updated at high frequency.
+\end{quote}
+This two-timescale separation is the key to reducing rollout overhead.
+
+\subsection{Estimator for $\rhat$}
+If we have two independent unbiased gradient estimators generated under the same $\theta_t$, denoted by $\ghat_A$ and $\ghat_B$, then we define
+\begin{equation}
+\rhat = \frac{\ip{\ghat_A}{\ghat_B}}{\dfrac{\norm{\ghat_A}^2 + \norm{\ghat_B}^2}{2}}.
+\end{equation}
+The interpretation is:
+\begin{itemize}[leftmargin=2em]
+    \item the numerator estimates the signal term $\norm{g_t}^2$;
+    \item the denominator estimates signal plus noise;
+    \item the ratio therefore measures the \textbf{current gradient reliability}.
+\end{itemize}
+
+\subsection{Controller for $c_t$}
+Scale control is driven by a held-out realization ratio. Let $\ghat_{\mathrm{upd}}$ be the gradient actually used to update the parameters, and let $C$ denote a held-out dataset that does \emph{not} participate in the definition of $\alpha_t$. We define
+\begin{align}
+ p_t &:= \alpha_t \, \ip{\ghat_C}{\ghat_{\mathrm{upd}}}, \\
+ a_t &:= \widehat{\mathcal L}_C(\theta_{t+1}) - \widehat{\mathcal L}_C(\theta_t), \\
+ \phit &:= \frac{a_t}{p_t + \varepsilon}.
+\end{align}
+Here:
+\begin{itemize}[leftmargin=2em]
+    \item $p_t$ is the \textbf{first-order predicted gain};
+    \item $a_t$ is the \textbf{actual held-out surrogate gain};
+    \item $\phit$ is the \textbf{realization ratio} or \textbf{payoff ratio}.
+\end{itemize}
+The slow variable is then updated by
+\begin{equation}
+ c_{t+1} = c_t \exp\!\bigl(\eta_c(\phit - \phi^{\ast})\bigr).
+\end{equation}
+Under the local quadratic model, after substituting $\alpha_t = c_t r_t$, we obtain
+\begin{equation}
+\phit \approx 1 - \frac{c_t L}{2}.
+\end{equation}
+Hence the fixed-point condition $c_t \to 1/L$ corresponds to
+\begin{equation}
+\phi^{\ast} = \frac{1}{2}.
+\end{equation}
+This is a major simplification: \textbf{$\phi^{\ast}$ should be treated as a fixed constant, not as a function of $r_t$}. The time-varying part is already handled by $\rhat$.
+
+\section{What Must Happen in One Update Step}
+\subsection{Three statistical roles}
+At the highest level, one adaptive-LR step may involve three distinct statistical roles:
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item \textbf{Update data}: used to compute the training gradient and update the parameters;
+    \item \textbf{Shape-probe data}: used to estimate $\rhat$;
+    \item \textbf{Held-out data}: used to measure $\phit$ and update $c_t$.
+\end{enumerate}
+The crucial implementation fact is:
+\begin{quote}
+Only the third role must be genuinely held out. The first two roles may overlap in the sense that both may contribute to the update gradient.
+\end{quote}
+
+\subsection{Why the samples used for $\rhat$ may also contribute to the update}
+Suppose two gradient estimators $\ghat_A$ and $\ghat_B$ are used to estimate $\rhat$. There is no requirement that the ``$B$ side'' must be excluded from the final update. What matters is only that the held-out set $C$ does not influence $\alpha_t$ or $\theta_{t+1}$.
+
+Therefore, from an engineering viewpoint, the cleanest design is not to create a completely separate rollout stream solely for the ``$B$ side.'' Instead, the practical design is:
+\begin{quote}
+Use the training batch itself, split internally into two independent gradient estimates for measuring $\rhat$, and then combine both halves back into the actual update gradient.
+\end{quote}
+This drastically reduces unnecessary rollout overhead.
+
+\section{GRPO-Specific Constraint: Never Shrink the Response Group Carelessly}
+\subsection{Why naive response-level splitting is dangerous}
+In ordinary policy gradient, randomly splitting a batch mainly changes variance. In GRPO, however, the atomic object is not a single response but an entire \textbf{response group for one prompt}. If the standard group size is $G=8$, then advantage normalization is performed within that group, e.g.
+\begin{equation}
+A_i = \frac{r_i - \bar r}{s_r + \epsilon},
+\end{equation}
+where both $\bar r$ and $s_r$ are computed over all responses within that prompt group.
+
+If one takes the original 8 responses for a prompt and cuts them into smaller subsets for different roles, then the following problems appear immediately:
+\begin{itemize}[leftmargin=2em]
+    \item the group mean $\bar r$ becomes much noisier;
+    \item the group standard deviation $s_r$ becomes much less reliable;
+    \item normalization becomes unstable when the rewards are close or when one outlier dominates;
+    \item the advantage distribution no longer matches the intended GRPO training configuration.
+\end{itemize}
+So in GRPO, the most important engineering constraint is:
+\begin{quote}
+What must be preserved is \textbf{group integrity}, not merely the total number of responses.
+\end{quote}
+
+\subsection{Correct independence requirement in GRPO}
+If we use multiple independent response groups for the same policy $\theta_t$, then each group must perform its \emph{own} advantage normalization. In particular:
+\begin{itemize}[leftmargin=2em]
+    \item the update-side group must normalize within itself;
+    \item the shape-probe group must normalize within itself;
+    \item the held-out group must normalize within itself.
+\end{itemize}
+This preserves role separation and keeps each gradient estimator unbiased for the same objective. The cost is that if each group becomes too small, variance will increase dramatically.
+
+\section{Recommended Engineering Design}
+\subsection{Core idea}
+The recommended first implementation is the following:
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item Keep the training batch at the standard GRPO group size.
+    \item Do \emph{not} create an extra full rollout stream purely for estimating $\rhat$.
+    \item Instead, split the training batch internally by \textbf{prompt groups}, not by individual responses.
+    \item Use the two halves to estimate $\rhat$.
+    \item Use the average of the two halves as the actual update gradient.
+    \item Introduce a separate held-out set $C$ only on low-frequency calibration steps, not on every step.
+\end{enumerate}
+This means:
+\begin{quote}
+Ordinary steps need no extra rollout beyond the training batch. Only calibration steps pay additional rollout cost.
+\end{quote}
+
+\subsection{Internal split of the training batch}
+Let the training batch be denoted by $A$, and split it by prompt groups into two disjoint subsets,
+\begin{equation}
+A = A_1 \cup A_2, \qquad A_1 \cap A_2 = \varnothing.
+\end{equation}
+As long as both subsets are generated under the same $\theta_t$, both induce unbiased gradient estimators $\ghat_{A_1}$ and $\ghat_{A_2}$. Then define
+\begin{equation}
+\rhat = \frac{\ip{\ghat_{A_1}}{\ghat_{A_2}}}{\dfrac{\norm{\ghat_{A_1}}^2 + \norm{\ghat_{A_2}}^2}{2}},
+\end{equation}
+and define the actual update gradient by
+\begin{equation}
+\ghat_{\mathrm{upd}} = \frac{\ghat_{A_1} + \ghat_{A_2}}{2}.
+\end{equation}
+This achieves three goals simultaneously:
+\begin{itemize}[leftmargin=2em]
+    \item no extra rollout cost for measuring $\rhat$;
+    \item full preservation of GRPO group integrity;
+    \item a clean division of labor in which only $C$ is genuinely held out.
+\end{itemize}
+
+\section{Ordinary Steps and Calibration Steps}
+\subsection{Ordinary step: update parameters but do not update $c_t$}
+On an ordinary step, we estimate $\rhat$ and update the model parameters, but we do \emph{not} compute $\phit$.
+
+The procedure is:
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item Sample the training batch $A$ under the current policy $\theta_t$.
+    \item Split $A$ by prompt groups into $A_1$ and $A_2$.
+    \item Compute $\ghat_{A_1}$ and $\ghat_{A_2}$.
+    \item Compute
+    \begin{equation*}
+    \rhat = \frac{\ip{\ghat_{A_1}}{\ghat_{A_2}}}{\dfrac{\norm{\ghat_{A_1}}^2 + \norm{\ghat_{A_2}}^2}{2}}.
+    \end{equation*}
+    \item Form
+    \begin{equation*}
+    \ghat_{\mathrm{upd}} = \frac{\ghat_{A_1}+\ghat_{A_2}}{2}.
+    \end{equation*}
+    \item Set
+    \begin{equation*}
+    \alpha_t = c_t\,\rhat.
+    \end{equation*}
+    \item Update
+    \begin{equation*}
+    \theta_{t+1} = \theta_t - \alpha_t\,\ghat_{\mathrm{upd}}.
+    \end{equation*}
+\end{enumerate}
+No held-out batch is needed, and $c_t$ remains unchanged on that step.
+
+\subsection{Calibration step: update both parameters and $c_t$}
+Every $K$ steps, or at some other low frequency, we perform a calibration step. The first part is identical to the ordinary step. Then we additionally sample a held-out batch $C$ under the \emph{same old parameter} $\theta_t$.
+
+The full calibration procedure is:
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item Execute the ordinary-step logic and obtain $\theta_{t+1}$.
+    \item Independently sample a held-out batch $C$ under $\theta_t$.
+    \item Compute the held-out gradient $\ghat_C$.
+    \item Compute the first-order predicted gain
+    \begin{equation*}
+    p_t = \alpha_t \, \ip{\ghat_C}{\ghat_{\mathrm{upd}}}.
+    \end{equation*}
+    \item Compute the actual held-out surrogate gain
+    \begin{equation*}
+    a_t = \widehat{\mathcal L}_C(\theta_{t+1}) - \widehat{\mathcal L}_C(\theta_t).
+    \end{equation*}
+    \item Form the realization ratio
+    \begin{equation*}
+    \phit = \frac{a_t}{p_t + \varepsilon}.
+    \end{equation*}
+    \item Update the slow scale variable
+    \begin{equation*}
+    c_{t+1} = c_t \exp\!\bigl(\eta_c(\phit - \phi^{\ast})\bigr).
+    \end{equation*}
+\end{enumerate}
+The held-out batch $C$ is required only here.
+
+\section{Why Low-Frequency Calibration is Natural}
+Theoretical motivation and engineering motivation point in the same direction:
+\begin{itemize}[leftmargin=2em]
+    \item $\rhat$ is a fast variable and should respond to the current state of the rollout distribution;
+    \item $c_t$ is a slow variable and should not react aggressively to per-step noise.
+\end{itemize}
+Therefore, there is no reason to update $c_t$ on every step. A very natural implementation is:
+\begin{quote}
+Estimate $\rhat$ on every step, but update $c_t$ only every $K$ steps.
+\end{quote}
+When a step is not a calibration step, there is no need to allocate a held-out batch $C$. The sample budget that would otherwise go to $C$ simply does not need to exist on that step.
+
+\section{Implementation Example: $\mathrm{bsz}=256$, $\mathrm{mini\_bsz}=64$, $\mathrm{group\_size}=8$}
+Assume the total response budget used in an ordinary training step is 256 responses, with mini-batches of 64 responses and standard GRPO group size 8.
+
+Then the ordinary training batch corresponds to
+\begin{equation}
+\frac{256}{8} = 32
+\end{equation}
+prompt groups.
+
+A convenient engineering implementation is:
+\begin{itemize}[leftmargin=2em]
+    \item split the 32 prompt groups into $A_1$ and $A_2$;
+    \item each half contains 16 prompt groups;
+    \item each half therefore contains $16 \times 8 = 128$ responses;
+    \item with $\mathrm{mini\_bsz}=64$, each half is processed in two mini-batches.
+\end{itemize}
+So an ordinary step looks like this:
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item sample 32 prompt groups under $\theta_t$;
+    \item compute $\ghat_{A_1}$ from the first 16 groups;
+    \item compute $\ghat_{A_2}$ from the second 16 groups;
+    \item form $\rhat$ from the cross-inner-product of the two half-batch gradients;
+    \item form $\ghat_{\mathrm{upd}} = (\ghat_{A_1}+\ghat_{A_2})/2$;
+    \item set $\alpha_t = c_t\,\rhat$;
+    \item update the parameters.
+\end{enumerate}
+No extra rollout beyond the 256 responses is needed.
+
+On a calibration step, one additionally samples a held-out batch $C$. If $C$ also uses 32 prompt groups with group size 8, then the calibration step incurs one extra block of 256 responses. Since this happens only every $K$ steps, the average rollout multiplier becomes approximately
+\begin{equation}
+1 + \frac{1}{K}
+\end{equation}
+relative to the ordinary-step rollout budget used for training itself.
+
+\section{Why This Design Is Better Than a Separate Full ``B'' Stream}
+One might imagine using three completely separate streams at every step:
+\begin{itemize}[leftmargin=2em]
+    \item one for updates,
+    \item one for $\rhat$,
+    \item one for $\phit$.
+\end{itemize}
+In GRPO this is unattractive for two reasons:
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item if each stream preserves full group size, rollout cost grows rapidly;
+    \item if one tries to reduce cost by shrinking each group, advantage quality degrades sharply.
+\end{enumerate}
+The proposed design avoids both issues:
+\begin{itemize}[leftmargin=2em]
+    \item $\rhat$ is measured using an \emph{internal split} of the training batch, so there is no dedicated extra rollout just for shape estimation;
+    \item only the calibration signal for $c_t$ requires genuinely new held-out data.
+\end{itemize}
+Thus the only unavoidable measurement overhead is the held-out calibration batch, and even that overhead can be amortized by low-frequency updates.
+
+\section{Practical Safeguards}
+Even with the clean role separation above, the ratio $\phit$ may be unstable on some steps. A practical implementation should therefore include safeguards such as:
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item update $c_t$ only when $p_t$ is sufficiently positive;
+    \item skip the calibration update when $\ip{\ghat_C}{\ghat_{\mathrm{upd}}}$ is non-positive or too small;
+    \item clip or smooth $\phit$ before feeding it into the controller;
+    \item use a small $\eta_c$ so that $c_t$ remains a slow variable;
+    \item optionally impose lower and upper bounds on $c_t$ during early experiments.
+\end{enumerate}
+These safeguards do not change the logic of the method; they merely keep the controller from chasing batch noise.
+
+\section{Final Recommended Training Loop}
+The complete engineering recommendation can be summarized as follows.
+
+\subsection*{Ordinary step}
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item Sample one GRPO training batch under the current policy.
+    \item Split the batch by prompt groups into two halves.
+    \item Compute two half-batch gradients.
+    \item Estimate $\rhat$ from their cross-inner-product.
+    \item Average the two gradients to form the update gradient.
+    \item Use $\alpha_t = c_t\,\rhat$ to update the parameters.
+    \item Do not update $c_t$.
+\end{enumerate}
+
+\subsection*{Calibration step (every $K$ steps)}
+\begin{enumerate}[label=\arabic*., leftmargin=2em]
+    \item Perform the ordinary step.
+    \item Independently sample a held-out GRPO batch under the old policy.
+    \item Compute $p_t$, $a_t$, and $\phit$.
+    \item Update $c_t$ using the multiplicative controller.
+\end{enumerate}
+
+\subsection*{Core takeaways}
+\begin{itemize}[leftmargin=2em]
+    \item The samples used to estimate $\rhat$ may and should also contribute to the update gradient.
+    \item The only batch that must be genuinely held out is the one used for calibrating $c_t$.
+    \item In GRPO, preserving full group integrity is more important than forcing a naive three-way split of responses.
+    \item The cleanest first implementation is: \textbf{internal split for $\rhat$, low-frequency held-out calibration for $c_t$}. 
+\end{itemize}
+
+\section{Pseudocode}
+\begin{algorithm}[h]
+\caption{Adaptive learning rate for GRPO: engineering loop}
+\begin{algorithmic}[1]
+\State Initialize parameters $\theta_0$ and scale $c_0$
+\For{$t=0,1,2,\dots$}
+    \State Sample one GRPO training batch $A$ under $\theta_t$
+    \State Split $A$ by prompt groups into $A_1$ and $A_2$
+    \State Compute $\ghat_{A_1}$ and $\ghat_{A_2}$
+    \State $\rhat \gets \dfrac{\ip{\ghat_{A_1}}{\ghat_{A_2}}}{(\norm{\ghat_{A_1}}^2 + \norm{\ghat_{A_2}}^2)/2}$
+    \State $\ghat_{\mathrm{upd}} \gets (\ghat_{A_1}+\ghat_{A_2})/2$
+    \State $\alpha_t \gets c_t\,\rhat$
+    \State $\theta_{t+1} \gets \theta_t - \alpha_t\,\ghat_{\mathrm{upd}}$
+    \If{$t$ is a calibration step}
+        \State Sample held-out batch $C$ under $\theta_t$
+        \State Compute $\ghat_C$
+        \State $p_t \gets \alpha_t\,\ip{\ghat_C}{\ghat_{\mathrm{upd}}}$
+        \State $a_t \gets \widehat{\mathcal L}_C(\theta_{t+1}) - \widehat{\mathcal L}_C(\theta_t)$
+        \State $\phit \gets \dfrac{a_t}{p_t + \varepsilon}$
+        \State Optionally smooth / clip $\phit$
+        \State $c_{t+1} \gets c_t\exp\!\bigl(\eta_c(\phit - 1/2)\bigr)$
+    \Else
+        \State $c_{t+1} \gets c_t$
+    \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\end{document}

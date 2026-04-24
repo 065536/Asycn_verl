@@ -527,7 +527,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                     # TODO: we may want to add diff of probs too.
                     from verl.utils.debug.metrics import calculate_debug_metrics
 
-                    metrics.update(calculate_debug_metrics(batch))
+                    metrics.update(calculate_debug_metrics(batch, tokenizer=getattr(self, "tokenizer", None)))
 
         assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
         return batch

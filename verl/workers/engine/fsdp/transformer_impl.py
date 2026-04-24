@@ -16,8 +16,10 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
 import gc
+import json
 import logging
 import os
+import time
 import warnings
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional
@@ -79,6 +81,508 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+class EntropyAdaptiveLRScheduler:
+    """LR scheduler that scales LR based on entropy relative to a reference.
+
+    Two reference modes:
+      - "ema":     α_t = α_0 * min(H_t / H_ref_t, 1.0), where H_ref_t is an EMA.
+                   Reacts to sudden entropy drops relative to recent trend.
+      - "initial": α_t = α_0 * min(H_t / H_0, 1.0), where H_0 is the first entropy.
+                   Couples LR directly to absolute support level.
+
+    Both modes clamp the ratio above min_ratio and cap at 1.0.
+    Supports linear warmup. Entropy state is updated externally via update_entropy().
+    """
+
+    def __init__(self, optimizer, num_warmup_steps: int, min_ratio: float,
+                 ema_beta: float = 0.95, reference_mode: str = "ema"):
+        assert reference_mode in ("ema", "initial"), f"Unknown reference_mode: {reference_mode}"
+        self.optimizer = optimizer
+        self.num_warmup_steps = num_warmup_steps
+        self.min_ratio = min_ratio
+        self.ema_beta = ema_beta
+        self.reference_mode = reference_mode
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self.step_count = 0
+        # Entropy state
+        self.H0: float = None        # first entropy ever seen (for "initial" mode)
+        self.H_ref: float = None     # EMA of entropy (for "ema" mode)
+        self.current_H: float = None
+        # Initialize optimizer LR to base_lr/warmup_steps so training step 1
+        # uses the correct warmup-start LR (avoids the original bug where step 1
+        # used full base_lr and then dropped 10x to base_lr/N at step 2).
+        if num_warmup_steps > 0:
+            init_factor = 1.0 / num_warmup_steps
+            self._last_lr = [base_lr * init_factor for base_lr in self.base_lrs]
+            for lr, pg in zip(self._last_lr, self.optimizer.param_groups):
+                pg["lr"] = lr
+        else:
+            self._last_lr = list(self.base_lrs)
+
+    def update_entropy(self, entropy: float):
+        """Update current entropy and reference values; initializes on first call."""
+        if self.H0 is None:
+            self.H0 = entropy
+        if self.H_ref is None:
+            self.H_ref = entropy
+        else:
+            self.H_ref = self.ema_beta * self.H_ref + (1.0 - self.ema_beta) * entropy
+        self.current_H = entropy
+
+    def _entropy_ratio(self) -> float:
+        if self.current_H is None:
+            return 1.0
+        if self.reference_mode == "initial":
+            if self.H0 is None or self.H0 <= 0:
+                return 1.0
+            ratio = self.current_H / self.H0
+        else:  # ema
+            if self.H_ref is None or self.H_ref <= 0:
+                return 1.0
+            ratio = self.current_H / self.H_ref
+        # Cap at 1.0: LR never exceeds base LR even if entropy temporarily rises
+        ratio = min(ratio, 1.0)
+        return max(ratio, self.min_ratio)
+
+    def step(self):
+        self.step_count += 1
+        if self.num_warmup_steps > 0 and self.step_count <= self.num_warmup_steps:
+            warmup_factor = self.step_count / self.num_warmup_steps
+        else:
+            warmup_factor = 1.0
+        scale = warmup_factor * self._entropy_ratio()
+        self._last_lr = []
+        for base_lr, pg in zip(self.base_lrs, self.optimizer.param_groups):
+            new_lr = base_lr * scale
+            pg["lr"] = new_lr
+            self._last_lr.append(new_lr)
+
+    def get_last_lr(self):
+        return list(self._last_lr)
+
+    def state_dict(self):
+        return {
+            "step_count": self.step_count,
+            "H0": self.H0,
+            "H_ref": self.H_ref,
+            "current_H": self.current_H,
+            "base_lrs": self.base_lrs,
+            "_last_lr": self._last_lr,
+            "ema_beta": self.ema_beta,
+            "min_ratio": self.min_ratio,
+            "reference_mode": self.reference_mode,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.step_count = state_dict["step_count"]
+        self.H0 = state_dict.get("H0", None)
+        self.H_ref = state_dict["H_ref"]
+        self.current_H = state_dict["current_H"]
+        self.base_lrs = state_dict["base_lrs"]
+        self._last_lr = state_dict["_last_lr"]
+        if "ema_beta" in state_dict:
+            self.ema_beta = state_dict["ema_beta"]
+        if "min_ratio" in state_dict:
+            self.min_ratio = state_dict["min_ratio"]
+        if "reference_mode" in state_dict:
+            self.reference_mode = state_dict["reference_mode"]
+
+
+class SignalFractionLRScheduler:
+    """LR scheduler implementing the two-timescale signal-fraction decomposition.
+
+    α_t = c_t · r_t_ctrl
+
+    r-side (fast, per-step):
+      Estimates the signal fraction r̂_t = dot(ĝ_A1, ĝ_A2) / mean_norm_sq.
+      Uses a three-stage pipeline to convert the noisy raw estimate into a
+      reliable control value:
+
+        1. Validity guard (3 conditions must all pass):
+             (a) dot(ĝ_A1, ĝ_A2) > 0
+             (b) d_t = (||ĝ_A1||² + ||ĝ_A2||²)/2  >  d_min_abs
+             (c) g_rms_t = sqrt(||ĝ_upd||² / n_params)  >  tau_rms * g_rms_ema
+           g_rms_ema is updated unconditionally on any step where (b) holds
+           (decoupled from validity to avoid circular dependency).
+
+        2. Asymmetric EMA on valid observations:
+             β↓ (fast) when r_obs < r̄_{t-1},  β↑ (slow) when r_obs ≥ r̄_{t-1}
+
+        3. Fast-drop + cooldown state machine:
+             If r_obs valid AND r_obs < ρ · r̄_{t-1} → enter cooldown (H steps).
+             During cooldown: r̄ continues updating, c_t is frozen.
+             Cooldown resets if fast-drop triggers again.
+
+      Control value:  r_t_ctrl = max(min(r̄_t, r_obs_valid), r_min_ctrl)
+      During fast-drop step:  r_t_ctrl = max(r_obs, r_min_ctrl)  (bypass EMA)
+
+    c-side (slow, every K calibration steps):
+      Scale factor updated by the held-out realization ratio φ_t, targeting φ*=1/2.
+      Frozen during cooldown (fast-drop active).
+
+    Warmup:
+      Steps 1..T_w: original warmup LR ramp; r̂_t is computed and tracked with a
+      symmetric EMA (β_sym) but does NOT control LR.  g_rms_ema also bootstraps.
+      Initialized: r̄_warm = r_boot.
+
+    Handoff (step T_w → T_w+1):
+      c_T = α_base / max(r̄_warm, r_boot)  so that c_T · r̄ ≈ α_base (continuity).
+      r̄_post := r̄_warm  (no reset; EMA transitions from symmetric to asymmetric).
+      LR is interpolated over M handoff_steps:
+        α_t = (1 - λ) · α_base + λ · (c_t · r̄_t),  λ = (t - T_w) / M  ↑ 1.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        num_warmup_steps: int,
+        c_init: float,
+        eta_c: float,
+        c_min: float,
+        c_max: float,
+        phi_ema_beta: float,
+        r_min_ctrl: float,
+        r_boot: float,
+        r_ema_beta_sym: float,
+        r_ema_beta_down: float,
+        r_ema_beta_up: float,
+        g_rms_ema_beta: float,
+        d_min_abs: float,
+        tau_rms: float,
+        fast_drop_rho: float,
+        cooldown_steps: int,
+        handoff_steps: int,
+        sign_gate_gamma: float = None,
+        sign_gate_alpha_plus: float = None,
+    ):
+        import math as _math
+        self._math = _math
+
+        self.optimizer = optimizer
+        self.num_warmup_steps = num_warmup_steps
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self.step_count = 0
+
+        # c-side
+        self.c_t = c_init
+        self.eta_c = eta_c
+        self.c_min = c_min
+        self.c_max = c_max
+        self.phi_ema_beta = phi_ema_beta
+        self.phi_bar = 0.5  # initialized to target; controller starts neutral
+
+        # r-side: hyper-parameters
+        self.r_min_ctrl = r_min_ctrl
+        self.r_boot = r_boot
+        self.r_ema_beta_sym = r_ema_beta_sym
+        self.r_ema_beta_down = r_ema_beta_down
+        self.r_ema_beta_up = r_ema_beta_up
+        self.g_rms_ema_beta = g_rms_ema_beta
+        self.d_min_abs = d_min_abs
+        self.tau_rms = tau_rms
+        self.fast_drop_rho = fast_drop_rho
+        self.cooldown_steps = cooldown_steps
+        self.handoff_steps = handoff_steps
+
+        # r-side: state
+        self.r_ema: float = r_boot          # unified EMA (sym during warmup, asym after)
+        self.g_rms_ema: float = None        # bootstrapped on first valid step
+        self._handoff_done: bool = False    # True once warmup has ended
+        self._handoff_step: int = 0         # steps completed since handoff
+        self._cooldown_counter: int = 0     # >0 means in cooldown
+
+        # sign-gate mode
+        # When set, overrides continuous r_ctrl with a two-level gate:
+        #   g_dot > 0  →  r_ctrl = _sign_gate_r_ref (full speed)
+        #   g_dot ≤ 0  →  r_ctrl = gamma × _sign_gate_r_ref (reduced)
+        # _sign_gate_r_ref is fixed at handoff as max(r_ema, r_boot) so that
+        # c_T × r_ref = alpha_base (handoff continuity preserved).
+        #
+        # sign_gate_alpha_plus (optional): if set, overrides c_T at handoff so that
+        # c_T × r_ref = sign_gate_alpha_plus (instead of alpha_base). This decouples
+        # the warmup ramp (= alpha_base) from the post-handoff full-speed LR (= alpha_plus),
+        # enabling warmup-match across experiments without breaking mean-matching.
+        self.sign_gate_gamma: float = sign_gate_gamma
+        self.sign_gate_alpha_plus: float = sign_gate_alpha_plus
+        self._sign_gate_r_ref: float = None  # set at handoff
+
+        # Metrics
+        self._last_r_hat_raw: float = 0.0
+        self._last_r_hat: float = r_boot
+        self._last_alpha: float = self.base_lrs[0]
+        self._last_phi: float = None
+        self._last_p_t: float = None
+        self._last_a_t: float = None
+        self._last_r_ctrl: float = r_boot
+
+        # Initialize warmup start LR
+        if num_warmup_steps > 0:
+            init_lr = self.base_lrs[0] / num_warmup_steps
+            for pg in optimizer.param_groups:
+                pg["lr"] = init_lr
+            self._last_lr = [init_lr]
+        else:
+            for pg in optimizer.param_groups:
+                pg["lr"] = self.base_lrs[0]
+            self._last_lr = [self.base_lrs[0]]
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _check_validity(self, g_dot: float, d_t: float, g_rms_t: float) -> bool:
+        """Three-condition validity guard for a raw r̂_t observation."""
+        if g_dot <= 0:
+            return False
+        if d_t <= self.d_min_abs:
+            return False
+        if self.g_rms_ema is not None and g_rms_t <= self.tau_rms * self.g_rms_ema:
+            return False
+        return True
+
+    def _update_g_rms_ema(self, d_t: float, g_rms_t: float):
+        """Update background gradient-scale EMA (unconditional, only gated by d_min_abs)."""
+        if d_t <= self.d_min_abs:
+            return
+        if self.g_rms_ema is None:
+            self.g_rms_ema = g_rms_t  # bootstrap on first numerically valid step
+        else:
+            b = self.g_rms_ema_beta
+            self.g_rms_ema = (1.0 - b) * self.g_rms_ema + b * g_rms_t
+
+    def _update_r_ema_warmup(self, r_obs: float):
+        """Symmetric EMA update during warmup."""
+        b = self.r_ema_beta_sym
+        self.r_ema = (1.0 - b) * self.r_ema + b * r_obs
+
+    def _update_r_ema_post(self, r_obs: float):
+        """Asymmetric EMA update post-handoff."""
+        if r_obs < self.r_ema:
+            b = self.r_ema_beta_down
+        else:
+            b = self.r_ema_beta_up
+        self.r_ema = (1.0 - b) * self.r_ema + b * r_obs
+
+    def _set_optimizer_lr(self, lr: float):
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
+        self._last_lr = [lr]
+        self._last_alpha = lr
+
+    # ------------------------------------------------------------------ #
+    # Main entry: called every training step after computing r̂_t stats
+    # ------------------------------------------------------------------ #
+
+    def update_r_and_set_lr(
+        self,
+        g_dot: float,
+        d_t: float,
+        g_rms_t: float,
+        r_hat_raw: float,
+    ) -> float:
+        """Process the raw r̂_t estimate, update EMA, and set optimizer LR.
+
+        Must be called after step() so that step_count is already incremented.
+
+        Returns the α_t applied.
+        """
+        self._last_r_hat_raw = r_hat_raw
+
+        # Always update the background g_rms baseline
+        self._update_g_rms_ema(d_t, g_rms_t)
+
+        valid = self._check_validity(g_dot, d_t, g_rms_t)
+        r_obs = float(max(0.0, min(1.0, r_hat_raw))) if valid else None
+
+        # ---- warmup phase ----
+        if self.step_count <= self.num_warmup_steps:
+            if valid:
+                self._update_r_ema_warmup(r_obs)
+            # LR is controlled by step() during warmup; nothing to do here
+            alpha_t = self._last_lr[0]
+            self._last_r_hat = self.r_ema
+            self._last_r_ctrl = self.r_ema
+            self._last_alpha = alpha_t
+            return alpha_t
+
+        # ---- first step past warmup: perform handoff ----
+        if not self._handoff_done:
+            self._handoff_done = True
+            self._handoff_step = 0
+            # Re-initialize c_t so that c_T * r̄ ≈ α_base (LR continuity)
+            alpha_base = self.base_lrs[0]
+            r_denom = max(self.r_ema, self.r_boot)
+            self.c_t = max(self.c_min, min(self.c_max, alpha_base / r_denom))
+            # Reset phi_bar: warmup calibrations have tiny LR so phi_t is
+            # noisy and biased; carry-over would corrupt the post-handoff controller.
+            self.phi_bar = 0.5
+            # r̄_post := r̄_warm (EMA continues, no reset)
+            # Switch to asymmetric EMA from this step on
+            # Sign-gate: fix reference r at handoff = max(r_ema, r_boot)
+            # so that c_T × r_ref = alpha_base exactly.
+            if self.sign_gate_gamma is not None:
+                self._sign_gate_r_ref = r_denom
+                # If sign_gate_alpha_plus is provided, override c_T so that
+                # c_T × r_ref = alpha_plus (not alpha_base). This decouples
+                # the warmup ramp target from the post-handoff full-speed LR.
+                if self.sign_gate_alpha_plus is not None:
+                    self.c_t = max(self.c_min, min(self.c_max, self.sign_gate_alpha_plus / r_denom))
+
+        # ---- update asymmetric EMA with current observation ----
+        r_prev = self.r_ema
+        fast_drop_triggered = False
+
+        if valid:
+            # Fast-drop detection (compare against r̄ before this update)
+            if r_obs < self.fast_drop_rho * r_prev:
+                fast_drop_triggered = True
+                self._cooldown_counter = self.cooldown_steps
+            self._update_r_ema_post(r_obs)
+        # (if invalid, r̄ is held; cooldown state is unchanged)
+
+        # ---- compute r_t_ctrl ----
+        if self.sign_gate_gamma is not None and self._sign_gate_r_ref is not None:
+            # Sign-gate mode: two-level gate based on alignment sign
+            if g_dot > 0:
+                r_ctrl = self._sign_gate_r_ref
+            else:
+                r_ctrl = self.sign_gate_gamma * self._sign_gate_r_ref
+        elif fast_drop_triggered and valid:
+            # Immediate response: bypass EMA, use raw obs directly
+            r_ctrl = float(max(r_obs, self.r_min_ctrl))
+        elif valid:
+            r_ctrl = float(max(min(self.r_ema, r_obs), self.r_min_ctrl))
+        else:
+            r_ctrl = float(max(self.r_ema, self.r_min_ctrl))
+
+        self._last_r_hat = self.r_ema
+        self._last_r_ctrl = r_ctrl
+
+        # ---- compute α_t ----
+        alpha_sf = self.c_t * r_ctrl  # signal-fraction target LR
+
+        if self._handoff_step < self.handoff_steps:
+            # Interpolation: blend warmup LR → signal-fraction LR
+            lam = self._handoff_step / self.handoff_steps
+            alpha_t = (1.0 - lam) * self.base_lrs[0] + lam * alpha_sf
+            self._handoff_step += 1
+        else:
+            alpha_t = alpha_sf
+
+        self._set_optimizer_lr(alpha_t)
+
+        # Always advance cooldown timer (once per training step, unconditionally)
+        if self._cooldown_counter > 0:
+            self._cooldown_counter -= 1
+
+        return alpha_t
+
+    # ------------------------------------------------------------------ #
+    # c-side update (called from actor after calibration step)
+    # ------------------------------------------------------------------ #
+
+    def update_ct(self, phi_t: float, p_t: float, g_dot: float):
+        """Update scale factor c_t using the realization ratio φ_t.
+
+        Skipped if:
+          - g_dot ≤ 0 (update direction misaligned with held-out gradient)
+          - currently in cooldown (fast-drop active)
+        """
+        if self._cooldown_counter > 0:
+            # c_t frozen during cooldown; counter is decremented by update_r_and_set_lr
+            return
+        if g_dot <= 0:
+            return
+        phi_clipped = max(-2.0, min(2.0, phi_t))
+        self.phi_bar = self.phi_ema_beta * self.phi_bar + (1.0 - self.phi_ema_beta) * phi_clipped
+        self.c_t = self.c_t * self._math.exp(self.eta_c * (self.phi_bar - 0.5))
+        self.c_t = max(self.c_min, min(self.c_max, self.c_t))
+        self._last_phi = phi_t
+        self._last_p_t = p_t
+
+    # ------------------------------------------------------------------ #
+    # step(): warmup LR ramp; no-op after warmup
+    # ------------------------------------------------------------------ #
+
+    def step(self):
+        """Advance step counter; applies warmup LR ramp. No-op after warmup ends."""
+        self.step_count += 1
+        if self.num_warmup_steps > 0 and self.step_count <= self.num_warmup_steps:
+            warmup_factor = self.step_count / self.num_warmup_steps
+            lr = self.base_lrs[0] * warmup_factor
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = lr
+            self._last_lr = [lr]
+
+    def get_last_lr(self):
+        return list(self._last_lr)
+
+    def get_signal_fraction_metrics(self) -> dict:
+        metrics = {
+            "actor/r_hat_raw": self._last_r_hat_raw,
+            "actor/r_hat": self._last_r_hat,
+            "actor/r_ctrl": self._last_r_ctrl,
+            "actor/c_t": self.c_t,
+            "actor/alpha_t": self._last_alpha,
+            "actor/phi_bar": self.phi_bar,
+            "actor/cooldown": float(self._cooldown_counter > 0),
+            "actor/in_handoff": float(self._handoff_done and self._handoff_step < self.handoff_steps),
+        }
+        if self.g_rms_ema is not None:
+            metrics["actor/g_rms_ema"] = self.g_rms_ema
+        if self._last_phi is not None:
+            metrics["actor/phi_t"] = self._last_phi
+        if self._last_p_t is not None:
+            metrics["actor/p_t"] = self._last_p_t
+        if self._last_a_t is not None:
+            metrics["actor/a_t"] = self._last_a_t
+        return metrics
+
+    def state_dict(self):
+        return {
+            "step_count": self.step_count,
+            "c_t": self.c_t,
+            "phi_bar": self.phi_bar,
+            "r_ema": self.r_ema,
+            "g_rms_ema": self.g_rms_ema,
+            "_handoff_done": self._handoff_done,
+            "_handoff_step": self._handoff_step,
+            "_cooldown_counter": self._cooldown_counter,
+            "base_lrs": self.base_lrs,
+            "_last_lr": self._last_lr,
+            "_last_r_hat_raw": self._last_r_hat_raw,
+            "_last_r_hat": self._last_r_hat,
+            "_last_r_ctrl": self._last_r_ctrl,
+            "_last_alpha": self._last_alpha,
+            "_last_phi": self._last_phi,
+            "_last_p_t": self._last_p_t,
+            "_last_a_t": self._last_a_t,
+            "_sign_gate_r_ref": self._sign_gate_r_ref,
+            "sign_gate_alpha_plus": self.sign_gate_alpha_plus,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.step_count = state_dict["step_count"]
+        self.c_t = state_dict["c_t"]
+        self.phi_bar = state_dict["phi_bar"]
+        self.r_ema = state_dict.get("r_ema", self.r_boot)
+        self.g_rms_ema = state_dict.get("g_rms_ema", None)
+        self._handoff_done = state_dict.get("_handoff_done", False)
+        self._handoff_step = state_dict.get("_handoff_step", 0)
+        self._cooldown_counter = state_dict.get("_cooldown_counter", 0)
+        self.base_lrs = state_dict["base_lrs"]
+        self._last_lr = state_dict["_last_lr"]
+        self._last_r_hat_raw = state_dict.get("_last_r_hat_raw", 0.0)
+        self._last_r_hat = state_dict.get("_last_r_hat", self.r_boot)
+        self._last_r_ctrl = state_dict.get("_last_r_ctrl", self.r_boot)
+        self._last_alpha = state_dict.get("_last_alpha", self.c_t)
+        self._last_phi = state_dict.get("_last_phi", None)
+        self._last_p_t = state_dict.get("_last_p_t", None)
+        self._last_a_t = state_dict.get("_last_a_t", None)
+        self._sign_gate_r_ref = state_dict.get("_sign_gate_r_ref", None)
+        # sign_gate_alpha_plus is a constructor param, not mutable state; not restored from checkpoint
 
 
 class FSDPEngine(BaseEngine):
@@ -219,8 +723,8 @@ class FSDPEngine(BaseEngine):
         torch_dtype = self.engine_config.model_dtype
 
         if torch_dtype is None:
-            # if it is training, we force torch_dtype to fp32
-            torch_dtype = torch.float32 if not self.engine_config.forward_only else torch.bfloat16
+            # Default to bf16 for both train and inference when unspecified (matches fsdp.yaml / mixed precision).
+            torch_dtype = torch.bfloat16
 
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
@@ -428,6 +932,15 @@ class FSDPEngine(BaseEngine):
 
         if lr_scheduler_type == "constant":
             lr_scheduler = get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps)
+        elif lr_scheduler_type == "entropy_adaptive":
+            min_ratio = optim_config.entropy_adaptive_min_ratio
+            ema_beta = optim_config.entropy_adaptive_ema_beta
+            lr_scheduler = EntropyAdaptiveLRScheduler(
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                min_ratio=min_ratio,
+                ema_beta=ema_beta,
+            )
         elif lr_scheduler_type == "cosine":
             lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
@@ -592,6 +1105,41 @@ class FSDPEngine(BaseEngine):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
+                    # region agent log
+                    try:
+                        if torch.cuda.is_available():
+                            free_b, total_b = torch.cuda.mem_get_info()
+                            mem = {
+                                "cuda_mem_free_gib": round(free_b / (1024**3), 3),
+                                "cuda_mem_total_gib": round(total_b / (1024**3), 3),
+                                "cuda_allocated_gib": round(torch.cuda.memory_allocated() / (1024**3), 3),
+                                "cuda_reserved_gib": round(torch.cuda.memory_reserved() / (1024**3), 3),
+                            }
+                        else:
+                            mem = {}
+                        payload = {
+                            "sessionId": "dc2587",
+                            "runId": os.environ.get("VERL_DEBUG_RUN_ID", "pre-fix"),
+                            "hypothesisId": "H1/H2/H3/H4",
+                            "location": "verl/workers/engine/fsdp/transformer_impl.py:forward_backward_batch:pre_backward",
+                            "message": "pre-backward memory + batch token stats",
+                            "data": {
+                                "forward_only": bool(forward_only),
+                                "loss_mask_tokens": int(micro_batch["loss_mask"].sum().item())
+                                if "loss_mask" in micro_batch.keys()
+                                else None,
+                                "max_token_len_per_gpu": tu.get(micro_batch, "max_token_len_per_gpu", default=None),
+                                "micro_batch_size_per_gpu": tu.get(micro_batch, "micro_batch_size_per_gpu", default=None),
+                                "use_dynamic_bsz": tu.get(micro_batch, "use_dynamic_bsz", default=None),
+                                **mem,
+                            },
+                            "timestamp": int(time.time() * 1000),
+                        }
+                        with open("/data/250010176/codes/verl/.cursor/debug-dc2587.log", "a", encoding="utf-8") as f:
+                            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
+                    # endregion
                     loss.backward()
 
             output_lst.append(meta_info)
@@ -650,6 +1198,14 @@ class FSDPEngine(BaseEngine):
         self.lr_scheduler.step()
         lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
         return lr
+
+    def update_entropy_for_lr(self, entropy: float):
+        """Update current entropy for entropy-adaptive LR scheduler.
+
+        No-op if the scheduler is not an EntropyAdaptiveLRScheduler.
+        """
+        if isinstance(self.lr_scheduler, EntropyAdaptiveLRScheduler):
+            self.lr_scheduler.update_entropy(entropy)
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         """

@@ -1,0 +1,901 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{setspace}
+\usepackage{titlesec}
+\usepackage{microtype}
+
+\setstretch{1.12}
+\setlist[itemize]{topsep=3pt,itemsep=2pt,leftmargin=2em}
+\setlist[enumerate]{topsep=3pt,itemsep=2pt,leftmargin=2.2em}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.75em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.75em}{}
+
+\title{From the Observed Failure of Fixed Learning Rates to the Core Algorithm\\[0.4em]
+\large A Minimal and Fully Explicit Reconstruction}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This note reconstructs the project logic using only the core objects that are still needed. The starting point is an empirical fact: in on-policy RL, a fixed learning rate can be too small early in training and too large later in training. The central question is therefore not ``why does entropy decrease'' and not ``what is support,'' but rather: \emph{why does the safe and useful step size change over time?} We answer this question in a fully explicit sequence. First, each update is a sample-based approximation of the true gradient. Second, as the policy concentrates, the effective number of distinct rollouts decreases, which increases gradient-estimation noise. Third, combining this fact with an $L$-smooth improvement bound yields a time-varying optimal learning rate
+\[
+\alpha_t^* = \frac{r_t}{L},
+\qquad
+r_t = \frac{\|g_t\|^2}{\|g_t\|^2 + \sigma_t^2 / n_{\mathrm{eff}}(t)}.
+\]
+The entire time variation is captured by the signal fraction $r_t$. We then show how $r_t$ can be estimated online with a split-batch estimator, and why this naturally leads to the algorithmic decomposition
+\[
+\alpha_t = c_t\,\hat r_t,
+\]
+where $\hat r_t$ tracks the time-varying shape of the optimal learning rate and $c_t$ carries the unknown absolute scale. No auxiliary stories about support, entropy-driven monotone decay, or broad information taxonomies are needed.
+\end{abstract}
+
+\section{What is the real problem?}
+
+We begin from the empirical observation that motivated the project.
+
+\begin{quote}
+In on-policy RL, a fixed learning rate eventually fails. More precisely, the same fixed learning rate may be \emph{too small} in one phase of training and \emph{too large} in another.
+\end{quote}
+
+This already tells us that the right question is \emph{not} ``should the learning rate decrease because entropy decreases?'' That formulation already presupposes both the signal to monitor and the direction of change. The real question is more primitive:
+
+\begin{quote}
+Why does the safe and useful step size change over time in on-policy RL?
+\end{quote}
+
+The whole project should be reconstructed around this question.
+
+\paragraph{What should not be the starting point.}
+At this stage we deliberately exclude several older narratives:
+\begin{itemize}
+    \item ``support shrinkage'' as the central primitive;
+    \item ``entropy decreases, therefore learning rate should also decrease'';
+    \item broad conceptual decompositions that introduce more latent objects than the algorithm ever uses.
+\end{itemize}
+These may be intuitively suggestive, but they are not the shortest route from the observed optimization failure to a concrete algorithm.
+
+\paragraph{What should be the starting point.}
+The correct starting point is this:
+\begin{quote}
+Each RL update is built from samples produced by the current policy. Therefore, the quality of the update depends on the quality of the \emph{sample-based evidence} available at that step.
+\end{quote}
+
+Once this is stated, the problem becomes a quantitative one:
+\begin{quote}
+How does the quality of the gradient estimate change over training, and what does that imply for the optimal learning rate?
+\end{quote}
+
+This is the point from which the mathematics should begin.
+
+\section{RL updates are sample-based approximations}
+
+Let $J(\theta)$ denote the objective that the policy seeks to optimize. In principle, the ideal update direction is the true gradient
+\[
+g_t := \nabla J(\theta_t).
+\]
+However, in RL we do not have direct access to $g_t$. Instead, at step $t$ we sample trajectories from the current policy and construct an estimator
+\[
+\hat g_t.
+\]
+The parameter update is therefore
+\[
+\theta_{t+1} = \theta_t + \alpha_t \hat g_t.
+\]
+This equation is simple, but it contains the entire difficulty. The optimization algorithm never updates with the exact gradient. It always updates with an estimate.
+
+Therefore, the quality of the update depends on two things:
+\begin{enumerate}
+    \item the true direction $g_t$ that we would like to follow;
+    \item the discrepancy between the estimator $\hat g_t$ and the truth $g_t$.
+\end{enumerate}
+
+So the first formal subproblem is:
+\begin{quote}
+How large is the estimation error $\hat g_t - g_t$?
+\end{quote}
+
+\section{The mean squared error of the batch gradient estimator}
+
+We now derive the estimation error carefully.
+
+Let
+\[
+X_i := A_i\,\nabla_\theta \log \pi_{\theta_t}(\tau_i) \in \mathbb{R}^d
+\]
+be the per-sample gradient contribution of the $i$-th rollout, where
+\[
+\tau_i \overset{\text{i.i.d.}}{\sim} \pi_{\theta_t}.
+\]
+Assume that the estimator is unbiased, so that
+\[
+\mathbb{E}[X_i] = g_t.
+\]
+Using $n$ samples, the batch estimator is
+\[
+\hat g_t = \frac{1}{n}\sum_{i=1}^n X_i.
+\]
+By linearity of expectation,
+\[
+\mathbb{E}[\hat g_t]
+=
+\frac{1}{n}\sum_{i=1}^n \mathbb{E}[X_i]
+=
+\frac{1}{n}\sum_{i=1}^n g_t
+=
+g_t.
+\]
+So the estimator is unbiased.
+
+We now compute its mean squared error:
+\[
+\mathbb{E}\bigl[\|\hat g_t - g_t\|^2\bigr].
+\]
+First rewrite the difference as
+\[
+\hat g_t - g_t
+=
+\frac{1}{n}\sum_{i=1}^n (X_i - g_t).
+\]
+Hence
+\[
+\mathbb{E}\bigl[\|\hat g_t - g_t\|^2\bigr]
+=
+\mathbb{E}\left[\left\|\frac{1}{n}\sum_{i=1}^n (X_i-g_t)\right\|^2\right].
+\]
+Pulling out the factor $1/n$ gives
+\[
+\mathbb{E}\bigl[\|\hat g_t - g_t\|^2\bigr]
+=
+\frac{1}{n^2}
+\mathbb{E}\left[\left\|\sum_{i=1}^n (X_i-g_t)\right\|^2\right].
+\]
+Expand the squared norm:
+\[
+\left\|\sum_{i=1}^n (X_i-g_t)\right\|^2
+=
+\sum_{i=1}^n \|X_i-g_t\|^2
++
+\sum_{i\neq j}(X_i-g_t)^\top (X_j-g_t).
+\]
+Taking expectation,
+\begin{align*}
+\mathbb{E}\bigl[\|\hat g_t - g_t\|^2\bigr]
+&=
+\frac{1}{n^2}
+\left(
+\sum_{i=1}^n \mathbb{E}[\|X_i-g_t\|^2]
++
+\sum_{i\neq j}\mathbb{E}\bigl[(X_i-g_t)^\top(X_j-g_t)\bigr]
+\right).
+\end{align*}
+Because the samples are independent and centered,
+\[
+\mathbb{E}\bigl[(X_i-g_t)^\top(X_j-g_t)\bigr]=0,
+\qquad i\neq j.
+\]
+Therefore all cross-terms vanish, leaving
+\[
+\mathbb{E}\bigl[\|\hat g_t - g_t\|^2\bigr]
+=
+\frac{1}{n^2}
+\sum_{i=1}^n \mathbb{E}[\|X_i-g_t\|^2].
+\]
+Since the $X_i$ are identically distributed,
+\[
+\mathbb{E}\bigl[\|\hat g_t - g_t\|^2\bigr]
+=
+\frac{1}{n^2}\cdot n \, \mathbb{E}[\|X-g_t\|^2]
+=
+\frac{1}{n}\,\mathbb{E}[\|X-g_t\|^2].
+\]
+Define
+\[
+\sigma_t^2 := \mathbb{E}[\|X-g_t\|^2].
+\]
+Then
+\begin{equation}
+\mathbb{E}\bigl[\|\hat g_t - g_t\|^2\bigr]
+=
+\frac{\sigma_t^2}{n}.
+\label{eq:mse-nominal}
+\end{equation}
+
+Equation~\eqref{eq:mse-nominal} is the standard $1/n$ variance reduction law for independent samples.
+
+\section{Why nominal batch size is not enough: effective sample size}
+
+Equation~\eqref{eq:mse-nominal} assumes that the $n$ samples contribute independent information. In on-policy RL this assumption becomes less and less faithful as the policy concentrates.
+
+To see why, consider the extreme case in which the policy has become nearly deterministic. Then repeated sampling from the policy produces nearly identical trajectories. Although the nominal sample count is still $n$, the number of \emph{distinct} informative rollouts may be much smaller.
+
+This motivates the replacement of the nominal sample size by an \emph{effective sample size}, denoted
+\[
+n_{\mathrm{eff}}(t).
+\]
+Conceptually, $n_{\mathrm{eff}}(t)$ should answer the question:
+\begin{quote}
+How many effectively distinct, independent rollout-level pieces of evidence are present in the current batch?
+\end{quote}
+
+A useful approximation is
+\[
+n_{\mathrm{eff}}(t)
+\approx
+\min\bigl(n, e^{H(\pi_{\theta_t})}\bigr),
+\]
+where $H(\pi_{\theta_t})$ is the response-level entropy. This approximation says:
+\begin{itemize}
+    \item when the policy is diffuse, many distinct rollouts are possible, so $n_{\mathrm{eff}}(t) \approx n$;
+    \item when the policy is concentrated, the number of distinct rollouts collapses, so $n_{\mathrm{eff}}(t) \ll n$.
+\end{itemize}
+
+Replacing the nominal sample size by the effective one gives
+\begin{equation}
+\mathbb{E}\bigl[\|\hat g_t - g_t\|^2\bigr]
+\approx
+\frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}.
+\label{eq:mse-effective}
+\end{equation}
+
+This is the first key turning point of the logic. The quality of the gradient estimator is not controlled by nominal batch size alone. It is controlled by the ratio
+\[
+\frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}.
+\]
+As training progresses and the policy concentrates, this quantity tends to increase.
+
+\section{A per-step improvement bound}
+
+We now connect gradient-estimation quality to step-size selection.
+
+Assume that $J(\theta)$ is $L$-smooth. By the standard descent lemma, for any $\theta$ and $\theta'$,
+\[
+J(\theta')
+\ge
+J(\theta)
++
+\nabla J(\theta)^\top(\theta'-\theta)
+-
+\frac{L}{2}\|\theta'-\theta\|^2.
+\]
+We now substitute the update rule
+\[
+\theta_{t+1} = \theta_t + \alpha \hat g_t,
+\qquad
+\nabla J(\theta_t)=g_t.
+\]
+This gives
+\[
+J(\theta_{t+1})
+\ge
+J(\theta_t)
++
+\alpha g_t^\top \hat g_t
+-
+\frac{\alpha^2L}{2}\|\hat g_t\|^2.
+\]
+Take expectation with respect to the sampling randomness. Then
+\[
+\mathbb{E}[J(\theta_{t+1})]
+\ge
+J(\theta_t)
++
+\alpha\,\mathbb{E}[g_t^\top \hat g_t]
+-
+\frac{\alpha^2L}{2}\mathbb{E}[\|\hat g_t\|^2].
+\]
+We now compute the two expectations explicitly.
+
+\subsection*{First expectation}
+Since $\hat g_t$ is unbiased,
+\[
+\mathbb{E}[g_t^\top \hat g_t]
+=
+g_t^\top \mathbb{E}[\hat g_t]
+=
+g_t^\top g_t
+=
+\|g_t\|^2.
+\]
+
+\subsection*{Second expectation}
+Write
+\[
+\hat g_t = g_t + (\hat g_t-g_t).
+\]
+Then
+\begin{align*}
+\mathbb{E}[\|\hat g_t\|^2]
+&=
+\mathbb{E}[\|g_t + (\hat g_t-g_t)\|^2] \\
+&=
+\|g_t\|^2 + 2g_t^\top \mathbb{E}[\hat g_t-g_t] + \mathbb{E}[\|\hat g_t-g_t\|^2].
+\end{align*}
+Because the estimator is unbiased,
+\[
+\mathbb{E}[\hat g_t-g_t]=0.
+\]
+Therefore
+\[
+\mathbb{E}[\|\hat g_t\|^2]
+=
+\|g_t\|^2 + \mathbb{E}[\|\hat g_t-g_t\|^2].
+\]
+Using~\eqref{eq:mse-effective},
+\[
+\mathbb{E}[\|\hat g_t\|^2]
+\approx
+\|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}.
+\]
+
+Substituting both expectations into the improvement bound yields
+\begin{equation}
+\mathbb{E}[J(\theta_{t+1})]-J(\theta_t)
+\ge
+\alpha\|g_t\|^2
+-
+\frac{\alpha^2L}{2}
+\left(
+\|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}
+\right).
+\label{eq:main-bound}
+\end{equation}
+
+This inequality is the central theoretical object of the entire project.
+
+\section{The optimal step size implied by the bound}
+
+The right-hand side of~\eqref{eq:main-bound} is a quadratic function of $\alpha$. Define
+\[
+f_t(\alpha)
+:=
+\alpha\|g_t\|^2
+-
+\frac{\alpha^2L}{2}
+\left(
+\|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}
+\right).
+\]
+We want the step size that maximizes this lower bound. Differentiate with respect to $\alpha$:
+\[
+\frac{d f_t}{d\alpha}
+=
+\|g_t\|^2
+-
+\alpha L
+\left(
+\|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}
+\right).
+\]
+Set the derivative equal to zero:
+\[
+\|g_t\|^2
+-
+\alpha L
+\left(
+\|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}
+\right)
+=
+0.
+\]
+Solving for $\alpha$ gives
+\begin{equation}
+\alpha_t^*
+=
+\frac{\|g_t\|^2}{L\left(\|g_t\|^2 + \sigma_t^2/n_{\mathrm{eff}}(t)\right)}.
+\label{eq:alpha-opt}
+\end{equation}
+
+This already answers the original question. The safe and useful step size changes over time because the ratio between signal and noise changes over time.
+
+\section{The signal fraction $r_t$}
+
+Equation~\eqref{eq:alpha-opt} suggests introducing the dimensionless quantity
+\begin{equation}
+r_t
+:=
+\frac{\|g_t\|^2}{\|g_t\|^2 + \sigma_t^2/n_{\mathrm{eff}}(t)}
+\in (0,1].
+\label{eq:rt-def}
+\end{equation}
+Then the optimal step size becomes simply
+\begin{equation}
+\alpha_t^* = \frac{r_t}{L}.
+\label{eq:alpha-rt}
+\end{equation}
+
+This is the main conceptual compression of the theory. The entire time variation of the optimal learning rate is carried by the single scalar $r_t$.
+
+\paragraph{Why is $r_t$ the right object?}
+The numerator $\|g_t\|^2$ is the squared magnitude of the true learning signal. The extra denominator term
+\[
+\frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}
+\]
+is the variance contribution coming from finite-sample estimation noise. Therefore
+\[
+r_t
+=
+\frac{\text{signal}}{\text{signal} + \text{noise}}.
+\]
+It is the fraction of the total second moment that comes from the true gradient rather than from sampling noise.
+
+\paragraph{Extremes.}
+Two limiting regimes help interpret $r_t$.
+\begin{itemize}
+    \item If the signal dominates the noise, i.e.
+    \[
+    \|g_t\|^2 \gg \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)},
+    \]
+    then $r_t \approx 1$ and
+    \[
+    \alpha_t^* \approx \frac{1}{L}.
+    \]
+    In this regime the step size is limited mainly by curvature.
+
+    \item If the noise dominates the signal, i.e.
+    \[
+    \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)} \gg \|g_t\|^2,
+    \]
+    then $r_t \ll 1$ and the optimal step size becomes much smaller. In this regime, large steps are dangerous because they amplify noise rather than exploiting a reliable gradient direction.
+\end{itemize}
+
+\paragraph{Why fixed learning rates fail.}
+Equation~\eqref{eq:alpha-rt} shows that if $L$ is approximately constant while $r_t$ decreases over training, then the optimal learning rate must also decrease over training. Hence a globally fixed learning rate will eventually be too large relative to $\alpha_t^*$.
+
+At the same time, this logic is symmetric: if one chooses a very small fixed learning rate to remain safe in late training, then that same learning rate may be unnecessarily conservative in earlier stages when $r_t$ is still large. Thus the practical problem is not merely late-stage instability; it is a phase mismatch across the entire run.
+
+\section{Safe-region interpretation}
+
+The signal fraction also yields a useful interpretation of the safe region for the learning rate.
+
+Starting from~\eqref{eq:main-bound}, define
+\[
+D_t := \|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}.
+\]
+Then by definition of $r_t$,
+\[
+\|g_t\|^2 = r_t D_t.
+\]
+Substituting into the bound,
+\begin{align*}
+\mathbb{E}[J(\theta_{t+1})]-J(\theta_t)
+&\ge
+\alpha r_t D_t - \frac{\alpha^2L}{2}D_t \\
+&=
+\alpha D_t\left(r_t - \frac{\alpha L}{2}\right).
+\end{align*}
+Since $\alpha>0$ and $D_t>0$, the expected improvement is positive if and only if
+\[
+r_t - \frac{\alpha L}{2} > 0.
+\]
+Equivalently,
+\begin{equation}
+\alpha < \frac{2r_t}{L} = 2\alpha_t^*.
+\label{eq:safe-region}
+\end{equation}
+
+This confirms that the relevant dynamic object is not $\|g_t\|^2$ alone and not $\sigma_t^2/n_{\mathrm{eff}}(t)$ alone, but their ratio summarized by $r_t$.
+
+\section{The measurement problem: $r_t$ is theoretically central but not directly observable}
+
+At this point we have derived the correct theoretical quantity, but this creates a practical problem. The formula
+\[
+r_t
+=
+\frac{\|g_t\|^2}{\|g_t\|^2 + \sigma_t^2/n_{\mathrm{eff}}(t)}
+\]
+contains the true gradient norm $\|g_t\|^2$, which is not directly observable.
+
+What we do observe is the random gradient estimate $\hat g_t$. Its squared norm satisfies
+\[
+\mathbb{E}[\|\hat g_t\|^2]
+=
+\|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}.
+\]
+Therefore $\|\hat g_t\|^2$ mixes signal and noise together. It cannot by itself tell us how much of the observed magnitude comes from the true gradient and how much comes from sampling variance.
+
+So the next subproblem is:
+\begin{quote}
+Can we estimate $\|g_t\|^2$ without separately estimating the full variance tensor?
+\end{quote}
+
+The answer is yes, using two independent gradient estimates.
+
+\section{Estimating $r_t$ with two independent gradient estimates}
+
+Suppose we construct two independent unbiased estimators of the same true gradient at the same parameter point $\theta_t$:
+\[
+\hat g_A,
+\qquad
+\hat g_B,
+\qquad
+\mathbb{E}[\hat g_A]=\mathbb{E}[\hat g_B]=g_t.
+\]
+We also assume independence between the two estimators.
+
+We now compute the expectation of their inner product:
+\begin{align*}
+\mathbb{E}[\hat g_A^\top \hat g_B]
+&=
+\mathbb{E}[\hat g_A]^\top \mathbb{E}[\hat g_B]
+\\
+&=
+g_t^\top g_t
+\\
+&=
+\|g_t\|^2.
+\end{align*}
+Thus the cross inner product is an unbiased estimator of the true squared gradient norm.
+
+Next consider the average of the two squared norms:
+\[
+\frac{\|\hat g_A\|^2 + \|\hat g_B\|^2}{2}.
+\]
+Each term estimates a signal-plus-noise quantity, so their average estimates
+\[
+\|g_t\|^2 + \text{noise}.
+\]
+This leads to the estimator
+\begin{equation}
+\hat r_t
+=
+\frac{\hat g_A^\top \hat g_B}{\dfrac{\|\hat g_A\|^2 + \|\hat g_B\|^2}{2}}.
+\label{eq:rhat}
+\end{equation}
+
+\paragraph{Interpretation.}
+In~\eqref{eq:rhat},
+\begin{itemize}
+    \item the numerator estimates the signal term $\|g_t\|^2$;
+    \item the denominator estimates signal plus noise.
+\end{itemize}
+So $\hat r_t$ is the natural online estimator of the theoretical signal fraction.
+
+\paragraph{Only one requirement matters.}
+The two estimators must be generated under the same parameter vector $\theta_t$. They need not share prompts. They need not be drawn from the same physical batch. What matters is that they estimate the same underlying gradient and are independent conditional on $\theta_t$.
+
+This point is extremely important. It means that the estimator is not tied to one specific batching trick. Any engineering realization that produces two independent unbiased gradient estimates at the same checkpoint is valid.
+
+\section{From theory to the algorithmic decomposition}
+
+We now return to the formula
+\[
+\alpha_t^* = \frac{r_t}{L}.
+\]
+At this stage, the dynamic part $r_t$ is conceptually understood and empirically estimable. However, the curvature scale $L$ is still unknown. Therefore estimating $r_t$ alone is not enough to specify the optimal learning rate numerically.
+
+This is exactly the point at which the algorithmic decomposition should be introduced. We write
+\begin{equation}
+\alpha_t = c_t\,\hat r_t.
+\label{eq:algorithm-decomp}
+\end{equation}
+
+The logic of this decomposition is the following.
+\begin{itemize}
+    \item $\hat r_t$ is the \emph{fast}, directly estimated quantity. It tracks the time-varying shape of the optimal learning rate.
+    \item $c_t$ is the \emph{slow} scale factor. In the ideal case it should approach $1/L$.
+\end{itemize}
+
+So the learning-rate problem is separated into two subproblems:
+\begin{enumerate}
+    \item estimate the changing shape of the optimal learning rate;
+    \item calibrate the absolute scale.
+\end{enumerate}
+
+This decomposition is not arbitrary. It is forced by the structure of the theory:
+\[
+\alpha_t^* = \frac{r_t}{L}
+\quad\Longrightarrow\quad
+\text{dynamic shape} \times \text{unknown scale}.
+\]
+
+
+\section{How $\hat r_t$ is computed in practice}
+
+We now make the estimator operational. The formula
+\[
+\hat r_t
+=
+\frac{\hat g_A^\top \hat g_B}{\dfrac{\|\hat g_A\|^2 + \|\hat g_B\|^2}{2}}
+\]
+requires two independent gradient estimates at the same parameter point $\theta_t$. The phrase ``split batch'' should therefore be understood statistically rather than literally. What is required is not one particular batching trick, but the following two conditions:
+\begin{enumerate}
+    \item both estimators are computed under the same parameters $\theta_t$;
+    \item conditional on $\theta_t$, the two estimators are independent.
+\end{enumerate}
+
+\paragraph{The most practical realization.}
+Suppose the ordinary training batch already contains many prompt groups. We divide these prompt groups into two disjoint subsets, which we denote by $A_1$ and $A_2$. Each subset keeps the original GRPO group structure intact. In particular, if the standard group size is $G=8$, then each prompt in $A_1$ still has $8$ sampled responses and each prompt in $A_2$ still has $8$ sampled responses. This is crucial: for GRPO one must preserve the within-group advantage normalization quality. The split is performed at the prompt-group level, not by cutting one response group into smaller fragments.
+
+Let the resulting gradient estimates be
+\[
+\hat g_{A_1},
+\qquad
+\hat g_{A_2}.
+\]
+Then the online estimator becomes
+\begin{equation}
+\hat r_t
+=
+\frac{\hat g_{A_1}^\top \hat g_{A_2}}{\dfrac{\|\hat g_{A_1}\|^2 + \|\hat g_{A_2}\|^2}{2}}.
+\label{eq:rhat-practical}
+\end{equation}
+This is the preferred practical form because it does not require a separate extra rollout stream purely for measuring $\hat r_t$. It reuses the ordinary update batch while still preserving the independence needed by the estimator.
+
+\paragraph{Which gradient is used for the actual update?}
+The two halves $A_1$ and $A_2$ are not measurement-only data. They may and should both contribute to the update gradient. If the two halves have equal size, the update gradient is simply their average:
+\begin{equation}
+\hat g_t^{\mathrm{upd}}
+=
+\frac{\hat g_{A_1}+\hat g_{A_2}}{2}.
+\label{eq:gupd-equal}
+\end{equation}
+If the two halves have unequal sizes $n_1$ and $n_2$, one uses the weighted average
+\[
+\hat g_t^{\mathrm{upd}}
+=
+\frac{n_1\hat g_{A_1}+n_2\hat g_{A_2}}{n_1+n_2}.
+\]
+Therefore measuring $\hat r_t$ does not require throwing away the data that were used to construct it.
+
+\paragraph{Result.}
+At every ordinary training step, one computes:
+\begin{enumerate}
+    \item two prompt-group gradients $\hat g_{A_1}$ and $\hat g_{A_2}$ under the same $\theta_t$;
+    \item the online signal-fraction estimator $\hat r_t$ from~\eqref{eq:rhat-practical};
+    \item the update gradient $\hat g_t^{\mathrm{upd}}$ from~\eqref{eq:gupd-equal} or its weighted version.
+\end{enumerate}
+This resolves the practical computation of the fast variable.
+
+\section{Why $\hat r_t$ alone is not enough}
+
+Although $\hat r_t$ tracks the changing shape of the optimal step size, it does not determine the absolute scale. The theoretical optimum is
+\[
+\alpha_t^* = \frac{r_t}{L},
+\]
+so even a perfect estimate of $r_t$ would still leave the unknown factor $1/L$ unresolved. This is why the algorithm must be written as
+\begin{equation}
+\alpha_t = c_t\hat r_t.
+\label{eq:alpha-decomp-final}
+\end{equation}
+Here:
+\begin{itemize}
+    \item $\hat r_t$ is the \emph{fast variable}: it reacts at the timescale of individual training steps;
+    \item $c_t$ is the \emph{slow variable}: it carries the missing absolute scale and should move much more slowly.
+\end{itemize}
+
+So after deriving and estimating $r_t$, the remaining problem is no longer ``what should the learning-rate shape be?'' It is now the strictly smaller question:
+\begin{quote}
+How should the slow scale factor $c_t$ be calibrated online?
+\end{quote}
+
+\section{How $c_t$ is computed: low-frequency held-out calibration}
+
+The scale factor $c_t$ should not be updated from the same data that were used to determine the update. If those data were reused, the resulting feedback signal would no longer be held out. Therefore we introduce a third data stream, denoted by $C$, used only on \emph{calibration steps}. All samples in $C$ are generated under the same pre-update parameters $\theta_t$, but they are not used in either $\hat r_t$ or the update gradient.
+
+\subsection{Step 1: perform the update using $A_1$ and $A_2$}
+At the beginning of step $t$, compute $\hat r_t$ and the update gradient from $A_1,A_2$ as described above, then set
+\[
+\alpha_t = c_t\hat r_t.
+\]
+The parameter update is
+\begin{equation}
+\theta_{t+1}
+=
+\theta_t + \alpha_t \hat g_t^{\mathrm{upd}}.
+\label{eq:update-with-c}
+\end{equation}
+
+\subsection{Step 2: define the predicted gain on the held-out batch}
+Now evaluate the held-out batch $C$. Let $\hat g_C$ denote the gradient estimate computed from $C$ at the old parameters $\theta_t$. The first-order predicted gain of the actual update direction on $C$ is
+\begin{equation}
+p_t
+:=
+\alpha_t \, \hat g_C^\top \hat g_t^{\mathrm{upd}}.
+\label{eq:pt-def}
+\end{equation}
+The interpretation is direct: if the objective were perfectly linear in a neighborhood of $\theta_t$, then the update would improve the held-out objective by approximately $p_t$.
+
+\subsection{Step 3: define the actual gain on the held-out batch}
+Let $\widehat{\mathcal L}_C(\theta)$ denote the surrogate objective evaluated on the held-out batch $C$. After the update~\eqref{eq:update-with-c}, define the actual gain
+\begin{equation}
+a_t
+:=
+\widehat{\mathcal L}_C(\theta_{t+1})
+-
+\widehat{\mathcal L}_C(\theta_t).
+\label{eq:at-def}
+\end{equation}
+This quantity measures what the update actually achieved on data that were not used to construct either the direction or the step size.
+
+\subsection{Step 4: define the realization ratio}
+We now compare actual gain to first-order predicted gain:
+\begin{equation}
+\phi_t
+:=
+\frac{a_t}{p_t + \varepsilon},
+\label{eq:phi-def}
+\end{equation}
+where $\varepsilon>0$ is a small numerical stabilizer. The quantity $\phi_t$ should be read as a \emph{realization ratio}: it measures how much of the predicted linear improvement was actually realized.
+
+Its interpretation is as follows.
+\begin{itemize}
+    \item If $\phi_t \approx 1$, then the first-order prediction was almost fully realized, so the current scale is conservative or at least safe.
+    \item If $0 < \phi_t \ll 1$, then the update still helped, but a substantial part of the predicted gain was lost to curvature and higher-order effects, suggesting that the scale is too aggressive.
+    \item If $\phi_t < 0$, then the held-out objective deteriorated even though the first-order predictor was positive, which is a strong sign that the step size is too large.
+\end{itemize}
+
+\subsection{Step 5: derive the fixed-point target for $\phi_t$}
+The controller target is not arbitrary. We now derive it from the same quadratic model that produced $\alpha_t^*=r_t/L$.
+
+Recall the bound
+\[
+f_t(\alpha)
+=
+\alpha \|g_t\|^2
+-
+\frac{\alpha^2L}{2}
+\left(
+\|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}
+\right).
+\]
+Let
+\[
+D_t := \|g_t\|^2 + \frac{\sigma_t^2}{n_{\mathrm{eff}}(t)}.
+\]
+Then by definition of $r_t$,
+\[
+\|g_t\|^2 = r_t D_t.
+\]
+Substituting gives
+\[
+f_t(\alpha)
+=
+\alpha r_t D_t - \frac{\alpha^2L}{2}D_t
+=
+\alpha D_t\left(r_t - \frac{\alpha L}{2}\right).
+\]
+The first-order predicted improvement is the linear term
+\[
+\alpha r_t D_t.
+\]
+The actual quadratic-model improvement is
+\[
+\alpha D_t\left(r_t - \frac{\alpha L}{2}\right).
+\]
+Therefore, under this local quadratic model, the realization ratio becomes
+\[
+\phi_t
+\approx
+\frac{\alpha D_t\left(r_t - \frac{\alpha L}{2}\right)}{\alpha r_t D_t}
+=
+1 - \frac{\alpha L}{2r_t}.
+\]
+Now substitute the algorithmic decomposition
+\[
+\alpha_t = c_t r_t
+\]
+while temporarily ignoring estimation error, so that $\hat r_t \approx r_t$. Then
+\begin{equation}
+\phi_t
+\approx
+1 - \frac{c_tL}{2}.
+\label{eq:phi-fixed-point}
+\end{equation}
+This formula is the key fixed-point relation. It shows that, once the fast variation has been absorbed into the factor $r_t$, the realization ratio depends only on the slow scale mismatch $c_tL$ and no longer on $r_t$ itself.
+
+If the desired fixed point is
+\[
+c_t = \frac{1}{L},
+\]
+then~\eqref{eq:phi-fixed-point} implies the target value
+\begin{equation}
+\phi^* = \frac{1}{2}.
+\label{eq:phi-star}
+\end{equation}
+Thus the correct controller target is a constant, not a function of $r_t$.
+
+\subsection{Step 6: update the slow variable}
+We can now define the slow-scale update. A natural multiplicative rule is
+\begin{equation}
+c_{t+1}
+=
+c_t\exp\bigl(\eta_c(\phi_t - \phi^*)\bigr),
+\qquad
+\phi^* = \frac{1}{2},
+\label{eq:c-update}
+\end{equation}
+where $\eta_c>0$ is a small controller gain. The multiplicative form guarantees positivity of $c_t$ and treats $c_t$ as a scale variable rather than as an additive state.
+
+The sign is correct for the intended behavior:
+\begin{itemize}
+    \item if $\phi_t > \phi^*$, then the current scale is too conservative and $c_t$ is increased;
+    \item if $\phi_t < \phi^*$, then the current scale is too aggressive and $c_t$ is decreased.
+\end{itemize}
+Because $c_t$ is a slow variable, one should not update it at every step in the most literal possible way. In practice, one may update $c_t$ only every $K$ steps, smooth $\phi_t$ with an exponential moving average, or skip calibration steps for which $p_t$ is too small to be informative.
+
+\section{The completed algorithmic form}
+
+We can now state the complete core algorithm in words.
+\begin{enumerate}
+    \item At step $t$, collect the ordinary update batch and split it into two independent prompt-group subsets $A_1$ and $A_2$ under the same $\theta_t$.
+    \item Compute $\hat g_{A_1}$ and $\hat g_{A_2}$.
+    \item Compute the fast signal-fraction estimator $\hat r_t$ using~\eqref{eq:rhat-practical}.
+    \item Form the update gradient $\hat g_t^{\mathrm{upd}}$ by averaging the two halves.
+    \item Set the learning rate according to
+    \[
+    \alpha_t = c_t\hat r_t.
+    \]
+    \item Update the parameters using~\eqref{eq:update-with-c}.
+    \item On calibration steps only, collect a held-out batch $C$, compute $p_t$ from~\eqref{eq:pt-def}, $a_t$ from~\eqref{eq:at-def}, $\phi_t$ from~\eqref{eq:phi-def}, and update $c_t$ using~\eqref{eq:c-update}.
+\end{enumerate}
+
+The roles are now completely separated:
+\begin{itemize}
+    \item $\hat r_t$ tracks the time-varying shape of the optimal learning rate;
+    \item $c_t$ calibrates the slowly varying absolute scale;
+    \item the held-out realization ratio $\phi_t$ provides the feedback needed to adjust $c_t$.
+\end{itemize}
+
+\section{What has now been solved}
+
+At this point the full path from the observed practical problem to the core algorithm is complete.
+\begin{enumerate}
+    \item A fixed learning rate fails because the safe and useful step size changes over time.
+    \item The step size changes because the gradient estimator becomes noisier as the policy concentrates and the effective sample size decreases.
+    \item Combining this fact with an $L$-smooth improvement bound yields a time-varying optimal learning rate
+    \[
+    \alpha_t^* = \frac{r_t}{L}.
+    \]
+    \item The entire time variation is captured by the signal fraction $r_t$.
+    \item $r_t$ can be estimated online by the split-batch estimator $\hat r_t$.
+    \item Because $\hat r_t$ supplies only the shape and not the absolute scale, the practical learning rate must be written as
+    \[
+    \alpha_t = c_t\hat r_t.
+    \]
+    \item The slow scale factor $c_t$ can be calibrated from held-out realized-versus-predicted improvement, which yields the feedback quantity $\phi_t$ and the multiplicative controller~\eqref{eq:c-update} with target $\phi^*=1/2$.
+\end{enumerate}
+
+\section{Final compressed version}
+
+The project can now be summarized in one continuous paragraph.
+
+In on-policy RL, the empirical failure of a fixed learning rate should be understood as a step-size mismatch problem. Every update is built from a sample-based gradient estimator rather than the true gradient. As the policy concentrates during training, the effective number of distinct informative rollouts decreases, so the estimator becomes noisier even if the nominal batch size remains unchanged. Combining this fact with a standard $L$-smooth improvement bound yields a time-varying optimal learning rate
+\[
+\alpha_t^* = \frac{\|g_t\|^2}{L\left(\|g_t\|^2 + \sigma_t^2/n_{\mathrm{eff}}(t)\right)} = \frac{r_t}{L}.
+\]
+The dynamic part of the optimal learning rate is therefore completely captured by the signal fraction
+\[
+r_t = \frac{\|g_t\|^2}{\|g_t\|^2 + \sigma_t^2/n_{\mathrm{eff}}(t)}.
+\]
+This quantity can be estimated online by two independent gradient estimates produced under the same pre-update parameters, yielding the split-batch estimator
+\[
+\hat r_t
+=
+\frac{\hat g_{A_1}^\top \hat g_{A_2}}{\dfrac{\|\hat g_{A_1}\|^2+\|\hat g_{A_2}\|^2}{2}}.
+\]
+Because $\hat r_t$ tracks only the shape of the optimal step size while the curvature scale remains unknown, the practical algorithm writes the learning rate as
+\[
+\alpha_t = c_t\hat r_t.
+\]
+The fast factor $\hat r_t$ is computed at every step from the two update halves, while the slow factor $c_t$ is calibrated on low-frequency held-out steps. On those calibration steps, one compares actual surrogate improvement to first-order predicted improvement,
+\[
+\phi_t = \frac{a_t}{p_t+\varepsilon},
+\]
+and updates $c_t$ multiplicatively toward the fixed-point target $\phi^*=1/2$. This yields a complete two-timescale algorithm: a fast online estimate for the changing shape of the optimal learning rate and a slow controller for its unknown absolute scale.
+
+\end{document}

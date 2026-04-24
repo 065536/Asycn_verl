@@ -60,7 +60,69 @@ def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor, 
     return torch.masked_select(full_diff, mask)
 
 
-def calculate_debug_metrics(data: DataProto) -> dict:
+def _build_topk_rollout_actor_prob_metrics(
+    responses: torch.Tensor,
+    actor_probs: torch.Tensor,
+    rollout_probs: torch.Tensor,
+    response_mask_bool: torch.Tensor,
+    tokenizer=None,
+    topk: int = 10,
+) -> dict:
+    """
+    Build scalar metrics for top-k rollout/actor probability diffs.
+
+    Returned keys are numeric-only so all logging backends can ingest them safely.
+    """
+    # Align response token IDs with probability tensors.
+    # Some pipelines may keep longer response tensors than log-prob tensors.
+    if responses.shape != actor_probs.shape:
+        if responses.size(0) == actor_probs.size(0) and responses.size(1) >= actor_probs.size(1):
+            responses = responses[:, -actor_probs.size(1) :]
+        else:
+            logger.warning(
+                "responses and prob tensors shape mismatch: responses=%s actor_probs=%s, skip top-k token metrics",
+                tuple(responses.shape),
+                tuple(actor_probs.shape),
+            )
+            return {}
+
+    full_diff = torch.abs(actor_probs - rollout_probs)
+    # Fill non-response positions with -1 to exclude them from top-k selection.
+    masked_diff = torch.where(response_mask_bool, full_diff, torch.full_like(full_diff, -1.0))
+    flat_diff = masked_diff.flatten()
+
+    valid_count = int(response_mask_bool.sum().item())
+    if valid_count <= 0:
+        return {}
+
+    k = min(topk, valid_count)
+    top_vals, top_indices = torch.topk(flat_diff, k=k, largest=True, sorted=True)
+
+    flat_actor_probs = actor_probs.flatten()
+    flat_rollout_probs = rollout_probs.flatten()
+    flat_tokens = responses.flatten().to(torch.long)
+
+    def _decode_token(token_id: int) -> str:
+        if tokenizer is None:
+            return ""
+        try:
+            return tokenizer.decode([token_id], skip_special_tokens=False)
+        except Exception:
+            return ""
+
+    top_metrics = {}
+    for rank in range(k):
+        idx = top_indices[rank]
+        token_id = int(flat_tokens[idx].item())
+        top_metrics[f"training/rollout_probs_diff_top{rank + 1}_token_text"] = _decode_token(token_id)
+        top_metrics[f"training/rollout_probs_diff_top{rank + 1}_rollout_prob"] = float(flat_rollout_probs[idx].item())
+        top_metrics[f"training/rollout_probs_diff_top{rank + 1}_trainer_prob"] = float(flat_actor_probs[idx].item())
+        top_metrics[f"training/rollout_probs_diff_top{rank + 1}_abs_diff"] = float(top_vals[rank].item())
+
+    return top_metrics
+
+
+def calculate_debug_metrics(data: DataProto, tokenizer=None) -> dict:
     """
     calculate rollout vs actor logprobs diff, for debugging purpose
 
@@ -100,10 +162,48 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     response_mask_bool = response_mask.bool()
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
-    return {
+    metrics = {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
     }
+
+    # Percentiles of probs_diff: distinguish fat-tail vs uniform drift
+    if rollout_probs_diff.numel() > 0:
+        diff_f = rollout_probs_diff.float()
+        metrics["training/rollout_probs_diff_p90"] = torch.quantile(diff_f, 0.90).item()
+        metrics["training/rollout_probs_diff_p99"] = torch.quantile(diff_f, 0.99).item()
+
+    # Response length percentiles: track tail of length distribution
+    response_lengths = response_mask.sum(dim=-1).float()
+    if response_lengths.numel() > 0:
+        metrics["training/response_len_p90"] = torch.quantile(response_lengths, 0.90).item()
+        metrics["training/response_len_p99"] = torch.quantile(response_lengths, 0.99).item()
+
+    # EOS token statistics: detect EOS collapse before it hits val acc
+    if tokenizer is not None and getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_id = tokenizer.eos_token_id
+        resp = responses if responses.shape[1] == response_mask.shape[1] else responses[:, -response_mask.shape[1]:]
+        if resp.shape == response_mask.shape:
+            eos_mask = (resp == eos_id) & response_mask_bool
+            # fraction of sequences that actually generated EOS (vs truncated)
+            metrics["training/eos_rate"] = eos_mask.any(dim=-1).float().mean().item()
+            # mean log-prob assigned to EOS tokens by the training policy
+            if eos_mask.any() and actor_old_log_probs.shape == resp.shape:
+                metrics["training/eos_log_prob_mean"] = actor_old_log_probs[eos_mask].float().mean().item()
+
+    # Add top-k token-level details for largest rollout-vs-trainer probability gaps.
+    # These are logged as scalar metrics for SwanLab compatibility.
+    metrics.update(
+        _build_topk_rollout_actor_prob_metrics(
+            responses=responses,
+            actor_probs=actor_probs,
+            rollout_probs=rollout_probs,
+            response_mask_bool=response_mask_bool,
+            tokenizer=tokenizer,
+            topk=10,
+        )
+    )
+    return metrics

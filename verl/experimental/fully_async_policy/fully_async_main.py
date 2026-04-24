@@ -23,6 +23,7 @@ import ray
 from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
+from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
@@ -202,6 +203,7 @@ def main(config):
 
     from time import time
 
+    config = migrate_legacy_reward_impl(config)
     start_time = time()
     # TODO: unify rollout config with actor_rollout_ref
     config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes

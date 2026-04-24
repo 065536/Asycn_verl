@@ -673,6 +673,44 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     min_lr_ratio=min_lr_ratio,
                     num_cycles=num_cycles,
                 )
+            elif lr_scheduler_type == "entropy_adaptive":
+                from verl.workers.engine.fsdp.transformer_impl import EntropyAdaptiveLRScheduler
+
+                min_ratio = optim_config.get("entropy_adaptive_min_ratio", 0.1)
+                ema_beta = optim_config.get("entropy_adaptive_ema_beta", 0.95)
+                reference_mode = optim_config.get("entropy_adaptive_reference_mode", "ema")
+                actor_lr_scheduler = EntropyAdaptiveLRScheduler(
+                    optimizer=actor_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    min_ratio=min_ratio,
+                    ema_beta=ema_beta,
+                    reference_mode=reference_mode,
+                )
+            elif lr_scheduler_type == "signal_fraction":
+                from verl.workers.engine.fsdp.transformer_impl import SignalFractionLRScheduler
+
+                actor_lr_scheduler = SignalFractionLRScheduler(
+                    optimizer=actor_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    c_init=optim_config.get("lr", 1e-5),
+                    eta_c=optim_config.get("signal_fraction_eta_c", 0.1),
+                    c_min=optim_config.get("signal_fraction_c_min", 1e-8),
+                    c_max=optim_config.get("signal_fraction_c_max", 1e-2),
+                    phi_ema_beta=optim_config.get("signal_fraction_phi_ema_beta", 0.9),
+                    r_min_ctrl=optim_config.get("signal_fraction_r_min", 0.01),
+                    r_boot=optim_config.get("signal_fraction_r_boot", 0.05),
+                    r_ema_beta_sym=optim_config.get("signal_fraction_r_ema_beta_sym", 0.3),
+                    r_ema_beta_down=optim_config.get("signal_fraction_r_ema_beta_down", 0.5),
+                    r_ema_beta_up=optim_config.get("signal_fraction_r_ema_beta_up", 0.1),
+                    g_rms_ema_beta=optim_config.get("signal_fraction_g_rms_ema_beta", 0.05),
+                    d_min_abs=optim_config.get("signal_fraction_d_min_abs", 1e-30),
+                    tau_rms=optim_config.get("signal_fraction_tau_rms", 0.05),
+                    fast_drop_rho=optim_config.get("signal_fraction_fast_drop_rho", 0.7),
+                    cooldown_steps=optim_config.get("signal_fraction_cooldown_steps", 5),
+                    handoff_steps=optim_config.get("signal_fraction_handoff_steps", 10),
+                    sign_gate_gamma=optim_config.get("signal_fraction_sign_gate_gamma", None),
+                    sign_gate_alpha_plus=optim_config.get("signal_fraction_sign_gate_alpha_plus", None),
+                )
             else:
                 raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
 
@@ -923,6 +961,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor = DataParallelPPOActor(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
+            # For signal_fraction: attach scheduler to actor so update_policy can access c_t
+            if getattr(self, "actor_lr_scheduler", None) is not None:
+                from verl.workers.engine.fsdp.transformer_impl import SignalFractionLRScheduler
+                if isinstance(self.actor_lr_scheduler, SignalFractionLRScheduler):
+                    self.actor.actor_lr_scheduler = self.actor_lr_scheduler
 
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
@@ -1003,6 +1046,44 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
+        # Optional metrics:
+        #   param_delta_norm     = ||theta_{t+1} - theta_t||
+        #   relative_param_delta = ||theta_{t+1} - theta_t|| / ||theta_t||
+        # Enable via:
+        #   VERL_ACTOR_PARAMETER_DELTA_NORM_ENABLE=1
+        # Optional frequency:
+        #   VERL_ACTOR_PARAMETER_DELTA_NORM_EVERY=1  (compute every N update_actor calls)
+        # Optional module-wise logging (grouped as embedding/attention/mlp/lm_head):
+        #   VERL_ACTOR_PARAMETER_DELTA_NORM_LAYERWISE_ENABLE=1
+        enable_param_delta_norm = str(os.environ.get("VERL_ACTOR_PARAMETER_DELTA_NORM_ENABLE", "1")).lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
+        enable_layerwise_param_delta = str(
+            os.environ.get("VERL_ACTOR_PARAMETER_DELTA_NORM_LAYERWISE_ENABLE", "1")
+        ).lower() in ("1", "true", "yes", "y")
+        every = int(os.environ.get("VERL_ACTOR_PARAMETER_DELTA_NORM_EVERY", "1"))
+        if not hasattr(self, "_parameter_delta_norm_calls"):
+            self._parameter_delta_norm_calls = 0
+        self._parameter_delta_norm_calls += 1
+        do_param_delta_norm = enable_param_delta_norm and (self._parameter_delta_norm_calls % max(every, 1) == 0)
+
+        # Snapshot local actor parameters (sharded) on CPU and compute norms using L2.
+        # This is metric-only and therefore intentionally uses CPU copies.
+        named_param_list = None
+        old_params_cpu = None
+        denom_sum_sq_local = None
+        if do_param_delta_norm:
+            named_param_list = [(n, p) for n, p in self.actor_module_fsdp.named_parameters() if p.requires_grad]
+            old_params_cpu = []
+            denom_sum_sq_local = torch.zeros((), dtype=torch.float32, device="cpu")
+            for _, p in named_param_list:
+                p_cpu = p.detach().cpu().float()
+                old_params_cpu.append(p_cpu)
+                denom_sum_sq_local += (p_cpu * p_cpu).sum()
+
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
@@ -1010,6 +1091,72 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
+
+            if (
+                do_param_delta_norm
+                and named_param_list is not None
+                and old_params_cpu is not None
+                and denom_sum_sq_local is not None
+            ):
+                delta_sum_sq_local = torch.zeros((), dtype=torch.float32, device="cpu")
+                groupwise_stats = (
+                    {
+                        "embedding": [torch.zeros((), dtype=torch.float32, device="cpu"), torch.zeros((), dtype=torch.float32, device="cpu")],
+                        "attention": [torch.zeros((), dtype=torch.float32, device="cpu"), torch.zeros((), dtype=torch.float32, device="cpu")],
+                        "mlp": [torch.zeros((), dtype=torch.float32, device="cpu"), torch.zeros((), dtype=torch.float32, device="cpu")],
+                        "lm_head": [torch.zeros((), dtype=torch.float32, device="cpu"), torch.zeros((), dtype=torch.float32, device="cpu")],
+                        "other": [torch.zeros((), dtype=torch.float32, device="cpu"), torch.zeros((), dtype=torch.float32, device="cpu")],
+                    }
+                    if enable_layerwise_param_delta
+                    else None
+                )
+                for (name, p), p_old_cpu in zip(named_param_list, old_params_cpu, strict=True):
+                    p_new_cpu = p.detach().cpu().float()
+                    diff = p_new_cpu - p_old_cpu
+                    diff_sq = (diff * diff).sum()
+                    delta_sum_sq_local += diff_sq
+
+                    if groupwise_stats is not None:
+                        base_sq = (p_old_cpu * p_old_cpu).sum()
+                        if "lm_head" in name:
+                            group_key = "lm_head"
+                        elif "embed" in name:
+                            group_key = "embedding"
+                        elif "attn" in name or "attention" in name:
+                            group_key = "attention"
+                        elif "mlp" in name or "ffn" in name:
+                            group_key = "mlp"
+                        else:
+                            group_key = "other"
+                        groupwise_stats[group_key][0] += diff_sq
+                        groupwise_stats[group_key][1] += base_sq
+
+                # Reduce across all DP ranks to get global L2 norms.
+                if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    dist.all_reduce(denom_sum_sq_local, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(delta_sum_sq_local, op=dist.ReduceOp.SUM)
+                    if groupwise_stats is not None:
+                        for diff_sq, base_sq in groupwise_stats.values():
+                            dist.all_reduce(diff_sq, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(base_sq, op=dist.ReduceOp.SUM)
+
+                # Global metrics. Add eps for numerical stability.
+                denom_norm = torch.sqrt(denom_sum_sq_local + 1e-12)
+                delta_norm = torch.sqrt(delta_sum_sq_local + 0.0)
+                metrics["actor/param_delta_norm"] = delta_norm.item()
+                metrics["actor/relative_param_delta"] = (delta_norm / denom_norm).item()
+                # Keep backward compatibility for existing dashboards.
+                metrics["actor/parameter_delta_norm"] = metrics["actor/relative_param_delta"]
+
+                if groupwise_stats is not None:
+                    for group_key, (diff_sq, base_sq) in groupwise_stats.items():
+                        delta_norm_group = torch.sqrt(diff_sq + 0.0)
+                        base_norm_group = torch.sqrt(base_sq + 1e-12)
+                        metrics[f"actor_groupwise/param_delta_norm/{group_key}"] = delta_norm_group.item()
+                        metrics[f"actor_groupwise/relative_param_delta/{group_key}"] = (
+                            delta_norm_group / base_norm_group
+                        ).item()
+
             global_num_tokens = data.meta_info["global_token_num"]
             images_seqlens = data.meta_info.get("images_seqlens", None)
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
@@ -1024,6 +1171,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
+            if hasattr(self.actor_lr_scheduler, "update_entropy"):
+                entropy_val = metrics.get("actor/entropy", None)
+                if entropy_val is not None:
+                    if isinstance(entropy_val, list):
+                        entropy_val = sum(entropy_val) / len(entropy_val)
+                    self.actor_lr_scheduler.update_entropy(float(entropy_val))
+            if hasattr(self.actor_lr_scheduler, "get_signal_fraction_metrics"):
+                metrics.update(self.actor_lr_scheduler.get_signal_fraction_metrics())
             self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics

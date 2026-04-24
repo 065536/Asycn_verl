@@ -45,6 +45,7 @@ class ValidateMetrics:
 
     timing_raw: dict[str, Any]
     metrics: Optional[dict[str, Any]] = None
+    val_samples: Optional[list] = None
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
@@ -161,11 +162,27 @@ def assemble_batch_from_rollout_samples(
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
+    is_partial = np.array([d > 0 for d in param_version_diff], dtype=bool)
     num_diff0 = param_version_diff.count(0)
+
+    # Response-length based partial statistics.
+    response_lengths = torch.sum(final_batch.batch["response_mask"], dim=-1).detach().cpu().numpy().astype(np.float64)
+    total_tokens = float(response_lengths.sum())
+    partial_tokens = float(response_lengths[is_partial].sum()) if len(response_lengths) > 0 else 0.0
+    full_mask = ~is_partial
     partial_stats = {
         "fully_async/partial/total_partial_num": len(param_version_diff) - num_diff0,
         "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff),
         "fully_async/partial/max_partial_span": max(param_version_diff),
+        # New partial-rollout diagnostics.
+        "fully_async/partial/partial_ratio_by_sample": float(is_partial.mean()) if is_partial.size > 0 else 0.0,
+        "fully_async/partial/partial_ratio_by_token": (partial_tokens / total_tokens) if total_tokens > 0 else 0.0,
+        # For partial samples, response length corresponds to the truncation position in generated trajectory.
+        "fully_async/partial/partial_avg_truncation_position": (
+            float(response_lengths[is_partial].mean()) if is_partial.any() else 0.0
+        ),
+        "fully_async/partial/partial_avg_response_len": float(response_lengths[is_partial].mean()) if is_partial.any() else 0.0,
+        "fully_async/partial/full_avg_response_len": float(response_lengths[full_mask].mean()) if full_mask.any() else 0.0,
     }
     # add meta_info
     trajectory_param_versions = final_batch.non_tensor_batch["max_global_steps"]

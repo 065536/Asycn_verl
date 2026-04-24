@@ -111,6 +111,58 @@ class FSDPOptimizerConfig(OptimizerConfig):
     num_cycles: float = 0.5
     override_optimizer_config: Optional[dict] = None
     zero_indexed_step: bool = True
+    # Entropy-adaptive LR: minimum LR ratio floor (ρ in α_t = α_0 * max(H_t/H_ref, ρ))
+    entropy_adaptive_min_ratio: float = 0.1
+    # Entropy-adaptive LR: EMA smoothing factor for reference entropy (higher = smoother)
+    entropy_adaptive_ema_beta: float = 0.95
+    # Entropy-adaptive LR: reference mode — "ema" (H_t/H_ref_ema) or "initial" (H_t/H_0)
+    entropy_adaptive_reference_mode: str = "ema"
+    # Signal-fraction adaptive LR (α_t = c_t · r̂_t)
+    # Controller step size for c_t update: c_{t+1} = c_t * exp(η_c * (φ̄_t - 0.5))
+    signal_fraction_eta_c: float = 0.1
+    # Hard bounds on scale factor c_t
+    signal_fraction_c_min: float = 1e-8
+    signal_fraction_c_max: float = 1e-2
+    # How often (every K steps) to run the calibration step that updates c_t
+    signal_fraction_calib_freq: int = 5
+    # EMA smoothing factor for φ_t (realization ratio) before feeding into controller
+    signal_fraction_phi_ema_beta: float = 0.9
+    # Minimum |p_t| threshold: skip c_t update when predicted gain is too small
+    signal_fraction_p_min: float = 1e-8
+    # Lower bound for r_t_ctrl (safety floor after EMA/fast-drop, replaces raw clamp)
+    signal_fraction_r_min: float = 0.01
+    # Fraction of per-rank batch reserved as held-out C on calibration steps
+    signal_fraction_calib_frac: float = 0.25
+
+    # ------------------------------------------------------------------ #
+    # Warmup handoff + r-side state machine (Bug 1 fix)
+    # ------------------------------------------------------------------ #
+    # Bootstrap floor: warmup EMA initial value and denominator floor for c_T init
+    signal_fraction_r_boot: float = 0.05
+    # Symmetric EMA beta used during warmup to estimate typical r̄
+    signal_fraction_r_ema_beta_sym: float = 0.3
+    # Asymmetric EMA betas for post-handoff control (down = fast, up = slow)
+    signal_fraction_r_ema_beta_down: float = 0.5
+    signal_fraction_r_ema_beta_up: float = 0.1
+    # Background gradient-scale EMA (unconditional, only gated by d_min_abs)
+    signal_fraction_g_rms_ema_beta: float = 0.05
+    # Absolute numerical floor for denom (d_t = mean of ||ĝ_A1||² + ||ĝ_A2||²)
+    signal_fraction_d_min_abs: float = 1e-30
+    # Relative RMS threshold: step valid only if g_rms > tau_rms * g_rms_ema
+    signal_fraction_tau_rms: float = 0.05
+    # Fast-drop trigger: r_t_obs < rho * r̄_{t-1} → enter cooldown
+    signal_fraction_fast_drop_rho: float = 0.7
+    # Cooldown duration (steps) after fast-drop trigger; c_t frozen during cooldown
+    signal_fraction_cooldown_steps: int = 5
+    # Handoff interpolation steps (warmup LR → c_t * r̄_t)
+    signal_fraction_handoff_steps: int = 10
+    # Sign-gate mode: two-level LR gate based on alignment sign.
+    # gamma=None → continuous r-shaping (default); gamma=1.0 → constant LR (M baseline);
+    # gamma=0.5 → half speed on misaligned steps (A experiment).
+    signal_fraction_sign_gate_gamma: Optional[float] = None
+    # Optional: override post-handoff full-speed LR for mean-matching across experiments.
+    # If set, c_T = alpha_plus / r_ref instead of alpha_base / r_ref.
+    signal_fraction_sign_gate_alpha_plus: Optional[float] = None
 
     def __post_init__(self):
         if self.warmup_style is not None:
@@ -119,7 +171,8 @@ class FSDPOptimizerConfig(OptimizerConfig):
                 "`warmup_style` is deprecated, use `lr_scheduler_type` instead.", DeprecationWarning, stacklevel=2
             )
             self.lr_scheduler_type = self.warmup_style
-        assert self.lr_scheduler_type in ["constant", "cosine"]
+        assert self.lr_scheduler_type in ["constant", "cosine", "entropy_adaptive", "signal_fraction"]
+        assert self.entropy_adaptive_reference_mode in ["ema", "initial"]
         return super().__post_init__()
 
 

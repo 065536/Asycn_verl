@@ -156,6 +156,9 @@ class ActorConfig(BaseConfig):
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
     entropy_coeff: float = 0
+    # Entropy bonus mode: 'uniform' applies the same coefficient to all states.
+    # 'advantage_variance' weights by per-prompt advantage variance (directed exploration).
+    entropy_bonus_mode: str = "uniform"
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False

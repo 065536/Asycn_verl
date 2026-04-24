@@ -883,6 +883,18 @@ def compute_offpolicy_metrics(
 
     # 2. Compute rollout off-policy metrics (only if rollout_log_probs available)
     if rollout_log_prob is not None:
+        # 2a0. rollout probability drift stats (token-level |p_train - p_rollout|)
+        actor_probs = torch.exp(old_log_prob)
+        rollout_probs = torch.exp(rollout_log_prob)
+        probs_diff = (actor_probs - rollout_probs).abs()
+        valid_probs_diff = probs_diff[response_mask > 0]
+        if valid_probs_diff.numel() > 0:
+            metrics["rollout_probs_diff_p95"] = torch.quantile(valid_probs_diff.float(), 0.95).detach().item()
+            metrics["rollout_probs_diff_p99"] = torch.quantile(valid_probs_diff.float(), 0.99).detach().item()
+        else:
+            metrics["rollout_probs_diff_p95"] = 0.0
+            metrics["rollout_probs_diff_p99"] = 0.0
+
         # 2a. kl: Direct estimator for KL(π_rollout || π_training)
         # This is the standard KL divergence: E[log(π_rollout) - log(π_training)]
         # Positive value means rollout policy is more confident than training policy
