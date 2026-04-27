@@ -710,6 +710,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     handoff_steps=optim_config.get("signal_fraction_handoff_steps", 10),
                     sign_gate_gamma=optim_config.get("signal_fraction_sign_gate_gamma", None),
                     sign_gate_alpha_plus=optim_config.get("signal_fraction_sign_gate_alpha_plus", None),
+                    alpha_replay_path=optim_config.get("signal_fraction_alpha_replay_path", None),
+                    alpha_replay_shuffle=optim_config.get("signal_fraction_alpha_replay_shuffle", False),
+                    alpha_replay_seed=optim_config.get("signal_fraction_alpha_replay_seed", 0),
+                    alpha_replay_start_step=optim_config.get("signal_fraction_alpha_replay_start_step", 21),
+                    alpha_replay_end_step=optim_config.get("signal_fraction_alpha_replay_end_step", None),
                 )
             else:
                 raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")

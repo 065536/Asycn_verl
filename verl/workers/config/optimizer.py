@@ -163,6 +163,18 @@ class FSDPOptimizerConfig(OptimizerConfig):
     # Optional: override post-handoff full-speed LR for mean-matching across experiments.
     # If set, c_T = alpha_plus / r_ref instead of alpha_base / r_ref.
     signal_fraction_sign_gate_alpha_plus: Optional[float] = None
+    # Optional: replay an external alpha_t sequence (for control baselines).
+    # Supported file formats: json/csv/txt (see scheduler implementation).
+    signal_fraction_alpha_replay_path: Optional[str] = None
+    # If True, shuffle replay alpha values with the provided seed while preserving
+    # their marginal distribution (tests whether benefits come from alignment coupling
+    # vs. generic LR jitter/distribution).
+    signal_fraction_alpha_replay_shuffle: bool = False
+    # RNG seed used when signal_fraction_alpha_replay_shuffle=True.
+    signal_fraction_alpha_replay_seed: int = 0
+    # Replay active window [start_step, end_step]. Useful to preserve warmup/handoff.
+    signal_fraction_alpha_replay_start_step: int = 21
+    signal_fraction_alpha_replay_end_step: Optional[int] = None
 
     def __post_init__(self):
         if self.warmup_style is not None:

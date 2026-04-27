@@ -16,9 +16,11 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
 import gc
+import csv
 import json
 import logging
 import os
+import random
 import time
 import warnings
 from contextlib import nullcontext
@@ -256,6 +258,11 @@ class SignalFractionLRScheduler:
         handoff_steps: int,
         sign_gate_gamma: float = None,
         sign_gate_alpha_plus: float = None,
+        alpha_replay_path: str = None,
+        alpha_replay_shuffle: bool = False,
+        alpha_replay_seed: int = 0,
+        alpha_replay_start_step: int = 21,
+        alpha_replay_end_step: int = None,
     ):
         import math as _math
         self._math = _math
@@ -307,6 +314,20 @@ class SignalFractionLRScheduler:
         self.sign_gate_gamma: float = sign_gate_gamma
         self.sign_gate_alpha_plus: float = sign_gate_alpha_plus
         self._sign_gate_r_ref: float = None  # set at handoff
+
+        # alpha replay mode (Baseline 2 support):
+        # allows overriding alpha_t with an external sequence while preserving
+        # the same training code path and metrics collection.
+        self.alpha_replay_path: str = alpha_replay_path
+        self.alpha_replay_shuffle: bool = alpha_replay_shuffle
+        self.alpha_replay_seed: int = alpha_replay_seed
+        self.alpha_replay_start_step: int = alpha_replay_start_step
+        self.alpha_replay_end_step: Optional[int] = alpha_replay_end_step
+        self._alpha_replay_values: list[float] = []
+        self._alpha_replay_by_step: dict[int, float] = {}
+        self._last_alpha_replay_applied: float = 0.0
+        if self.alpha_replay_path:
+            self._load_alpha_replay()
 
         # Metrics
         self._last_r_hat_raw: float = 0.0
@@ -371,6 +392,124 @@ class SignalFractionLRScheduler:
         self._last_lr = [lr]
         self._last_alpha = lr
 
+    def _load_alpha_replay(self):
+        """Load alpha replay data from json/csv/txt file.
+
+        Supported formats:
+        1) JSON list: [a1, a2, ...]
+        2) JSON dict: {"alpha_t": [...]} or {"step_to_alpha": {"21": 2.9e-6, ...}}
+        3) CSV with columns including alpha_t (optional step column)
+        4) TXT with one float per line
+        """
+        path = os.path.expanduser(self.alpha_replay_path)
+        if not os.path.isabs(path):
+            path = os.path.abspath(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"alpha replay file not found: {path}")
+
+        ext = os.path.splitext(path)[1].lower()
+        values: list[float] = []
+        by_step: dict[int, float] = {}
+
+        if ext == ".json":
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, list):
+                values = [float(x) for x in payload]
+            elif isinstance(payload, dict):
+                if "step_to_alpha" in payload:
+                    by_step = {int(k): float(v) for k, v in payload["step_to_alpha"].items()}
+                elif "alpha_t" in payload:
+                    values = [float(x) for x in payload["alpha_t"]]
+                else:
+                    # fallback: dict where keys look like step numbers
+                    numeric_keys = []
+                    for k in payload.keys():
+                        try:
+                            numeric_keys.append(int(k))
+                        except Exception:
+                            numeric_keys = []
+                            break
+                    if numeric_keys:
+                        by_step = {int(k): float(payload[k]) for k in payload.keys()}
+                    else:
+                        raise ValueError(f"unsupported alpha replay json format: {path}")
+            else:
+                raise ValueError(f"unsupported alpha replay json format: {path}")
+
+        elif ext == ".csv":
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            if not rows:
+                raise ValueError(f"alpha replay csv is empty: {path}")
+            columns = {c.lower(): c for c in rows[0].keys()}
+            alpha_col = None
+            for c in ("alpha_t", "alpha", "lr"):
+                if c in columns:
+                    alpha_col = columns[c]
+                    break
+            if alpha_col is None:
+                # fallback: first non-step numeric-like column
+                candidates = [c for c in rows[0].keys() if c.lower() not in ("step", "global_step")]
+                if not candidates:
+                    raise ValueError(f"cannot infer alpha column from csv: {path}")
+                alpha_col = candidates[0]
+
+            step_col = None
+            for c in ("step", "global_step"):
+                if c in columns:
+                    step_col = columns[c]
+                    break
+
+            if step_col is not None:
+                for row in rows:
+                    if row.get(step_col, "") == "" or row.get(alpha_col, "") == "":
+                        continue
+                    by_step[int(float(row[step_col]))] = float(row[alpha_col])
+            else:
+                values = [float(row[alpha_col]) for row in rows if row.get(alpha_col, "") != ""]
+
+        else:
+            # txt / fallback: one float per line
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f.readlines()]
+            values = [float(x) for x in lines if x]
+
+        if not values and not by_step:
+            raise ValueError(f"alpha replay source has no usable data: {path}")
+
+        if self.alpha_replay_shuffle:
+            rng = random.Random(self.alpha_replay_seed)
+            if by_step:
+                steps = sorted(by_step.keys())
+                vals = [by_step[s] for s in steps]
+                rng.shuffle(vals)
+                by_step = {s: vals[i] for i, s in enumerate(steps)}
+            else:
+                values = list(values)
+                rng.shuffle(values)
+
+        self._alpha_replay_values = values
+        self._alpha_replay_by_step = by_step
+
+    def _alpha_replay_override(self) -> Optional[float]:
+        """Return replay alpha for current step, if replay is enabled and active."""
+        if not self.alpha_replay_path:
+            return None
+        if self.step_count < self.alpha_replay_start_step:
+            return None
+        if self.alpha_replay_end_step is not None and self.step_count > self.alpha_replay_end_step:
+            return None
+
+        if self._alpha_replay_by_step:
+            return self._alpha_replay_by_step.get(self.step_count, None)
+
+        idx = self.step_count - self.alpha_replay_start_step
+        if idx < 0 or idx >= len(self._alpha_replay_values):
+            return None
+        return self._alpha_replay_values[idx]
+
     # ------------------------------------------------------------------ #
     # Main entry: called every training step after computing r̂_t stats
     # ------------------------------------------------------------------ #
@@ -402,6 +541,7 @@ class SignalFractionLRScheduler:
                 self._update_r_ema_warmup(r_obs)
             # LR is controlled by step() during warmup; nothing to do here
             alpha_t = self._last_lr[0]
+            self._last_alpha_replay_applied = 0.0
             self._last_r_hat = self.r_ema
             self._last_r_ctrl = self.r_ema
             self._last_alpha = alpha_t
@@ -471,6 +611,14 @@ class SignalFractionLRScheduler:
         else:
             alpha_t = alpha_sf
 
+        # Optional alpha replay override (for shuffled/replay controls)
+        alpha_replay = self._alpha_replay_override()
+        if alpha_replay is not None:
+            alpha_t = float(alpha_replay)
+            self._last_alpha_replay_applied = 1.0
+        else:
+            self._last_alpha_replay_applied = 0.0
+
         self._set_optimizer_lr(alpha_t)
 
         # Always advance cooldown timer (once per training step, unconditionally)
@@ -529,6 +677,8 @@ class SignalFractionLRScheduler:
             "actor/phi_bar": self.phi_bar,
             "actor/cooldown": float(self._cooldown_counter > 0),
             "actor/in_handoff": float(self._handoff_done and self._handoff_step < self.handoff_steps),
+            "actor/alpha_replay_applied": self._last_alpha_replay_applied,
+            "actor/alpha_replay_enabled": float(self.alpha_replay_path is not None),
         }
         if self.g_rms_ema is not None:
             metrics["actor/g_rms_ema"] = self.g_rms_ema
@@ -559,6 +709,7 @@ class SignalFractionLRScheduler:
             "_last_phi": self._last_phi,
             "_last_p_t": self._last_p_t,
             "_last_a_t": self._last_a_t,
+            "_last_alpha_replay_applied": self._last_alpha_replay_applied,
             "_sign_gate_r_ref": self._sign_gate_r_ref,
             "sign_gate_alpha_plus": self.sign_gate_alpha_plus,
         }
@@ -581,6 +732,7 @@ class SignalFractionLRScheduler:
         self._last_phi = state_dict.get("_last_phi", None)
         self._last_p_t = state_dict.get("_last_p_t", None)
         self._last_a_t = state_dict.get("_last_a_t", None)
+        self._last_alpha_replay_applied = state_dict.get("_last_alpha_replay_applied", 0.0)
         self._sign_gate_r_ref = state_dict.get("_sign_gate_r_ref", None)
         # sign_gate_alpha_plus is a constructor param, not mutable state; not restored from checkpoint
 
