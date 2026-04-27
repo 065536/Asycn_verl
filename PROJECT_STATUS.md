@@ -1,9 +1,290 @@
 # Project Status: Learning-Update Mismatch in Self-Generated Data Loops
 
-**Last updated**: 2026-04-23 (4.23 理论诊断 + Phase 2 三角对照确定 + Bug 16 修复)
+**Last updated**: 2026-04-26
 **Model**: DeepSeek-R1-Distill-Qwen-1.5B | **Framework**: verl | **Algorithm**: PPO/GRPO
 
 ---
+
+## Today's Progress (2026-04-26)
+
+### 1. 9-run 多 seed 结果完成分析（`exp_data/4.26/analysis_report.md`）
+
+已完成 3 condition × 3 seed（M/A/B × 42/0/1）汇总分析，报告见：
+
+- `exp_data/4.26/analysis_report.md`
+
+**当前最稳结论（仅基于数据）**：
+
+1. **B（continuous r-shaping）是当前 overall 最强条件（near-mean-match 前提下）**：5 benchmark 综合均值与胜场均领先。  
+2. **A（sign-gate）是 task-specific stabilizer**：AIME 上稳定收益，但在 GPQA/MINERVA/OLYMPIAD 上稳定不优于 M。  
+3. **sign-only 不能解释 B 的收益**：`B-A` 在 OLYMPIAD 上稳定为正，GPQA/AIME 也偏正。  
+4. **结论边界**：B 与 M 不是严格完美 mean-match（step21-300: B≈3.095e-6, M=2.97e-6），需保留 residual confound 声明。
+
+### 2. Baseline 1 完成：constant LR = 3.10e-6（对齐 B 的 mean alpha）
+
+目的：回答 “B 是否仅仅因为 mean alpha 更高”。
+
+新增脚本：
+
+- `new_experiments/signal_fraction_lr/sync_matched_alpha_3.10e-6.sh`
+- `new_experiments/signal_fraction_lr/sync_matched_alpha_3.10e-6_seed0.sh`
+- `new_experiments/signal_fraction_lr/sync_matched_alpha_3.10e-6_seed1.sh`
+
+实现要点：
+
+- 仍走 `signal_fraction` 路径 + `sign_gate_gamma=1.0`，保持与 M/A/B 同代码路径，避免“换 scheduler 路径”混杂。
+- 主脚本已参数化（`SEED` / `EXP_NAME`），便于扩展 seed。
+
+### 3. Baseline 2 完成：alpha shuffled control（保分布，打乱与对齐信号对应）
+
+目的：回答 “B 的收益来自 alignment-conditioned modulation，还是普通 LR jitter”。
+
+#### 3.1 代码能力已实现（scheduler 层）
+
+新增 signal-fraction 参数（`optimizer.py` + `fsdp_workers.py` 透传 + `transformer_impl.py` 实现）：
+
+- `signal_fraction_alpha_replay_path`
+- `signal_fraction_alpha_replay_shuffle`
+- `signal_fraction_alpha_replay_seed`
+- `signal_fraction_alpha_replay_start_step`
+- `signal_fraction_alpha_replay_end_step`
+
+支持从 `json/csv/txt` 读取 alpha 序列，并在指定 step 窗口内 replay/shuffle 覆盖 alpha。
+
+新增监控：
+
+- `actor/alpha_replay_enabled`
+- `actor/alpha_replay_applied`
+
+#### 3.2 运行脚本已就绪（3 seeds）
+
+- `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpha_shuffled.sh`
+- `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpha_shuffled_seed42.sh`
+- `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpha_shuffled_seed0.sh`
+- `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpha_shuffled_seed1.sh`
+
+replay 源文件（已生成）：
+
+- `exp_data/4.26/alpha_replay/b_alpha_seed42_step21_300.json`
+- `exp_data/4.26/alpha_replay/b_alpha_seed0_step21_300.json`
+- `exp_data/4.26/alpha_replay/b_alpha_seed1_step21_300.json`
+
+### 4. 新一轮 6 组对照实验已启动（2026-04-26）
+
+按 3 seed 运行两类新 baseline，共 6 组：
+
+1. Baseline 1（constant 3.10e-6）：seed42/0/1
+2. Baseline 2（alpha shuffled）：seed42/0/1
+
+这些实验将直接用于消除/量化当前最关键 confound（B 的 mean alpha 略高）并验证“对齐条件调制”是否为主要增益来源。
+
+---
+
+## Today's Progress (2026-04-24)
+
+### 1. Phase 2 三角对照实验全部完成（300步）
+
+M / A / B 三组均完成，数据已下载至 `exp_data/4.24/`，分析报告：`exp_data/4.24/analysis_report.md`。
+
+**核心结论（完整版本，含用户 review 后的修正）**：
+
+**结论 1：Alignment-based modulation 有独立收益**
+在 mean α_t 基本对齐的条件下（M=2.97e-6, A=2.89e-6, B=2.97e-6），B 在 5/5 benchmark 上均超过 M；KL mean 和 grad norm mean 三组完全相同。平均 LR 量级无法解释主要差异。
+
+**结论 2：B（Continuous r-shaping）是整体最强**
+B 在 4/5 benchmark final 最优；尤其 GPQA/OLYMPIAD/MINERVA 上明显优于 A（GPQA：+0.031）。Continuous magnitude 在宽任务有 sign-only 之外的额外价值。
+
+**结论 3：A（Sign-gate）是 AIME 稳定器，但不是全局最优**
+- A AIME24 peak-to-final drop = -0.008（vs M 的 -0.044），AIME2025 final 最优
+- A 在 OLYMPIAD/GPQA/MINERVA 上**低于 M**（GPQA: A=0.3419 < M=0.3663）
+- 不能再说 "A ≈ B，所以 sign 足够"
+
+**结论 4：固定 LR 后期守不住**
+M 的问题不是初始学习能力不足（AIME24 峰值 0.3375），而是后期回落最严重（drop=-0.044）。
+
+**结论 5：任务类型影响最优控制形式**
+AIME 类：A 更好（保守稳定）；OLYMPIAD/GPQA/MINERVA：B 更好（细粒度调制）。
+
+**不能声明的内容（用户明确纠正）**：
+- φ̄_t=0.5 不能作为 c_t controller 收敛证据（本轮 c-side 关闭，eta_c=0）
+- P(g_dot>0) 不能做 iid 显著性检验（时序相关）
+- 不能说 "A/B 在所有 benchmark 上均超 M"（A 在宽 benchmark 上不如 M）
+
+**关键 training dynamics 指标**：
+
+| 指标 | M | A | B |
+|-----|---|---|---|
+| entropy mean | 0.450 | 0.446 | **0.362** |
+| KL mean | 0.0004 | 0.0004 | 0.0004 |
+| grad norm mean | 0.039 | 0.039 | 0.040 |
+| resp len final | 2714 | 2601 | **2917** |
+| P(g_dot>0) mean | 52.7% | 57.9% | — |
+
+### 2. Sign-gate 深度分析（2026-04-24 完成）
+
+P(g_dot>0) 分阶段统计：
+
+| 阶段 | M | A |
+|------|---|---|
+| warmup (1-20) | 0.750 | **0.900** |
+| early (21-100) | 0.475 | 0.557 |
+| mid (101-200) | 0.520 | 0.600 |
+| late (201-300) | 0.530 | **0.510** |
+
+**核心结论（4.24 确定）**：
+
+1. **Late-period P(g_dot>0) 下降的根因**：A 比 M 更快达到低熵 regime（entropy final: A=0.334 < M=0.390），低熵下 split-batch 方向估计 SNR 系统性下降。这是结构性问题，与 γ 无关。A 的 late-period 对齐率交叉低于 M（0.510 vs 0.530），signal 判别力在训练后期自然衰弱。
+
+2. **A 的 AIME2025 稳定性是巧合性优势**：late-period P(g_dot≤0)↑ → 刹车频率↑ → A 的 effective LR 自动降低（late mean=2.801e-6 vs M 的2.970e-6），对 AIME 后期过更新恰好有保护作用，但这不是设计上的正确性。
+
+3. **GPQA: A < M 的机制**：gamma=0.5 刹车力度在 GPQA 对应步骤过于保守。这是最干净的"sign-gate 有害"证据：KL/gradnorm 三组均值完全对齐，差异只能来自信号利用方式。
+
+4. **游程分析含义**：负游程 median=1，>50% 的负对齐步骤在下一步就翻正，当前每步独立 gate 对这类"一步噪声"过度刹车。**Hysteresis（k=2）** 是最简单有效的改进候选：连续 k 步 g_dot≤0 才触发刹车，可过滤大部分单步负游程。但这个方向本质上已接近 continuous r-shaping（B），不如直接用 B。
+
+5. **Continuous magnitude 不是纯噪声的最强证据**：GPQA final B=0.3725 > M=0.3663 > A=0.3419，幅度信息在宽任务有 sign-only 之外的实际价值，"sign 足够"的假设已被推翻。
+
+### 3. Seed 重复实验（2026-04-24 已启动）
+
+Phase 2 结论基于单次运行，部分差距较小（A vs B on AIME24: 0.004），需要 seed 重复量化方差。
+
+已创建并启动 6 个新脚本（seed=0 和 seed=1，各跑 M/A/B 三组）：
+
+```
+new_experiments/signal_fraction_lr/
+  sync_matched_alpha_2.97e-6_seed0.sh     ← M, seed=0
+  sync_matched_alpha_2.97e-6_seed1.sh     ← M, seed=1
+  sync_sign_gate_gamma0.5_seed0.sh        ← A, seed=0
+  sync_sign_gate_gamma0.5_seed1.sh        ← A, seed=1
+  sync_sigfrac_cfixed_lr1.25e-5_seed0.sh  ← B, seed=0
+  sync_sigfrac_cfixed_lr1.25e-5_seed1.sh  ← B, seed=1
+```
+
+原始 seed=42（3组）+ 新 6组 = **9次运行，3 seed × 3 condition**。可报告 mean ± std，支撑论文声明。
+
+### 3. GitHub 仓库上线
+
+https://github.com/065536/Asycn_verl.git
+包含：核心代码修改、实验脚本、论文草稿、项目文档。排除：exp_data/（CSV）、verl/ckpts/（1.5T checkpoints）。
+
+### 4. Checkpoint 清理
+
+verl/ckpts/DeepSeek1.5B/ 清理：1.5T → 477G（保留 18 个 sigfrac/Phase 2 实验目录）。
+
+### 5. 分析脚本与报告
+
+- `exp_data/4.24/analyze.py`：生成所有图表
+- `exp_data/4.24/analysis_report.md`：完整分析报告（含用户 review 后的修正版结论）
+- `exp_data/4.24/figures/`：5 张图（benchmark、training dynamics、LR dynamics、alignment signal）
+
+---
+
+## What To Do Next
+
+### 第一优先级：等待 4.26 新 6 组 baseline 对照结果（已启动）
+
+跑完后按以下顺序分析：
+
+1. **先做机制 sanity-check（必须先于分数）**  
+   - Baseline 1: `alpha_t` 是否严格常数 3.10e-6（step11 后）  
+   - Baseline 2: `actor/alpha_replay_applied` 是否在 step21-300 全为 1  
+   - Baseline 2: `alpha_t` 在 step21-300 的 multiset 是否与对应 B 源序列一致（仅顺序被打乱）
+2. **再做结果对照（按 seed 配对差分）**  
+   - B vs Constant-3.10e-6：验证 B 的优势是否超出“更高平均 LR”解释  
+   - B vs Alpha-Shuffled：验证收益是否来自 alignment-conditioned modulation，而非普通 LR 波动
+3. 更新 `exp_data/4.26/analysis_report.md`，写入两组 baseline 对照结论与可声明边界
+
+#### 对照 1（Constant LR = B mean alpha）的判定目标
+
+要回答的问题：
+
+- **B 赢是不是仅仅因为 mean alpha 更大？**
+
+期望主比较：
+
+- `B` vs `Constant(3.10e-6)`（或等于 B 实测 mean alpha 的常数 LR）
+
+理想支持证据：
+
+- `B > Constant(B-mean)`，尤其在：
+  - `final avg_5bench`
+  - `AIME24 / OLYMPIAD final`
+  - `peak-to-final drop`（B 更小）
+  - late-stage stability（B 更稳）
+
+若成立，可支持叙事：
+
+- **adaptive gain allocation matters, not just average LR scale**
+- 关键不是平均 LR，而是 LR 在不同训练状态下的分配（early 更积极、late 自动降速）。
+
+#### 对照 2（Random/Shuffled alpha）的判定目标
+
+要回答的问题：
+
+- **B 赢是不是仅仅因为 LR 有波动（jitter），而不是因为与 alignment 对应？**
+
+实验定义：
+
+- 保留 B 的 alpha 分布（均值/方差/范围），仅打乱其与真实 step 状态（alignment）的对应关系。
+
+期望主比较：
+
+- `B` vs `Alpha-Shuffled`
+
+理想支持证据：
+
+- `B > Shuffled`（final 更高、drop 更小、late-stage 更稳）
+- Shuffled 无法复现 B 在 AIME/OLYMPIAD 上的 late-stage stability
+
+若成立，可支持叙事：
+
+- 收益来自 **alignment signal → LR allocation**，不是普通 LR jitter。
+
+#### 理想综合结果与结论强度
+
+最理想排序：
+
+- `B > Constant(B-mean) > M`，且 `B > Alpha-Shuffled`
+
+这时可给出强结论：
+
+- B 的提升既不是“平均 LR 更大”，也不是“LR 波动本身”，而是 alignment-conditioned continuous modulation 的因果收益。
+
+#### 非理想结果的降级解释（预定义）
+
+1. `Constant(B-mean) ≈ B`：
+   - B 优势与 mean LR scale 仍耦合，当前证据不足以完全解耦 conditioning 贡献。
+2. `Shuffled ≈ B`：
+   - dynamic LR schedule 有效，但当前证据不足以证明 split-batch alignment 是因果信号。
+3. `B < Constant` 或 `B < Shuffled`：
+   - 当前 B 主结论不稳，需收缩 claim 并重新审查 r_t 信号因果价值。
+
+#### 结果出来后的优先指标顺序（固定模板）
+
+1. `final avg_5bench`（整体效果）
+2. `AIME24 peak/final/drop`（late degradation）
+3. `OLYMPIAD final`（当前最稳的宽任务观察点）
+4. `alpha_t` 分段统计（early/mid/late）
+5. late-stage `entropy/KL/grad norm` 曲线与分位数（避免只看均值）
+
+### 第二优先级：论文更新
+
+根据 4.24 + 4.26 结论更新 main.tex：
+- Section 3–5：加入 slow scale（handoff）+ sign-gate + continuous-r 的实验叙事
+- 修正旧叙事（"sign 是最优"→ 任务依赖；continuous magnitude 有额外价值；near-mean-match 限制）
+- 填写 Section 7（Empirical Story）和 Section 8（Interventions）
+
+### 第三优先级：Phase 3 设计
+
+在完整 c_t controller（eta_c > 0）下重复 Phase 2，验证动态 scale 是否进一步提升宽 benchmark 性能。
+
+### 第四优先级：外部比较
+
+- DAPO Clip-Higher（脚本已有）
+- AER-style adaptive entropy-coefficient baseline（未实现）
+
+---
+
+
 
 ## Theory Revision (2026-04-16) — RESOLVED 2026-04-19 → see Theory Finalization below
 

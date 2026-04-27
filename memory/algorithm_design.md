@@ -222,15 +222,53 @@ sign-gate 不是 continuous r-shaping 的"降级版"，而可能是当前 regime
 4. 从该信号中识别出统计上最可信的分量：alignment sign
 5. sign-gate 是对"可靠信息"的最大化提取，而非退而求其次
 
-### Phase 2 三角对照（最终确定，2026-04-23）
+### Phase 2 三角对照（✅ 完成，2026-04-24 分析）
 
-三组 expected mean alpha 完全对齐（均≈2.97e-6），性能差异可归因于信号利用方式而非整体强度：
+三组 expected mean alpha 完全对齐（均≈2.97e-6），300步全部完成：
 
-| 组 | alpha 设计 | 期望 mean alpha | 脚本 | 状态 |
-|---|---|---|---|---|
-| M | 固定 2.97e-6（sign_gate_gamma=1.0） | 2.97e-6 | `sync_matched_alpha_2.97e-6.sh` | 🟡 待启动 |
-| A | g_dot>0: 3.71e-6 / g_dot≤0: 1.855e-6（gamma=0.5, alpha_plus=3.71e-6） | ≈2.97e-6 | `sync_sign_gate_gamma0.5.sh` | 🟡 待启动 |
-| B | c_fixed=2.5e-4, r_min=0.01，continuous r-shaping | 2.97e-6（实测） | `sync_sigfrac_cfixed_lr1.25e-5.sh` | ✅ 已完成 300步 |
+| 组 | alpha 设计 | 实测 mean alpha | 状态 |
+|---|---|---|---|
+| M | 固定 2.97e-6（sign_gate_gamma=1.0） | 2.97e-6 | ✅ 300步 |
+| A | g_dot>0: 3.71e-6 / g_dot≤0: 1.855e-6（gamma=0.5） | 2.89e-6 | ✅ 300步 |
+| B | c_fixed=2.5e-4, continuous r-shaping | 2.97e-6 | ✅ 300步 |
+
+### Phase 2 核心结论（2026-04-24）
+
+**B 是整体最强**：5/5 benchmark 超过 M；4/5 benchmark final 最优
+
+| Benchmark | M final | A final | B final |
+|-----------|---------|---------|---------|
+| AIME24    | 0.2938  | 0.3229  | **0.3271** |
+| AIME2025  | 0.2271  | **0.2646** | 0.2396 |
+| OLYMPIAD  | 0.4888  | 0.4850  | **0.5056** |
+| GPQA      | 0.3663  | 0.3419  | **0.3725** |
+| MINERVA   | 0.2794  | 0.2737  | **0.2900** |
+
+**关键修正（不能再说 "A ≈ B，所以 sign 足够"）**：
+- A 在 OLYMPIAD/GPQA/MINERVA 上**低于 M**（GPQA: A=0.3419 < M=0.3663），sign-gate 刹车对宽 benchmark 过于粗糙
+- B 在宽 benchmark 上的优势说明 continuous magnitude 不是纯噪声，在这类任务有独立价值
+- A 的价值体现在 AIME 类：peak-to-final drop 最小（-0.008 vs M 的 -0.044），在 AIME2025 final 最优
+
+**Entropy 异常**：B 的 entropy mean 显著低于 M/A（0.362 vs 0.450），但性能反而最好。低 entropy + continuous r-shaping 的关系待进一步研究。
+
+**KL/grad norm 三组完全对齐**（KL=0.0004，gradnorm≈0.039）——性能差异不来自整体更新强度。
+
+**不能声明的内容**：
+- φ̄_t=0.5 **不是** c_t controller 收敛证据（本轮 c-side 关闭，eta_c=0）
+- P(g_dot>0) 的统计显著性不能用 iid 检验（时序相关）
+
+**Sign-gate 动力学（2026-04-24 初步分析）**：
+
+| 阶段 | M P(g_dot>0) | A P(g_dot>0) |
+|------|-------------|-------------|
+| warmup (1-20) | 0.750 | **0.900** |
+| early (21-100) | 0.475 | 0.557 |
+| mid (101-200) | 0.520 | 0.600 |
+| late (201-300) | 0.530 | **0.510** |
+
+A 的 late-period 对齐率降到 0.510（接近随机），说明训练后期 sign 信号显著减弱——与 AIME2025 late 回落一致。A 的游程分析：正游程 mean=2.40（max=9），负游程 mean=1.75（median=1），说明信号微弱、以短游程为主。
+
+完整分析报告：`exp_data/4.24/analysis_report.md`
 
 **均值匹配推导**（A）：假设 p(g_dot>0)≈0.60，alpha+ = 2.97e-6 / (p + (1-p)×0.5) = 2.97e-6 / 0.80 = 3.7125e-6。B 的 mean 来自实测 actor/alpha_t。
 
@@ -241,3 +279,57 @@ sign-gate 不是 continuous r-shaping 的"降级版"，而可能是当前 regime
 - M（gamma=1.0）：两分支相同 → 常数 LR
 
 **新增监控指标**：`actor/g_dot_positive`（每步 0/1），用于核对实际 p(g_dot>0) 是否接近 0.60，进而核对 A 的实际 mean alpha。
+
+---
+
+## Sign-Gate 深度分析（2026-04-24）
+
+### Late-period P(g_dot>0) 下降的机制
+
+A 的 late-period 对齐率从 0.600 跌至 0.510，低于 M 的 0.530。
+
+**最可能的根因**：低熵 regime 下 split-batch 方向估计噪声放大。A 比 M 更快到达低熵状态（entropy final: A=0.334 < M=0.390），在低熵 regime 中少数极端样本的梯度贡献更大，两半批次更容易出现方向分歧，sign 信号 SNR 下降。这是结构性的，不是可修复的 bug。
+
+其他机制（自然收敛预测 P→升高，与观测矛盾；sign-gate 反馈机制理论上可能，但证据弱）。
+
+### Late-period 信号衰弱与 AIME2025 的关系
+
+A 在 AIME2025 final=0.2646（peak=final，drop=0）。这是"巧合性稳定"：
+- late-period P(g_dot≤0)↑ → 刹车频率↑ → effective LR 进一步降低（A late mean=2.801e-6 vs M的2.970e-6）
+- 这个自动降速恰好对 AIME 的 late degradation 有保护效果，但并非设计上的正确性
+
+### GPQA: A < M 的机制
+
+GPQA: A=0.3419 < M=0.3663。gamma=0.5 的刹车在 GPQA 对应步骤过于保守，抑制了有效更新。这是最干净的反例，KL/gradnorm 均值三组完全一致，排除了整体更新强度的解释。
+
+### 游程分析的含义
+
+正游程 mean=2.40（max=9），负游程 mean=1.75（median=1）。
+
+**关键发现**：超过 50% 的负对齐步骤只持续 1 步就反转（负游程 median=1）。当前 sign-gate 每步独立判断，对这些单步负对齐触发 γ=0.5 刹车——但下一步就会翻正，造成过度刹车。
+
+**设计含义（按优先级）**：
+1. **Hysteresis（k=2）**：连续 k 步 g_dot≤0 才刹车，过滤单步负游程。实现简单，对 GPQA 过刹车有直接改善。
+2. **EMA g_dot gate**：用 EMA(g_dot) sign 替代当步 sign，天然 hysteresis 效果。
+3. 如果要走这个方向，本质上已接近 continuous r-shaping（B 的路线），不如直接用 B。
+
+### 三个核心结论
+
+1. **sign 信号在当前 regime 是弱信号，AIME stabilization 是任务特异性的**：GPQA 上 A 的净效果为负（A < M），不能声明"sign-gate 是通用改进"。
+2. **late-period sign SNR 衰退是结构性的**：随训练推进策略集中、熵降低，split-batch 方向估计 SNR 系统性下降，与 γ 选择无关。
+3. **continuous magnitude 不是纯噪声**：GPQA B > M > A，说明幅度信息在宽任务上有实际价值，sign-only 假设已被推翻。
+
+### Seed 重复实验（2026-04-24 启动）
+
+为量化单次运行的方差，补充 seed=0 和 seed=1 的 M/A/B 三组（共 6 个新实验）：
+
+| 脚本 | seed |
+|------|------|
+| `sync_matched_alpha_2.97e-6_seed0.sh` | 0 |
+| `sync_matched_alpha_2.97e-6_seed1.sh` | 1 |
+| `sync_sign_gate_gamma0.5_seed0.sh` | 0 |
+| `sync_sign_gate_gamma0.5_seed1.sh` | 1 |
+| `sync_sigfrac_cfixed_lr1.25e-5_seed0.sh` | 0 |
+| `sync_sigfrac_cfixed_lr1.25e-5_seed1.sh` | 1 |
+
+原始 seed=42（3组）+ 6组 = 9次运行，3 seed × 3 condition。分析脚本（analyze.py）需更新以支持 mean ± std 汇总。

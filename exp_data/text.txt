@@ -1,0 +1,406 @@
+同步
+指标
+sync lr=1e-5
+sync lr=1e-6
+val accuracy
+V形崩溃（step ~150-180跌底后回升）
+相对稳定，无明显崩溃
+entropy
+衰减最快，step ~250趋近于0
+缓慢衰减，step 300仍保留合理水平
+grad_norm
+缓慢抬升至 ~0.10，step 150-165达峰
+step 200后持续上升至 ~0.13，未收敛
+ppo_kl
+小且平稳
+小且平稳
+response_length
+U形，回落后step ~180开始反弹至3200
+U形类似，但反弹更晚
+分析
+发现了一个问题：
+- ppo_kl 一直很小，非常平稳
+- 但 entropy 在 sync lr=1e-5 下衰减最快，几乎趋近于零
+如果 ppo_kl 很小，说明每一步更新后策略没有跑远——那 entropy 为什么还是坍缩了？
+说明每一步更新的方向是一致的，最终导致了坍缩
+每步更新的方向由什么决定？
+$$\Delta\theta \propto -\alpha \cdot \mathbb{E}\left[\hat{A}t \cdot \nabla\theta \log \pi_\theta(a_t)\right]$$
+advantage为正的动作，策略往"提高其概率"的方向走；advantage为负的动作，往"降低其概率"的方向走。每步方向都一样——这是on-policy同步训练的特性。
+如果每步方向一致，lr=1e-6 也应该往同一个方向走，为什么它的 entropy 没有那么快坍缩？
+假设第 $$t$$ 步，策略对某个"好动作" a^做了一次大的更新（高LR），\pi(a^) 从0.3变成了0.5。
+那第 $$t+1$$ 步，用新策略 $$\pi_{\theta_t}$$ 采样轨迹时，$a^*$ 会被采样到的频率是多少？
+采样到 $$a^*$$ 更多之后，advantage的估计会怎么变化？
+提高了a_hat的采样的概率？这样会让a_hat更容易被采到，它出现频率更高会导致adv降低？因为adv需要减去一个mean，这样的相对优势减小
+ $$a^*$$ 出现更多后，它的 advantage 因为减去均值而降低——这其实是一个自纠正信号，理论上应该让训练稳定下来。
+但 entropy 还是坍缩了。说明还有另一面没分析到。
+$$a^*$$ 被采样更多的同时，其他动作 $a'$ 被采样到的频率在发生什么？
+它们的 advantage 估计会怎样？
+如果 $$\pi(a')$$ 降到很低，比如某个动作的概率从 0.3 降到 0.02，在一个 batch 里它可能根本采样不到。
+采样不到意味着什么？
+$$\nabla_\theta \mathcal{L} = \mathbb{E}{a \sim \pi}\left[\hat{A}(a) \cdot \nabla\theta \log\pi(a)\right]$$
+这个梯度期望是对采样到的动作求和的。如果 $a'$ 没被采到，它对梯度有多少贡献？
+如果采不到，那么它对梯度没有贡献，但是我们需要负样本的对吧？因为我们希望模型知道这样做不对？
+第 $$t$$ 步：高LR让 $\pi(a^*)$ 大幅提升，$\pi(a')$ 大幅压低
+第 $$t+1$$ 步rollout：$a'$ 采样不到 → 梯度中没有负样本信号 → 模型不知道要抑制 $a^*$
+第 $$t+2$$ 步：$a^*$ 继续被强化，$a'$ 继续被忽视……
+这是一个单向的正反馈，最终 entropy → 0。
+现在回到最开始的问题——lr=1e-6 为什么不会这样？
+不是因为方向不同，而是步长小，每步 $$\pi(a^*)$$ 只从0.3涨到0.31，$a'$ 的概率变化很小，下一次rollout它还是能被采到，负样本信号得以保留。
+同步训练下高LR崩溃的本质：
+高LR通过破坏采样多样性，切断了负样本的梯度信号，形成不可逆的正反馈坍缩。
+下一个问题：clip机制（ppo_kl低）为什么没能阻止这件事？
+ppo_kl 是当前策略 $\pi_\theta$ 与rollout时的旧策略 $\pi_{\theta_{old}}$ 之间的KL散度估计：
+$$\mathrm{ppo\_kl} \approx
+\mathbb{E}_{(s,a)\sim \pi_{\theta_{\mathrm{old}}}}
+\left[
+\log \frac{\pi_{\theta_{\mathrm{old}}}(a \mid s)}{\pi_\theta(a \mid s)}
+\right]
+$$
+注意这个期望是对采样到的动作求的。
+所以在这种情况下，a'的变化根本没有被计入，我们根本不知道发生了较大的变化
+这就是 ppo_kl 低但 entropy 还在坍缩的真正原因：
+ppo_kl 是一个有偏的估计——它只能"看到"被采样到的动作，对于低概率动作的概率变化完全盲目。
+所以会出现这种情况：
+- $$a^*$$ 概率从 0.3 → 0.5，ratio ≈ 1.67，被clip截断，ppo_kl 贡献小
+- $$a'$$ 概率从 0.3 → 0.05，但采不到，KL估计里根本不出现
+- 最终 ppo_kl 显示"一切正常"，entropy 已经在悄悄坍缩
+这也是为什么 ppo_kl 在同步实验里一直很平稳，它是一个失效的预警指标——在高LR+同步训练的场景下，它无法捕捉策略的真实漂移。
+高LR
+ → 单步大幅提升π(a*)，压低π(a')，其中 a* 仅是当前局部最优
+ → 下一次rollout采样多样性下降
+ → 负样本(a')梯度信号丢失
+ → a'继续被忽视，a*继续被强化（正反馈）
+ → entropy坍缩
+ → ppo_kl全程"正常"（盲区）
+有一个现象还没有解释：
+看 sync_lr1e-5 在 MINERVA 上的数据：
+- Step 0: 0.22（起点）
+- Step 20: 0.28（峰值）
+- Step 300: 0.12（终点）
+它不仅是"停滞"，而是降到了起点以下。如果只是"锁死在局部最优"，性能应该是停在某个水平不动。但它在持续变差。
+怎么解释这个主动退化？模型已经不探索了，为什么性能还会继续下降？
+PPO 的梯度本质上还是 policy gradient，核心公式：
+$$\nabla_\theta J(\theta) = \mathbb{E}{s \sim d^\pi,; a \sim \pi\theta} \left[ \nabla_\theta \log \pi_\theta(a|s) \cdot A(s, a) \right]$$
+展开这个期望，对所有可能的 action 求和：
+$$\nabla_\theta J(\theta) = \sum_a \pi_\theta(a|s) \cdot \nabla_\theta \log \pi_\theta(a|s) \cdot A(s, a)$$
+当 entropy 坍缩后，π_θ(a*|s) → 1，π_θ(a'|s) → 0。那么这个求和
+$$\nabla_\theta J(\theta) \approx \pi_\theta(a^|s) \cdot \nabla_\theta \log \pi_\theta(a^|s) \cdot A(s, a^*)$$
+其他所有项都因为 π_θ(a'|s) ≈ 0 而消失了。
+不是这些 a' 没有信息量（它们的 A(s,a') 可能很大），而是它们的梯度贡献被 π_θ(a'|s) 这个权重直接抹掉了。
+也就是说，policy gradient 本身有一个结构性的问题：梯度由当前策略加权，低概率的 action 无论好坏，都无法影响梯度方向。
+当 α（lr）大的时候，单步更新就会让 π_θ(a*|s) 大幅增加、π_θ(a'|s) 大幅减少。而 π_θ(a'|s) 一旦减小，下一步它对梯度的贡献就更小，所以下一步它会被进一步压低……
+π_θ(a'|s) → 0 是一个单向过程
+因为要恢复 π_θ(a'|s)，你需要关于 a' 的梯度信号；但要获得梯度信号，你需要 π_θ(a'|s) 不为零来采到它。这是一个死锁。
+回到之前的问题，为什么范式固化还在掉acc。
+当 entropy 极低时，
+$$\nabla_\theta J(\theta) \approx \pi_\theta(a^|s) \cdot \nabla_\theta \log \pi_\theta(a^|s) \cdot A(s, a^*)$$
+现在 a* 是几乎唯一被采到的 action。但 A(s, a*) 是什么？是 advantage，即相对于 baseline 的好坏。
+当所有 rollout 都是 a* 时，baseline（value function）会逐渐逼近 a* 的 reward。这意味着：
+- 在 a* 答对的题上：A(s, a*) ≈ 0（和 baseline 持平）
+- 在 a* 答错的题上：A(s, a*) < 0（比 baseline 差）
+你看到了吗？答对的题几乎没有梯度，答错的题反而贡献负梯度。
+但这个负梯度只能压低 a*，却不能提升任何 a'（因为 π(a') ≈ 0，没有替代方案）。结果就是：模型在答错的题上被推离 a*，但又找不到更好的 action，参数就在一个没有有效信号的区域漂移。
+所以退化不是模型"学到了坏东西"，而是：
+梯度信号退化为只有噪声，参数在无信号区域随机游走，性能缓慢下降。
+这就解释了为什么 acc 是缓慢持续下降而不是突然崩盘——这是随机漂移的特征，不是灾难性遗忘。
+
+PPO/GRPO 的优化目标，和监督学习的优化目标，在数学结构上最本质的区别是什么？
+$$$$
+监督学习：$$\min_\theta ; \mathbb{E}{(x,y) \sim \mathcal{D}_{\text{fixed}}} [\ell(\theta; x, y)]
+$$
+On-policy RL：$$\max_\theta ; J(\theta) = \mathbb{E}_{s \sim d^{\pi\theta}, ; a \sim \pi_\theta} [R(s,a)]$$
+区别在于：监督学习的数据分布 $$\mathcal{D}$$ 是固定的，loss landscape 的形状不随 $$\theta$$ 变化。而 RL 的期望是在 $$\pi_\theta$$ 下取的——你优化的目标函数本身依赖于你正在优化的参数。
+这意味着每一步梯度更新 $$\theta_t \to \theta_{t+1}$$，不仅改变了参数，还改变了下一步采样的分布，进而改变了 loss landscape 本身的形状。
+在监督学习里，我们在 $$\theta_t$$ 处计算的梯度 $$\nabla L(\theta_t)$$，它是同一个函数 $$L$$ 的梯度。不管 $$\theta$$L=怎么变， L的形状不变。所以只要步长足够小，沿梯度方向走一步一定能让 $$L$$下降——这就是标准的梯度下降收敛保证。
+但在 on-policy RL 里，我们在 $$\theta_t$$ 处计算的梯度是：
+$$g_t = \mathbb{E}_{a \sim \pi{\theta_t}} [\hat{A}(a) \cdot \nabla_\theta \log \pi_{\theta_t}(a)]$$
+这个 $$g_t$$ 是在分布 $$\pi_{\theta_t}$$ 下估计的。更新到 $$\theta_{t+1}$$ 之后，下一步的梯度 $$g_{t+1}$$ 是在 $$\pi_{\theta_{t+1}}$$ 下估计的。
+也就是说：$$g_t$$ 和 $$g_{t+1}$$ 不是同一个函数的梯度。 我们不是在一个固定的 loss landscape 上做下降，而是每走一步，脚下的地形就变了。
+PPO 的 clip / trust region 机制，本质上是在应对这个问题。
+既然每一步更新都会改变 loss landscape，那我们能信任的只有当前 $$\theta_t$$附近的局部近似。TRPO 的理论给出了一个严格的下界：
+$$J(\theta_{t+1}) \geq L^{\pi_{\theta_t}}(\theta_{t+1}) - C \cdot D_{\text{KL}}^{\max}(\pi_{\theta_t} | \pi_{\theta_{t+1}})$$
+其中 $$L^{\pi_{\theta_t}}(\theta_{t+1})$$ 是用旧策略 $$\pi_{\theta_t}$$ 的数据构造的 surrogate objective，$C$ 是一个常数。
+这个不等式说的是：surrogate 的改进量减去一个 KL 惩罚项，是真实目标 $J$ 改进量的下界。 只要 KL 足够小，surrogate 改进就能保证真实目标也改进。
+PPO 的 clip 就是这个思想的一个实用近似——通过把 importance ratio $$r_t(\theta) = \frac{\pi_\theta(a)}{\pi_{\theta_{\text{old}}}(a)}$$ 截断在 $$[1{-}\epsilon, 1{+}\epsilon]$$，间接限制策略变化幅度。
+现在关键问题：这个保证里的 $$D_{\text{KL}}^{\max}$$ 是什么？它是 所有状态上 KL 散度的最大值，不是平均值。而 PPO 实际能控制的（通过 clip）只是被采样到的状态-动作对上的 ratio。
+TRPO 的理论保证需要一个条件：在所有可能的状态 $s$ 上，新旧策略的 KL 散度都要小。写成数学就是：
+$$D_{\text{KL}}^{\max} = \max_{s} ; D_{\text{KL}}(\pi_{\theta_t}(\cdot|s) | \pi_{\theta_{t+1}}(\cdot|s))$$
+这个要小。
+但 PPO 实际做的 clip 操作，是对什么做的？是对当前 batch 里采样到的那些 $(s, a)$ 对做的。它把 $$r = \frac{\pi_{\theta_{t+1}}(a|s)}{\pi_{\theta_t}(a|s)}$$ 截断在 [0.8, 1.2]。
+举个具体例子：假设某个状态 $$s$$ 下有两个动作 $$a^*$$ 和 $a'$。
+当前策略：$$\pi_{\theta_t}(a^*|s) = 0.7$$，$$\pi_{\theta_t}(a'|s) = 0.3$$
+因为 $a^$ 概率高，batch 里大部分样本是 $(s, a^)$。PPO 的 clip 保证了 a^ 的 ratio 不超过 1.2，也就是 $$\pi_{\theta_{t+1}}(a^|s) \leq 0.84$$。
+但 $$a'$$ 呢？如果 batch 里恰好没采到 $(s, a')$，clip 对 $a'$ 的概率变化没有任何约束。$$\pi_{\theta_{t+1}}(a'|s)$$可以从 0.3 变成 0.01，PPO 完全不知道。
+而 $$D_{\text{KL}}^{\max}$$ 要求的是包括 $a'$ 在内的整个分布的 KL 都要小。
+所以 PPO 实际控制的范围，和理论要求的范围之间，有一个 gap：没被采样到的动作上的策略变化，完全不受约束。
+这个 gap 在正常情况下问题不大——如果策略比较均匀，大部分动作都能被采到。但当 entropy 开始下降，越来越多的动作采不到时，这个 gap会进一步拉大，而且算法感知不到。
+之前我们说"高LR → $$a'$$ 采不到 → 梯度信号断裂"。从优化角度重新表述就是：
+$$a'$$ 采不到 → clip 对 $$a'$$ 无约束 → trust region 在 $$a'$$ 方向上破了一个洞 → surrogate 对真实目标 $$J(\theta)$$ 的近似不再可靠。
+也就是说，surragate $$L^{\text{CLIP}}$$ 告诉你"这一步改进了"，但真实目标 $$J(\theta)$$ 可能在下降。算法看着自己的 surrogate loss，觉得一切正常；实际上策略已经在不受约束地漂移了。
+到这里我们建立了：trust region 泄漏 → surrogate 和真实目标脱节。
+更糟糕的是，这个问题会随时间累积放大，而且不只是线性累积——它是自加速的。
+我们刚建立的链条是：
+1. 高LR → 某些 $a'$ 采不到 → trust region 在这些方向上破洞
+2. $\pi(a')$ 不受约束地被压低
+3. 下一步，$a'$ 更难采到 → 破洞更大
+但还有一个更微妙的点：破洞不仅变大，而且破洞的数量在增加。
+第 $t$ 步，可能只有几个低概率动作掉出了采样范围。但因为 trust region 在这些方向上不约束，它们的概率被进一步压低，同时 $\pi(a^*)$ 被抬高。这导致第 $t+1$ 步，原本概率还在边缘的一些动作也掉出了采样范围。
+也就是说 trust region 的"有效覆盖面积"在逐步缩小，每一步缩小都让下一步缩得更快。
+这其实就是我们之前分析的 entropy 坍缩过程——只是现在从优化角度重新描述了：它是 trust region 有效区域的渐进坍缩。
+我们说 clip 约束不住没被采到的动作，但 clip 对被采到的动作应该是有效的——那为什么 $a^$ 的概率还能持续上升？clip 不是应该限制住 $a^$ 的 ratio 吗？
+总结
+现象
+sync_lr1e-5 在训练前期快速上升（OLYMPIAD_BENCH step 20 达到 0.48），但随后持续退化，最终降至起点以下（MINERVA: 0.22 → 0.12）。而 sync_lr1e-6 全程稳步上升。
+两者的 entropy 最终都降到了 ~0.08，但 sync_lr1e-5 的 entropy 在 step 50 就已降到 0.25，sync_lr1e-6 在 step 50 还维持在 0.47。
+PPO KL 在两个配置下全程保持极低水平（0.0001-0.0005），未触发任何异常信号。
+Policy Gradient 的结构性缺陷被高 LR 激发
+Policy gradient 的梯度为：
+$$\nabla_\theta J(\theta) = \sum_a \pi_\theta(a|s) \cdot \nabla_\theta \log \pi_\theta(a|s) \cdot A(s, a)$$
+每个 action 对梯度的贡献由 π_θ(a|s) 加权。π_θ(a|s) 同时承担采样权重和梯度权重两个角色。
+参数更新为：
+$$\theta_{t+1} = \theta_t + \alpha \cdot \nabla_\theta J(\theta_t)$$
+对 log π 做一阶 Taylor 展开，可得单步更新对 action 概率的影响：
+$$\Delta \log \pi_\theta(a|s) \approx \alpha \cdot \nabla_\theta J(\theta_t)^\top \cdot \nabla_\theta \log \pi_\theta(a|s)$$
+α 线性地控制了 log π 的变化幅度。 由于 π = exp(log π)，α 实际上以指数速率影响概率的变化：
+$$\frac{\pi_{new}(a|s)}{\pi_{old}(a|s)} \approx \exp\left(\alpha \cdot \nabla_\theta J(\theta_t)^\top \cdot \nabla_\theta \log \pi_\theta(a|s)\right)$$
+当 A(s, a*) > 0 时，梯度方向使得 log π(a*) 增大、log π(a') 减小，而 α 直接放大了这一变化。lr 从 1e-6 增大到 1e-5（10 倍），意味着 每步 π(a*) 的增长和 π(a') 的衰减都以约 10 倍的速率进行。
+这里 a* 仅为当前 rollout 中的局部最优，而非全局最优。一旦 π(a') 被压低，由于它同时是采样概率和梯度权重：
+- 采样端：a' 不再被生成，负样本信号丢失
+- 梯度端：即使 A(s, a') 很大，其贡献也被 π(a') ≈ 0 抹掉
+这是一个不可逆的死锁：恢复 π(a') 需要关于 a' 的梯度信号，而获得梯度信号需要 π(a') 不为零。
+反馈循环
+高 LR → α 放大每步 π 的变化 → π(a*) 指数级增长、π(a') 指数级衰减 → rollout 多样性下降 → 负样本梯度信号丢失 → a* 继续被强化、a' 无法恢复 → entropy 坍缩
+这个循环一旦启动就无法自行终止
+为什么 acc 持续下降
+entropy 坍缩后，几乎所有 rollout 都是 a*。Value function 逐渐逼近 a* 的 reward，此时 advantage 出现不对称：
+- 答对的题：A(s, a*) ≈ 0，几乎无梯度
+- 答错的题：A(s, a*) < 0，产生负梯度
+负梯度只能压低 a*，却无法提升任何 a'（因为 π(a') ≈ 0，无替代方案可被强化）。梯度信号退化为纯噪声，参数在无信号区域随机漂移，表现为 acc 缓慢持续下降——这是随机游走的特征，而非灾难性遗忘。
+PPO KL 的结构性失效
+PPO KL 的计算为：
+$$D_{KL}(\pi_{old} | \pi_{new}) = \sum_a \pi_{old}(a|s) \log \frac{\pi_{old}(a|s)}{\pi_{new}(a|s)}$$
+每一项由 π_old(a|s) 加权。当 entropy 坍缩后 π_old(a') ≈ 0，无论 π_new(a') 发生多大变化，该项对 KL 的贡献都趋近于零。实际计算中 PPO KL 从 rollout 样本估计，坍缩后采到的几乎全是 a*，低概率 action 的变化完全不可见。
+这与梯度信号丢失是同一个根源：π_θ(a|s) 同时充当梯度权重、采样权重和 KL 权重，低概率 action 在梯度更新、数据采集和监控指标三个层面被同时屏蔽。因此 entropy 是唯一能捕捉该失败模式的指标。
+为什么 lr=1e-6 不会触发此问题
+α 缩小 10 倍，每步 π 的变化速率降低一个数量级。π(a') 被缓慢压低而非骤降，模型在 entropy 下降的过程中有充足的时间持续采到多样的 action、获得完整的梯度信号，逐步淘汰劣质策略、保留优质策略。最终 entropy 同样降至 0.08，但此时模型已经完成了充分的探索，收敛到的是经过验证的全局较优策略，而非局部最优。
+异步
+分析
+先看 async_partial_lr1e-5 和 sync_lr1e-5 最关键的区别
+指标
+sync_lr1e-5 (step 300)
+async_partial_lr1e-5 (step 300)
+entropy
+0.07
+0.24
+MINERVA acc
+0.12
+0.08
+两个配置的 acc 都崩了，但 entropy 完全不同——async 的 entropy 并没有坍缩。
+所以第一个问题：async_partial_lr1e-5 的失败显然不是 entropy collapse，那它的问题出在哪里？
+在于数据，async partial rollout 的 off-policy 问题有两种：
+1. 整体陈旧：生成 rollout 的 π_gen 和当前训练的 π_θ 版本不一致
+2. Partial rollout 的局部不一致：同一条 trajectory 内，前半段和后半段可能由不同版本的 π 生成
+PPO 用 importance sampling 来修正 off-policy 数据：
+$$r_t(\theta) = \frac{\pi_\theta(a|s)}{\pi_{gen}(a|s)}$$
+$$L^{CLIP}(\theta) = \mathbb{E}\left[\min\left(r_t(\theta) \cdot A_t,; \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \cdot A_t\right)\right]$$
+在 sync 模式下，π_gen = π_old（当前策略），所以 r_t(θ) ≈ 1，IS 修正几乎不起作用。
+但在 async 模式下，π_gen 是旧策略。那么当 lr 大的时候，π_θ 和 π_gen 之间的差距会进一步拉大，r_t(θ) 不一定是更小，而是偏离 1 更远，两个方向都有可能：
+- π_gen 当时认为很好的 action a，π_θ 可能已经不再偏好 → r_t << 1
+- π_gen 当时不太选的 action a'，π_θ 可能现在更偏好 → r_t >> 1
+关键是 r_t 的方差变大，很多值远离 1。
+配置
+clip fraction 范围
+async_partial_lr1e-6
+0.0004-0.001
+async_partial_lr1e-5
+0.002-0.02
+async_partial_lr1e-5 的 clip fraction 高出一个数量级，说明大量 r_t 超出了 [1-ε, 1+ε] 的范围被截断了。
+被 clip 掉意味着什么？clip 本来是 PPO 的保护机制，为什么在这里反而成了问题？
+当 r_t 远大于 1+ε 且 A_t > 0 时（当前策略比旧策略更偏好这个好 action），clip 会截断，阻止进一步强化。这是合理的保护。
+但问题是另一面：当 r_t 远小于 1-ε 且 A_t < 0 时（当前策略已经不喜欢这个差 action，而 advantage 也说它差），clip 同样会截断。
+在 async 场景下，大量 rollout 数据来自旧策略。当前策略 π_θ 已经通过之前的更新"学过"了这些数据中的信息，r_t 自然偏离 1。clip 会把这些样本的梯度截掉。
+所以真正的问题不是"错误地截断了好的更新"，而是：
+大量样本被 clip 后，剩下能提供有效梯度的样本变少了。
+$$L^{CLIP} = \min\left(r_t \cdot A_t,; \text{clip}(r_t, 1-\epsilon, 1+\epsilon) \cdot A_t\right)$$
+取的是 min。当 r_t 超出 [1-ε, 1+ε] 的范围时，clip 项变成一个常数（不再依赖 θ），而 min 会选择这个较小的常数项。
+对这个样本求梯度时，梯度直接为零——不是压缩，是完全丢弃。
+所以回到 async_partial_lr1e-5 的情况：大量 r_t 偏离 1 → 大量样本被 clip → 这些样本的梯度贡献为零 → 每个 batch 中能提供有效梯度信号的样本大幅减少。
+数据利用率降低了。但还不止于此——让我们再想深一步：
+被 clip 掉的样本和没被 clip 掉的样本，是随机分布的吗？还是说存在某种系统性的偏差？
+想想看：什么样的样本 r_t 更容易偏离 1？
+- π_θ 已经大幅更新过的方向 → r_t 偏离大 → 被 clip
+- π_θ 还没怎么更新的方向 → r_t 接近 1 → 保留
+也就是说，越是已经学过的、信息量越低的样本越容易存活；越是新鲜的、信息量高的样本越容易被 clip 掉。
+所以问题不仅是"有效样本变少"，而是剩下的样本存在系统性偏差——幸存的恰恰是信息量最低的那些。
+这意味着模型是把那些携带有效信息的数据剪掉了，模型很难学会新的知识。
+看起来clip发生的也不是很频繁啊，千分之2到百分之2，这个比例很大吗？
+确实，2% 看起来不多。但要想清楚这 2% 是哪些 token。
+在 LLM 的 RL 中，每个 action 是一个 token。一个 response 可能有几百个 token，其中大部分是什么？格式符号、常见短语、过渡句——这些 token 在 π_θ 和 π_gen 之间几乎没有差异，r_t ≈ 1，不会被 clip。
+那什么样的 token r_t 偏离最大？恰恰是关键推理步骤——π_θ 在这些位置上和 π_gen 的分歧最大，因为这些才是策略真正在更新的地方。
+所以 2% 的 clip rate 虽然在总 token 数上占比不大，但这 2% 高度集中在携带核心学习信号的 token 上。
+打个比方：一篇论文 95% 是背景和公式推导，核心贡献可能就几段话。如果你随机删掉 2% 的文字没什么影响，但如果恰好把核心贡献那几段删了，整篇论文就没有价值了。
+同时别忘了做个对比：sync 的 clip fraction 是 0.0001-0.0005，async_partial_lr1e-5 是它的 10-100 倍。
+现在把这个和 sync 的问题做个对比：
+- sync_lr1e-5：模型学得太快，锁死在局部最优，探索能力丧失
+- async_partial_lr1e-5：有效数据被 clip 掉，模型虽然还在探索（entropy 0.24），但学习能力丧失
+这就解释了为什么 async_partial_lr1e-5 的 entropy 不低但 acc 还是崩了——它不是不探索，而是探索到的信息传不进梯度。
+回看 async_partial_lr1e-5 的 clip fraction 数据，它不是一直很高，而是周期性震荡的（在 0.002-0.02 之间反复跳动）。这种震荡说明了什么？
+在 async 模式下，rollout worker 持续生成数据。当一批新鲜的 rollout 数据到来时（π_gen 和 π_θ 比较接近），r_t ≈ 1，clip fraction 低，模型能有效学习。这时 π_θ 快速更新。
+但正因为 π_θ 更新快（lr=1e-5），它迅速偏离了 buffer 中其他较旧的数据对应的 π_gen。于是那些数据的 r_t 偏离 1，clip fraction 升高，学习信号被截断。
+直到下一批新鲜数据到来，clip fraction 才再次降低。
+这就解释了 clip fraction 周期性震荡的原因：
+新鲜数据到来 → clip 低，有效学习 → π_θ 快速偏离 → 旧数据被 clip → 学习停滞 → 等待新鲜数据 → ...
+所以问题不是"发现了范式学不会"，而是学习是间歇性的——只有新鲜数据到来的短暂窗口内模型能有效更新，其余时间都在浪费算力。
+而且在这些间歇性的有效窗口里，每次学到的方向可能并不一致，导致策略反复摇摆。
+现在你能看到 lr 在这里的角色了吗？和 sync 里一样，lr 出现在同一个位置，但导致了完全不同的后果。你试着想想这个区别？
+用一句话对比：
+- sync + 高 lr：学得太快，快到丧失探索能力
+- async + 高 lr：想学但学不到，高 lr 加速了 π_θ 和 π_gen 的偏离，让 clip 更频繁，有效学习窗口更短
+现在还有一个重要的点需要分析：async_partial_lr1e-5 的 acc 为什么也会持续下降？
+sync 的退化我们解释过——entropy 坍缩后梯度退化为噪声，参数随机漂移。
+但 async 的 entropy 还在 0.24，并没有坍缩。它的退化机制是什么？回看 reward 数据，async_partial_lr1e-5 在后期（step 200+）reward 降到了 -0.2 左右。
+每次新鲜数据到来的窗口里，模型基于那一小批数据做了有效更新。但这批数据只覆盖了任务分布的一个局部。然后 π_θ 偏离，进入 clip 主导的阶段，等下一批新鲜数据到来时，那批数据覆盖的可能是另一个局部。
+所以模型在不同的短暂窗口里，被拉向不同的方向：
+窗口1：学了一些代数题的范式 → clip 阶段 → 窗口2：学了一些几何题的范式，但可能破坏了窗口1学到的 → clip 阶段 → ...
+每次有效更新都是局部的、不完整的，而且后一次可能覆盖前一次的成果。
+这和 sync 的退化机制完全不同：
+- sync_lr1e-5：参数在无信号区域漂移（梯度为噪声）
+- async_partial_lr1e-5：参数在矛盾信号之间摇摆（每次窗口的梯度方向不一致）
+两者都表现为 acc 下降，但原因截然不同。
+为什么连续更新的异步（1e-6）不会出现更新方向不一致的崩塌？
+回看数据：
+指标
+async_partial_lr1e-6
+async_partial_lr1e-5
+clip fraction
+0.0004-0.001
+0.002-0.02
+PPO KL
+~0.0004
+0.001-0.007
+async_partial_lr1e-6 的 clip fraction 极低，和 sync 配置在同一量级。
+原因回到我们推导过的公式：
+$$\frac{\pi_{new}(a|s)}{\pi_{old}(a|s)} \approx \exp\left(\alpha \cdot \nabla_\theta J(\theta_t)^\top \cdot \nabla_\theta \log \pi_\theta(a|s)\right)$$
+α 小 10 倍 → 每步 π_θ 变化小 → 即使 rollout 数据来自旧策略，π_θ 和 π_gen 之间的差距也始终有限 → r_t 始终接近 1 → 几乎不触发 clip。
+也就是说：低 lr 让 π_θ 的更新速度慢于 rollout 数据的刷新速度。在新鲜数据到来之前，π_θ 还没走远，旧数据的 r_t 还在有效范围内。
+这和 sync 那边 lr1e-6 成功的原因其实是同一个道理——低 lr 让每步变化足够小，使得各种保护机制（clip、KL）和数据新鲜度都来得及跟上。
+另一个问题：
+当大量样本被 clip 掉后，有效 batch size 缩小了。但 lr 并没有随之缩小。
+一般来说，batch size 和 lr 之间存在一个隐含的关系——batch size 越大，梯度估计越准，可以承受更大的 lr。反过来，当 batch size 缩小时，梯度估计的方差增大，需要更小的 lr 来补偿。
+但在 async_partial_lr1e-5 的情况下：
+- 名义 batch size 不变
+- 有效 batch size 因 clip 大幅缩小
+- lr 仍然是 1e-5
+我们计算的梯度是对真实梯度的估计。用 N 个样本估计时，梯度估计的方差为：
+$$\text{Var}[\hat{g}] = \frac{\sigma^2}{N}$$
+其中 σ² 是单样本梯度的方差，N 是有效样本数。
+每步参数更新的"噪声"量级为：
+$$|\alpha \cdot \hat{g} - \alpha \cdot g_{true}| \propto \frac{\alpha \cdot \sigma}{\sqrt{N}}$$
+当 clip 让有效样本数从 N 缩小到 N' 时，噪声放大了 √(N/N') 倍。但 α 不变。
+所以 clip 不仅减少了有效信息，还放大了每步更新的噪声。这意味着即使没被 clip 掉的样本给出的梯度方向大致正确，最终的更新步也可能因为噪声过大而偏离正确方向。
+而且你注意到这又是一个正反馈循环吗？
+高 lr → π_θ 偏离 π_gen → clip 增多 → 有效 batch size 缩小 → 梯度噪声增大 → 更新方向更不准 → π_θ 进一步偏离 → ...
+这是在"间歇性学习"之上的第二层恶化：
+我们之前分析的间歇性学习是说：模型只在新鲜数据到来的窗口内能学习。
+现在这个分析揭示的是：即使在那个有效窗口内，学习质量也很差——因为 clip 掉的样本让有效 batch size 缩小，梯度噪声增大，更新方向不准。
+所以是两层问题叠加：
+1. 时间维度：大部分时间在停摆，有效学习窗口很短
+2. 质量维度：窗口内的学习也是高噪声、低质量的
+这就更完整地解释了为什么 async_partial_lr1e-5 会退化得那么严重。
+我们说过，clip 后存活的样本是系统性偏向低信息量 token 的。但我们只说了"有效样本变少"。从优化角度看，这里有一个更严重的问题：
+PPO 的 clip 本质上让梯度估计从无偏变成了有偏。
+原始的 IS 修正是无偏的：
+$$\mathbb{E}{a \sim \pi{gen}}\left[\frac{\pi_\theta(a|s)}{\pi_{gen}(a|s)} \cdot A_t\right] = \mathbb{E}{a \sim \pi\theta}\left[A_t\right]$$
+但 clip 操作选择性地丢弃了一部分样本。剩下的样本不再是对真实梯度的无偏估计——它系统性地丢失了关键推理 token 的信息，保留了无关紧要的 token。
+从优化的角度来看，这意味着什么？
+- 高噪声但无偏的梯度：收敛慢，但方向大致正确，最终能到达合理的解（错误）
+- 有偏的梯度：无论走多少步，都在朝一个错误的方向收敛（正确）
+而且这个偏差和我们之前说的"矛盾信号"结合起来更致命：
+不仅每个窗口内的梯度是有偏的，不同窗口的偏差方向还不一样——因为每批数据覆盖的任务局部不同，存活下来的低信息 token 分布也不同。
+所以模型面对的是：每一步都在朝一个错误方向走，而且每一步错误的方向还不一致。
+好，还有一个角度我们完全没碰过——partial rollout 本身带来的特殊问题。
+在 partial rollout 中，同一条 trajectory 的前半段和后半段可能由不同版本的 π 生成。但 GAE（Generalized Advantage Estimation）计算 advantage 时使用的是 TD error：
+$$\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$$
+$$A_t^{GAE} = \sum_{l=0}^{T}(\gamma\lambda)^l \delta_{t+l}$$
+GAE 假设整条 trajectory 由同一个策略生成。当策略在 trajectory 中间发生切换时，这些 TD error 的计算基础就不一致了——前半段的状态转移概率和后半段的不同。
+这会导致进一步的偏差，但是这个偏差的方向不容易确定。
+在策略切换点附近，如果 π_new 比 π_old 更好，V(s) 会低估后续回报，advantage 被高估；反之则被低估。这取决于每个具体状态处新旧策略的相对优劣，而这在不同 trajectory、不同位置都不一样。
+所以更准确地说，partial rollout 带来的不是系统性的方向偏差，而是advantage 估计的额外噪声。
+但这和我们之前分析的问题叠加在一起：
+问题层面
+效应
+clip 截断有效样本
+梯度有偏
+有效 batch size 缩小
+梯度方差增大
+partial rollout advantage 不一致
+梯度方差进一步增大
+三层问题叠加：有偏 + 高方差 + 额外噪声。这对优化来说基本是最糟糕的组合——方向不对，信噪比还极低。
+总结
+现象
+async_partial_lr1e-5 的 acc 在三个测试集上全面崩溃（MINERVA: 0.22 → 0.08，OLYMPIAD_BENCH: 0.38 → 0.21），但 entropy 始终维持在 0.24，并未坍缩。这与 sync_lr1e-5 的 entropy collapse 是完全不同的失败模式。
+同时 clip fraction 高达 0.002-0.02（sync 配置的 10-100 倍），PPO KL 在 0.001-0.007 之间剧烈震荡。
+Off-Policy 数据与 IS 修正
+async partial rollout 模式下，rollout 数据由旧策略 π_gen 生成，与当前训练策略 π_θ 存在版本差异。这种 off-policy 体现在两个层面：
+- 整体陈旧：π_gen 和 π_θ 版本不一致
+- Partial rollout 的局部不一致：同一条 trajectory 内，前后段可能由不同版本的 π 生成
+PPO 通过 importance sampling ratio 修正这一偏差：
+$$r_t(\theta) = \frac{\pi_\theta(a|s)}{\pi_{gen}(a|s)}$$
+$$L^{CLIP}(\theta) = \mathbb{E}\left[\min\left(r_t(\theta) \cdot A_t,; \text{clip}(r_t, 1-\epsilon, 1+\epsilon) \cdot A_t\right)\right]$$
+当 r_t 超出 [1-ε, 1+ε] 时，该样本的梯度贡献直接归零（不是压缩，是丢弃）。
+高 LR 放大 Off-Policy 偏移，触发大面积 Clip
+每步参数更新对 π 的影响：
+$$\frac{\pi_{new}(a|s)}{\pi_{old}(a|s)} \approx \exp\left(\alpha \cdot \nabla_\theta J(\theta_t)^\top \cdot \nabla_\theta \log \pi_\theta(a|s)\right)$$
+α = 1e-5 时，π_θ 每步变化大，快速偏离 π_gen，r_t 大面积偏离 1，clip 被频繁触发。
+Clip 的选择性截断：有效信息被系统性丢弃
+被 clip 掉的不是随机样本。在 LLM RL 中，一个 response 的大部分 token 是格式符号和常见短语，这些 token 在 π_θ 和 π_gen 之间差异很小，r_t ≈ 1，不会被 clip。而 r_t 偏离最大的恰恰是关键推理步骤——策略真正在更新的位置。
+因此 clip 系统性地截断了信息量最高的 token，保留了信息量最低的 token。
+从优化角度的三层恶化
+梯度有偏
+原始 IS 修正是无偏估计：
+$$\mathbb{E}$${a \sim \pi{gen}}\left[\frac{\pi_\theta(a|s)}{\pi_{gen}(a|s)} \cdot A_t\right] = \mathbb{E}{a \sim \pi\theta}\left[A_t\right]$$
+但 clip 选择性地丢弃了关键推理 token 的梯度信号，存活样本不再是对真实梯度的无偏估计。这意味着优化器不仅收敛慢，而且在朝错误的方向收敛。
+梯度方差增大
+有效 batch size 因 clip 大幅缩小，但 lr 不变。梯度估计的方差为：
+$$\text{Var}[\hat{g}] = \frac{\sigma^2}{N_{eff}}$$
+N_eff 的减小直接放大了每步更新的噪声。名义上 lr = 1e-5，但相对于缩小后的有效 batch size，实际 lr 已经过高，lr 与 batch size 的匹配关系被打破。
+Partial Rollout 引入额外 Advantage 噪声
+GAE 通过 TD error 计算 advantage：
+$$\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)$$
+$$A_t^{GAE} = \sum_{l=0}^{T}(\gamma\lambda)^l \delta_{t+l}$$
+GAE 假设整条 trajectory 由同一策略生成。在 partial rollout 中，策略在 trajectory 中间切换，TD error 的计算基础不一致。切换点处的 advantage 估计引入额外噪声，进一步降低梯度的信噪比。
+三层问题叠加：有偏 + 高方差 + 额外噪声——方向不对，信噪比极低。
+间歇性学习与方向矛盾
+由于 rollout worker 持续生成数据，训练过程呈现周期性模式：
+新鲜数据到来 → r_t ≈ 1，clip 低，模型有效学习 → π_θ 快速偏离（高 lr）→ 旧数据 r_t 偏离，clip 升高，学习停摆 → 等待下一批新鲜数据 → ...
+这解释了 clip fraction 的周期性震荡（0.002-0.02）。
+更严重的是，每次有效学习窗口中，数据只覆盖任务分布的一个局部，且梯度本身是有偏的。不同窗口的偏差方向不一致，模型在不同范式之间反复摇摆，最终导致性能全面退化。
+正反馈循环
+高 LR → π_θ 快速偏离 π_gen → clip 增多 → 有效 batch size 缩小 → 梯度有偏且方差增大 → 更新方向不准 → π_θ 进一步偏离 → clip 更多 → ...
+与 Sync 失败模式的本质区别
+
+sync_lr1e-5
+async_partial_lr1e-5
+entropy
+坍缩至 0.07
+维持在 0.24
+失败本质
+探索能力丧失
+学习能力丧失
+机制
+π(a') → 0 不可逆，梯度信号消失
+有效样本被 clip，梯度信号被截断
+退化原因
+参数在无信号区域随机漂移
+参数在有偏、矛盾的信号之间摇摆
+梯度问题
+梯度退化为噪声（无信号）
+梯度有偏 + 高方差 + 额外噪声
+数学根源
+π 同时是采样权重和梯度权重，低概率 action 不可逆地丢失
+高 lr 放大 r_t 偏离，clip 系统性截断有效信息，破坏 IS 无偏性
+PPO 监控
+KL 因 π 加权结构性失效
+clip fraction 能检测到异常
+对比：为什么 lr=1e-6 不会触发此问题
+α 缩小 10 倍，每步 π_θ 变化量降低一个数量级。π_θ 的更新速度慢于 rollout 数据的刷新速度，即使数据来自旧策略，r_t 始终接近 1，clip 几乎不触发（clip fraction 0.0004-0.001）。IS 修正保持近似无偏，有效 batch size 接近名义值，lr 与 batch size 匹配关系完好。模型能持续、稳定地从所有数据中学习，不存在间歇性停摆和梯度偏差问题。
