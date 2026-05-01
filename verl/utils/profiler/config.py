@@ -46,6 +46,30 @@ class TorchProfilerToolConfig(BaseConfig):
 
     def __post_init__(self) -> None:
         """config validation logics go here"""
+        # #region agent log
+        try:
+            with open("/data/250010176/codes/verl/.cursor/debug-1525e0.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "1525e0",
+                            "runId": os.getenv("VERL_DEBUG_RUN_ID", "initial"),
+                            "hypothesisId": "H2",
+                            "location": "verl/utils/profiler/config.py:TorchProfilerToolConfig.__post_init__",
+                            "message": "torch profiler contents type check",
+                            "data": {
+                                "contents_type": type(self.contents).__name__,
+                                "contents_len": len(self.contents) if isinstance(self.contents, list) else None,
+                            },
+                            "timestamp": int(__import__("time").time() * 1000),
+                        },
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         __support_contents = ["cuda", "cpu", "memory", "shapes", "stack"]
         for content in self.contents:
             assert content in __support_contents, (
@@ -96,6 +120,31 @@ class NPUToolConfig(NsightToolConfig):
 
     def __post_init__(self) -> None:
         """config validation logics go here"""
+        # #region agent log
+        try:
+            with open("/data/250010176/codes/verl/.cursor/debug-1525e0.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "1525e0",
+                            "runId": os.getenv("VERL_DEBUG_RUN_ID", "initial"),
+                            "hypothesisId": "H1",
+                            "location": "verl/utils/profiler/config.py:NPUToolConfig.__post_init__",
+                            "message": "npu profiler contents type check",
+                            "data": {
+                                "contents_type": type(self.contents).__name__,
+                                "contents_len": len(self.contents) if isinstance(self.contents, list) else None,
+                                "level_type": type(self.level).__name__,
+                            },
+                            "timestamp": int(__import__("time").time() * 1000),
+                        },
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         assert isinstance(self.contents, list), f"Profiler contents must be of type list, got {type(self.contents)}"
         assert isinstance(self.level, str), f"Profiler level must be of type str, got {type(self.level)}"
         assert isinstance(self.analysis, bool), f"Profiler analysis must be of type bool, got {type(self.analysis)}"
@@ -158,6 +207,27 @@ class ProfilerConfig(BaseConfig):
 
     def __post_init__(self) -> None:
         """config validation logics go here"""
+        # #region agent log
+        try:
+            with open("/data/250010176/codes/verl/.cursor/debug-1525e0.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "1525e0",
+                            "runId": os.getenv("VERL_DEBUG_RUN_ID", "initial"),
+                            "hypothesisId": "H3",
+                            "location": "verl/utils/profiler/config.py:ProfilerConfig.__post_init__",
+                            "message": "profiler ranks type check",
+                            "data": {"ranks_type": type(self.ranks).__name__},
+                            "timestamp": int(__import__("time").time() * 1000),
+                        },
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         assert isinstance(self.ranks, set | list | tuple), (
             f"Profiler ranks must be of type list, got {type(self.ranks)}"
         )
