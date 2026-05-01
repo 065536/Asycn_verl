@@ -183,6 +183,7 @@ if [ "$IS_HEAD" = "1" ]; then
     +actor_rollout_ref.actor.optim.signal_fraction_calib_frac=0.0 \
     ++actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size} \
     ++actor_rollout_ref.actor.ppo_micro_batch_size=null \
+    +actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null \
     ++actor_rollout_ref.actor.fsdp_config.dtype=bfloat16 \
     ++actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     ++actor_rollout_ref.actor.fsdp_config.param_offload=True \
