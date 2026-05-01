@@ -235,6 +235,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
         )
 
+        # #region agent log
+        def _agent_debug_log(hypothesis_id, message, data):
+            try:
+                with open("/data/250010176/codes/verl/.cursor/debug-1525e0.log", "a", encoding="utf-8") as _f:
+                    _f.write(
+                        json.dumps(
+                            {
+                                "sessionId": "1525e0",
+                                "runId": os.getenv("VERL_DEBUG_RUN_ID", "initial"),
+                                "hypothesisId": hypothesis_id,
+                                "location": "verl/workers/fsdp_workers.py:FSDPWorker.__init__",
+                                "message": message,
+                                "data": data,
+                                "timestamp": int(datetime.datetime.now().timestamp() * 1000),
+                            },
+                            ensure_ascii=True,
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+
+        # #endregion
+
         self._is_offload_param = False
         self._is_offload_optimizer = False
         if self._is_actor:
@@ -246,6 +270,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # normalize config
         if self._is_actor:
+            # #region agent log
+            _agent_debug_log(
+                "H1",
+                "actor normalize entry",
+                {
+                    "rank": self.rank,
+                    "device_mesh_size": self.device_mesh.size(),
+                    "ulysses_sp": self.ulysses_sequence_parallel_size,
+                    "actor_keys_has_ppo_micro_batch_size": "ppo_micro_batch_size" in self.config.actor,
+                    "actor_keys_has_ppo_micro_batch_size_per_gpu": "ppo_micro_batch_size_per_gpu" in self.config.actor,
+                    "actor_keys_has_rollout_n": "rollout_n" in self.config.actor,
+                    "rollout_n": self.config.rollout.get("n", None),
+                },
+            )
+            # #endregion
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
             self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             assert self.config.actor.ppo_mini_batch_size > 0, (
@@ -253,13 +292,53 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 f"normalization"
             )
             # micro bsz
-            if self.config.actor.ppo_micro_batch_size is not None:
+            # #region agent log
+            try:
+                _dbg_ppo_micro_batch_size = self.config.actor.ppo_micro_batch_size
+                _agent_debug_log(
+                    "H2",
+                    "access actor.ppo_micro_batch_size success",
+                    {
+                        "value": _dbg_ppo_micro_batch_size,
+                        "actor_keys_count": len(list(self.config.actor.keys())),
+                    },
+                )
+            except Exception as _dbg_e:
+                _agent_debug_log(
+                    "H2",
+                    "access actor.ppo_micro_batch_size failed",
+                    {
+                        "error_type": type(_dbg_e).__name__,
+                        "error": str(_dbg_e),
+                        "actor_keys": list(self.config.actor.keys()),
+                    },
+                )
+                raise
+            # #endregion
+            if _dbg_ppo_micro_batch_size is not None:
+                # #region agent log
+                _agent_debug_log(
+                    "H3",
+                    "normalizing actor.ppo_micro_batch_size",
+                    {"before": _dbg_ppo_micro_batch_size},
+                )
+                # #endregion
                 self.config.actor.ppo_micro_batch_size //= (
                     self.device_mesh.size() // self.ulysses_sequence_parallel_size
                 )
                 self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
 
             if self.config.actor.ppo_micro_batch_size_per_gpu is not None:
+                # #region agent log
+                _agent_debug_log(
+                    "H4",
+                    "validate ppo_micro_batch_size_per_gpu",
+                    {
+                        "ppo_mini_batch_size": self.config.actor.ppo_mini_batch_size,
+                        "ppo_micro_batch_size_per_gpu": self.config.actor.ppo_micro_batch_size_per_gpu,
+                    },
+                )
+                # #endregion
                 assert self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0, (
                     f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be divisible by "
                     f"ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
@@ -708,6 +787,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     fast_drop_rho=optim_config.get("signal_fraction_fast_drop_rho", 0.7),
                     cooldown_steps=optim_config.get("signal_fraction_cooldown_steps", 5),
                     handoff_steps=optim_config.get("signal_fraction_handoff_steps", 10),
+                    alpha_rate_limit=optim_config.get("signal_fraction_alpha_rate_limit", 0.0),
+                    r_window_size=optim_config.get("signal_fraction_r_window_size", 0),
+                    r_window_mode=optim_config.get("signal_fraction_r_window_mode", "off"),
                     sign_gate_gamma=optim_config.get("signal_fraction_sign_gate_gamma", None),
                     sign_gate_alpha_plus=optim_config.get("signal_fraction_sign_gate_alpha_plus", None),
                     alpha_replay_path=optim_config.get("signal_fraction_alpha_replay_path", None),

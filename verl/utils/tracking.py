@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -176,7 +177,7 @@ class Tracking:
             self.logger["clearml"] = ClearMLLogger(project_name, experiment_name, config)
 
         if "file" in default_backend:
-            self.logger["file"] = FileLogger(project_name, experiment_name)
+            self.logger["file"] = FileLogger(project_name, experiment_name, config=config)
 
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
@@ -253,7 +254,7 @@ class ClearMLLogger:
 
 
 class FileLogger:
-    def __init__(self, project_name: str, experiment_name: str):
+    def __init__(self, project_name: str, experiment_name: str, config=None):
         self.project_name = project_name
         self.experiment_name = experiment_name
 
@@ -264,7 +265,32 @@ class FileLogger:
             os.makedirs(directory, exist_ok=True)
             self.filepath = os.path.join(directory, f"{self.experiment_name}.jsonl")
             print(f"Creating file logger at {self.filepath}")
+        if config is not None:
+            self._write_config_snapshot(config)
         self.fp = open(self.filepath, "wb", buffering=0)
+
+    def _write_config_snapshot(self, config):
+        directory = os.path.dirname(os.path.abspath(self.filepath))
+        os.makedirs(directory, exist_ok=True)
+
+        payload = {
+            "project_name": self.project_name,
+            "experiment_name": self.experiment_name,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+            "pid": os.getpid(),
+            "config": config,
+        }
+        latest_path = os.path.join(directory, f"{self.experiment_name}.config.json")
+        run_path = os.path.join(
+            directory,
+            f"{self.experiment_name}.config.{time.strftime('%Y%m%d_%H%M%S')}.pid{os.getpid()}.json",
+        )
+        data = orjson.dumps(payload, option=orjson.OPT_INDENT_2 | orjson.OPT_SERIALIZE_NUMPY)
+        for path in (latest_path, run_path):
+            with open(path, "wb") as fp:
+                fp.write(data)
+                fp.write(b"\n")
+        print(f"Saved config snapshot to {latest_path}")
 
     def log(self, data, step):
         data = {"step": step, "data": data}

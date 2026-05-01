@@ -170,18 +170,6 @@ def calculate_debug_metrics(data: DataProto, tokenizer=None) -> dict:
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
     }
 
-    # Percentiles of probs_diff: distinguish fat-tail vs uniform drift
-    if rollout_probs_diff.numel() > 0:
-        diff_f = rollout_probs_diff.float()
-        metrics["training/rollout_probs_diff_p90"] = torch.quantile(diff_f, 0.90).item()
-        metrics["training/rollout_probs_diff_p99"] = torch.quantile(diff_f, 0.99).item()
-
-    # Response length percentiles: track tail of length distribution
-    response_lengths = response_mask.sum(dim=-1).float()
-    if response_lengths.numel() > 0:
-        metrics["training/response_len_p90"] = torch.quantile(response_lengths, 0.90).item()
-        metrics["training/response_len_p99"] = torch.quantile(response_lengths, 0.99).item()
-
     # EOS token statistics: detect EOS collapse before it hits val acc
     if tokenizer is not None and getattr(tokenizer, "eos_token_id", None) is not None:
         eos_id = tokenizer.eos_token_id

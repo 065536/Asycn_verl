@@ -889,11 +889,12 @@ def compute_offpolicy_metrics(
         probs_diff = (actor_probs - rollout_probs).abs()
         valid_probs_diff = probs_diff[response_mask > 0]
         if valid_probs_diff.numel() > 0:
-            metrics["rollout_probs_diff_p95"] = torch.quantile(valid_probs_diff.float(), 0.95).detach().item()
-            metrics["rollout_probs_diff_p99"] = torch.quantile(valid_probs_diff.float(), 0.99).detach().item()
+            valid_probs_diff = valid_probs_diff.float()
+            metrics["rollout_probs_diff_mean"] = valid_probs_diff.mean().detach().item()
+            metrics["rollout_probs_diff_max"] = valid_probs_diff.max().detach().item()
         else:
-            metrics["rollout_probs_diff_p95"] = 0.0
-            metrics["rollout_probs_diff_p99"] = 0.0
+            metrics["rollout_probs_diff_mean"] = 0.0
+            metrics["rollout_probs_diff_max"] = 0.0
 
         # 2a. kl: Direct estimator for KL(π_rollout || π_training)
         # This is the standard KL divergence: E[log(π_rollout) - log(π_training)]

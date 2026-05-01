@@ -366,7 +366,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
-        if update_lr_scheduler:
+        signal_fraction_engine_step = (
+            getattr(self.engine.optimizer_config, "lr_scheduler_type", "constant") == "signal_fraction"
+        )
+        if update_lr_scheduler and not signal_fraction_engine_step:
             # For entropy-adaptive LR: feed current entropy into scheduler before stepping
             if hasattr(self.engine, "update_entropy_for_lr"):
                 raw_metrics = output.get("metrics", {})
@@ -550,6 +553,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 2. build actor model
         if "actor" in self.role:
+            with open_dict(self.config.actor.optim):
+                self.config.actor.optim.signal_fraction_rollout_n = self.config.rollout.n
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
             actor_training_config = TrainingWorkerConfig(
@@ -559,6 +564,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 optimizer_config=actor_config.optim,
                 checkpoint_config=actor_config.checkpoint,
             )
+            if actor_training_config.optimizer_config is not None:
+                logger.warning(
+                    "Actor optimizer config: lr_scheduler_type=%s, signal_fraction_rollout_n=%s",
+                    actor_training_config.optimizer_config.lr_scheduler_type,
+                    actor_training_config.optimizer_config.signal_fraction_rollout_n,
+                )
 
             assert self.config.actor.use_dynamic_bsz == self.config.rollout.log_prob_use_dynamic_bsz
 

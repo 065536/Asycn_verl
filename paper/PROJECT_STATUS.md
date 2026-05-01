@@ -1,6 +1,135 @@
 # Project Status
 
-**Last updated**: 2026-04-20 (bug-fixed + experiment scripts added)
+**Last updated**: 2026-04-30 (low-frequency signal-fraction controller checkpoint)
+
+---
+
+## Current Engineering Checkpoint (2026-04-30)
+
+The main 1.5B signal-fraction line has shifted from trusting raw single-step
+split alignment to testing whether **low-frequency temporal aggregation** makes
+the noisy alignment signal more reliable.
+
+Current interpretation:
+
+```text
+single-step g_A1^T g_A2 sign is weak;
+windowed / smoothed alignment may still be useful as a state proxy.
+```
+
+This is based on the observation that `g_dot_positive` is only around `55%`,
+which is too weak for a hard per-step classifier. The claim should therefore be
+phrased as:
+
+> split-batch alignment is a noisy but informative proxy whose value is to
+> induce a state-aware LR trajectory, not to exactly estimate each step's
+> optimal LR.
+
+### Implemented today
+
+Low-frequency r-side controller variants for the 1.5B c-fixed B script:
+
+1. **Slow EMA**
+   - Script defaults remain backward-compatible.
+   - Wrappers:
+     - `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95.sh`
+     - `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.98.sh`
+
+2. **Alpha change-rate limit**
+   - New config: `signal_fraction_alpha_rate_limit`
+   - Metric: `actor/alpha_rate_limited`
+   - Wrappers:
+     - `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpharlim0.05.sh`
+     - `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_alpharlim0.05.sh`
+
+3. **3A windowed continuous-r**
+   - New configs:
+     - `signal_fraction_r_window_size`
+     - `signal_fraction_r_window_mode`
+   - Mode implemented: `replace_ema`
+   - Uses the mean of the last `W` valid `r_obs` values.
+   - Invalid observations do not enter the window.
+   - Metrics:
+     - `actor/r_window`
+     - `actor/r_window_count`
+     - `actor/r_window_enabled`
+   - Wrappers:
+     - `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w5.sh`
+     - `new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w10.sh`
+
+Recommended immediate 1.5B runs:
+
+```bash
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w5.sh
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w10.sh
+```
+
+Expected local JSONL outputs:
+
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_windowr_w5.jsonl`
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_windowr_w10.jsonl`
+
+Verification completed:
+
+- `python3 -m py_compile verl/workers/config/optimizer.py verl/workers/engine/fsdp/transformer_impl.py verl/workers/fsdp_workers.py`
+- `bash -n` on base/W5/W10 signal-fraction scripts
+
+### Current experiment logic
+
+3A is the cleanest next test because it changes only the bandwidth of the
+signal-fraction controller and avoids artificial stage priors.
+
+Interpretation matrix:
+
+| result | interpretation |
+|---|---|
+| W5/W10 > B-current | raw B overreacted to single-step noise; temporal aggregation improves the controller |
+| W5 ~= B, W10 < B | moderate smoothing is safe; excessive low-pass loses useful adaptivity |
+| W5/W10 < B | current B smoothing is already sufficient or windowing over-damps |
+| W10 ~= D3 | long-window controller is mostly becoming a coarse stage schedule |
+
+Deferred:
+
+- stage-level baseline + residual adaptive: not the next main path because it
+  introduces D3/stage prior.
+- 3B windowed sign reliability: deferred because it adds several mapping
+  hyperparameters.
+- 3C hysteresis sign-gate: useful later as sign-gate repair, but not the main
+  continuous-r line.
+
+### 7B operational checkpoint
+
+7B sync restart failures for the 16-GPU `lr1e-5` and `lr7.5e-6` scripts were
+Hydra struct errors, not evidence of an algorithmic issue. The fix was to use
+`+actor_rollout_ref.actor.use_kl_loss=False` and
+`+actor_rollout_ref.actor.kl_loss_coef=0.0`.
+
+Disk pressure under `/data/250010176` was identified as another blocker; old
+7B logs/checkpoints/local-tracking artifacts were cleaned before the 32-GPU
+restart attempts.
+
+---
+
+## Previous Engineering Checkpoint (2026-04-27)
+
+Async signal-fraction c-fixed sweep is being ported to the fully async partial rollout path. This is not the full two-timescale controller: current supported boundary is `eta_c=0`, `calib_frac=0`, `ppo_epochs=1`, i.e. r-side split-batch `alpha_t = c_fixed * r_hat_t` only.
+
+Current async scripts:
+
+- `new_experiments/signal_fraction_lr/async_partial_sigfrac_cfixed.sh`
+- `new_experiments/signal_fraction_lr/async_partial_sigfrac_cfixed_lr7.5e-6_seed42.sh`
+- `new_experiments/signal_fraction_lr/async_partial_sigfrac_cfixed_lr1e-5_seed42.sh`
+- `new_experiments/signal_fraction_lr/async_partial_sigfrac_cfixed_lr1.25e-5_seed42.sh`
+
+Fixes already applied on 2026-04-27:
+
+- Fully async cannot use legacy workers, so the signal-fraction r-side update was ported into the new FSDP engine path.
+- `trainer.balance_batch=False` is required so prompt groups remain contiguous for A1/A2 splitting.
+- `signal_fraction_rollout_n` is passed from `rollout.n` into the engine so grouping is by prompt, not by individual response.
+- The async wrapper now uses a unique Hydra run dir and an `flock` lock to avoid concurrent 8GPU runs racing on Hydra/Ray resources.
+- Latest bug fixed: `signal_fraction_rollout_n` must be injected into `self.config.actor.optim` before `omega_conf_to_dataclass(self.config.actor)`; mutating the resulting `FSDPOptimizerConfig` raises `FrozenInstanceError`.
+
+Next sanity check after relaunch: logs should show `Actor optimizer config: lr_scheduler_type=signal_fraction, signal_fraction_rollout_n=8`, then first actor update should emit `actor/signal_fraction_new_engine=1`, `actor/g_A1_dot_A2`, `actor/r_hat`, `actor/r_ctrl`, and `actor/alpha_t`.
 
 ---
 

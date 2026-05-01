@@ -9,6 +9,20 @@ VERL_ROOT=/data/250010176/codes/verl/verl
 DATA_ROOT=/data/250010176/data
 MODEL_PATH=/data/250010176/codes/models/DeepSeek-R1-Distill-Qwen-1.5B
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+SIGFRAC_RUN_SUFFIX=${SIGFRAC_RUN_SUFFIX:-""}
+SIGFRAC_CKPT_NAME="DeepSeek1.5B-Sync-8gpu-sigfrac-cfixed-lr1.25e-5${SIGFRAC_RUN_SUFFIX}"
+SIGFRAC_LOG_NAME="sync_sigfrac_cfixed_lr1.25e-5${SIGFRAC_RUN_SUFFIX}"
+SIGFRAC_EXPERIMENT_NAME="deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5${SIGFRAC_RUN_SUFFIX}"
+
+# Signal-fraction EMA knobs. These are observation weights in the code:
+# r_ema <- (1 - beta) * r_ema + beta * r_obs.
+# For a retention-style EMA of 0.95/0.98, set these to 0.05/0.02.
+SIGFRAC_R_EMA_BETA_SYM=${SIGFRAC_R_EMA_BETA_SYM:-0.3}
+SIGFRAC_R_EMA_BETA_DOWN=${SIGFRAC_R_EMA_BETA_DOWN:-0.5}
+SIGFRAC_R_EMA_BETA_UP=${SIGFRAC_R_EMA_BETA_UP:-0.1}
+SIGFRAC_ALPHA_RATE_LIMIT=${SIGFRAC_ALPHA_RATE_LIMIT:-0.0}
+SIGFRAC_R_WINDOW_SIZE=${SIGFRAC_R_WINDOW_SIZE:-0}
+SIGFRAC_R_WINDOW_MODE=${SIGFRAC_R_WINDOW_MODE:-off}
 
 # Resume training configuration
 RESUME_MODE=${RESUME_MODE:-"disable"}  # Options: "auto", "resume_path", "disable"
@@ -30,22 +44,22 @@ elif [ -n "$USER_CKPTS_DIR" ]; then
   TIMESTAMP=$(basename "$CKPTS_DIR" | sed 's/.*-//')
   echo "Using user-specified checkpoint directory: $CKPTS_DIR"
 elif [ "$RESUME_MODE" = "auto" ]; then
-    LATEST_CKPT=$(find ${VERL_ROOT}/ckpts/DeepSeek1.5B -name "DeepSeek1.5B-Sync-8gpu-sigfrac-cfixed-lr1.25e-5-*" -type d 2>/dev/null | sort | tail -1)
+    LATEST_CKPT=$(find ${VERL_ROOT}/ckpts/DeepSeek1.5B -name "${SIGFRAC_CKPT_NAME}-*" -type d 2>/dev/null | sort | tail -1)
   if [ -n "$LATEST_CKPT" ]; then
     CKPTS_DIR="$LATEST_CKPT"
     TIMESTAMP=$(basename "$CKPTS_DIR" | sed 's/.*-//')
     echo "Auto-found existing checkpoint directory: $CKPTS_DIR"
   else
-    CKPTS_DIR=${VERL_ROOT}/ckpts/DeepSeek1.5B/DeepSeek1.5B-Sync-8gpu-sigfrac-cfixed-lr1.25e-5-${TIMESTAMP}
+    CKPTS_DIR=${VERL_ROOT}/ckpts/DeepSeek1.5B/${SIGFRAC_CKPT_NAME}-${TIMESTAMP}
     echo "No existing checkpoint found, creating new directory: $CKPTS_DIR"
   fi
 else
-    CKPTS_DIR=${VERL_ROOT}/ckpts/DeepSeek1.5B/DeepSeek1.5B-Sync-8gpu-sigfrac-cfixed-lr1.25e-5-${TIMESTAMP}
+    CKPTS_DIR=${VERL_ROOT}/ckpts/DeepSeek1.5B/${SIGFRAC_CKPT_NAME}-${TIMESTAMP}
     echo "Resume disabled, creating new checkpoint directory: $CKPTS_DIR"
 fi
 
 LOG_DIR=${VERL_ROOT}/logs
-LOG_FILE="${LOG_DIR}/sync_sigfrac_cfixed_lr1.25e-5_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/${SIGFRAC_LOG_NAME}_${TIMESTAMP}.log"
 mkdir -p "$CKPTS_DIR" "$LOG_DIR"
 
 if [ -n "${MASTER_ADDR:-}" ]; then HN="$MASTER_ADDR"; elif [ -n "${NODE_0_IP:-}" ]; then HN="$NODE_0_IP"; else HN="$(hostname -I | awk '{print $1}')"; fi
@@ -74,6 +88,9 @@ IS_HEAD=0
 NODE_RANK_CAND="${SENSECORE_PYTORCH_NODE_RANK:-${NODE_RANK:-}}"
 if [ "${NODE_RANK_CAND:-}" = "0" ] || [ "${RANK:-}" = "0" ]; then IS_HEAD=1; fi
 echo "HEAD_IP=$HEAD_IP IS_HEAD=$IS_HEAD RANK=${RANK:-unset} NODE_RANK=${NODE_RANK_CAND:-unset}"
+echo "Signal fraction EMA betas: sym=${SIGFRAC_R_EMA_BETA_SYM}, down=${SIGFRAC_R_EMA_BETA_DOWN}, up=${SIGFRAC_R_EMA_BETA_UP}"
+echo "Signal fraction alpha rate limit: ${SIGFRAC_ALPHA_RATE_LIMIT}"
+echo "Signal fraction r-window: size=${SIGFRAC_R_WINDOW_SIZE}, mode=${SIGFRAC_R_WINDOW_MODE}"
 
 RAY=/data/250010176/yrh/miniconda3/envs/verl2/bin/ray
 $RAY stop -f || true
@@ -103,61 +120,72 @@ if [ "$IS_HEAD" = "1" ]; then
     data.max_response_length=8192 \
     data.train_batch_size=128 \
     data.filter_overlong_prompts=True \
-    actor_rollout_ref.rollout.n=8 \
+    ++actor_rollout_ref.rollout.n=8 \
+    ++actor_rollout_ref.actor.rollout_n=8 \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
-    actor_rollout_ref.actor.use_kl_loss=False \
-    actor_rollout_ref.actor.kl_loss_coef=0.0 \
-    actor_rollout_ref.actor.clip_ratio_low=0.2 \
-    actor_rollout_ref.actor.clip_ratio_high=0.2 \
-    actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    actor_rollout_ref.model.use_remove_padding=True \
+    +actor_rollout_ref.actor.use_kl_loss=False \
+    +actor_rollout_ref.actor.kl_loss_coef=0.0 \
+    ++actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    ++actor_rollout_ref.actor.clip_ratio_high=0.2 \
+    ++actor_rollout_ref.actor.clip_ratio_c=10.0 \
+    ++actor_rollout_ref.model.use_remove_padding=True \
     +actor_rollout_ref.model.override_config.max_position_embeddings=12288 \
-    actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$((1024+8192+300)) \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$((1024+8192+300)) \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((1024+8192+300)) \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.optim.lr=1.25e-5 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
-    actor_rollout_ref.actor.optim.weight_decay=0.1 \
-    actor_rollout_ref.actor.optim.lr_scheduler_type=signal_fraction \
+    ++actor_rollout_ref.actor.use_dynamic_bsz=True \
+    ++actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    ++actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    ++actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$((1024+8192+300)) \
+    ++actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=$((1024+8192+300)) \
+    ++actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((1024+8192+300)) \
+    ++actor_rollout_ref.rollout.name=vllm \
+    ++actor_rollout_ref.model.path="${MODEL_PATH}" \
+    ++actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    ++actor_rollout_ref.actor.optim.lr=1.25e-5 \
+    ++actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    ++actor_rollout_ref.actor.optim.weight_decay=0.1 \
+    ++actor_rollout_ref.actor.optim.lr_scheduler_type=signal_fraction \
     +actor_rollout_ref.actor.optim.signal_fraction_eta_c=0.0 \
     +actor_rollout_ref.actor.optim.signal_fraction_c_min=1e-8 \
     +actor_rollout_ref.actor.optim.signal_fraction_c_max=1e-2 \
     +actor_rollout_ref.actor.optim.signal_fraction_calib_freq=5 \
     +actor_rollout_ref.actor.optim.signal_fraction_phi_ema_beta=0.9 \
+    +actor_rollout_ref.actor.optim.signal_fraction_r_ema_beta_sym=${SIGFRAC_R_EMA_BETA_SYM} \
+    +actor_rollout_ref.actor.optim.signal_fraction_r_ema_beta_down=${SIGFRAC_R_EMA_BETA_DOWN} \
+    +actor_rollout_ref.actor.optim.signal_fraction_r_ema_beta_up=${SIGFRAC_R_EMA_BETA_UP} \
+    +actor_rollout_ref.actor.optim.signal_fraction_alpha_rate_limit=${SIGFRAC_ALPHA_RATE_LIMIT} \
+    +actor_rollout_ref.actor.optim.signal_fraction_r_window_size=${SIGFRAC_R_WINDOW_SIZE} \
+    +actor_rollout_ref.actor.optim.signal_fraction_r_window_mode="${SIGFRAC_R_WINDOW_MODE}" \
     +actor_rollout_ref.actor.optim.signal_fraction_r_min=0.01 \
     +actor_rollout_ref.actor.optim.signal_fraction_calib_frac=0.0 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.grad_clip=1.0 \
-    actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=8 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=True \
-    actor_rollout_ref.rollout.max_num_batched_tokens=24576 \
-    actor_rollout_ref.rollout.enforce_eager=True \
-    actor_rollout_ref.rollout.temperature=1.0 \
-    actor_rollout_ref.rollout.top_p=1.0 \
-    actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
-    actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.n=16 \
-    actor_rollout_ref.rollout.calculate_log_probs=True \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.ref.ulysses_sequence_parallel_size=1 \
+    ++actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    ++actor_rollout_ref.actor.ppo_micro_batch_size=null \
+    ++actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    ++actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    ++actor_rollout_ref.actor.entropy_coeff=0 \
+    ++actor_rollout_ref.actor.grad_clip=1.0 \
+    ++actor_rollout_ref.actor.loss_agg_mode=token-mean \
+    ++actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
+    ++actor_rollout_ref.actor.fsdp_config.fsdp_size=8 \
+    ++actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
+    ++actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    ++actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    ++actor_rollout_ref.rollout.max_num_batched_tokens=24576 \
+    ++actor_rollout_ref.rollout.enforce_eager=True \
+    ++actor_rollout_ref.rollout.temperature=1.0 \
+    ++actor_rollout_ref.rollout.top_p=1.0 \
+    ++actor_rollout_ref.rollout.top_k=-1 \
+    ++actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    ++actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
+    ++actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
+    ++actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    ++actor_rollout_ref.rollout.val_kwargs.n=16 \
+    ++actor_rollout_ref.rollout.profiler.ranks=null \
+    ++actor_rollout_ref.rollout.profiler.tool_config.npu.contents=null \
+    ++actor_rollout_ref.rollout.profiler.tool_config.torch.contents=null \
+    ++actor_rollout_ref.rollout.calculate_log_probs=True \
+    ++actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    ++actor_rollout_ref.ref.ulysses_sequence_parallel_size=1 \
     reward_model.reward_manager=dapo \
     custom_reward_function.path=${VERL_ROOT}/custom_reward_functions/reward_fn.py \
     custom_reward_function.name=compute_score \
@@ -168,7 +196,7 @@ if [ "$IS_HEAD" = "1" ]; then
     +reward_model.reward_kwargs.max_resp_len=$((1024+8192)) \
     trainer.logger='["console","swanlab","file"]' \
     trainer.project_name="deepseek1.5b_lr" \
-    trainer.experiment_name="deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5" \
+    trainer.experiment_name="${SIGFRAC_EXPERIMENT_NAME}" \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \

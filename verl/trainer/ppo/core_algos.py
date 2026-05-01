@@ -1274,7 +1274,7 @@ def compute_policy_loss(
 
 
 def _masked_stats(values: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
-    """Compute mean/std/p95/p99/max for masked values."""
+    """Compute mean/std/max for masked values."""
     if values.shape == mask.shape:
         valid = values[mask > 0]
     else:
@@ -1282,14 +1282,12 @@ def _masked_stats(values: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
         valid = values.reshape(-1)
 
     if valid.numel() == 0:
-        return {"mean": 0.0, "std": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
+        return {"mean": 0.0, "std": 0.0, "max": 0.0}
 
     valid = valid.float()
     return {
         "mean": valid.mean().item(),
         "std": valid.std(unbiased=False).item(),
-        "p95": torch.quantile(valid, 0.95).item(),
-        "p99": torch.quantile(valid, 0.99).item(),
         "max": valid.max().item(),
     }
 
@@ -1302,12 +1300,8 @@ def _build_ratio_kl_metrics(
     return {
         "actor/ratio_mean": ratio_stats["mean"],
         "actor/ratio_std": ratio_stats["std"],
-        "actor/ratio_p95": ratio_stats["p95"],
-        "actor/ratio_p99": ratio_stats["p99"],
         "actor/ratio_max": ratio_stats["max"],
         "actor/ppo_kl_mean": kl_stats["mean"],
-        "actor/ppo_kl_p95": kl_stats["p95"],
-        "actor/ppo_kl_p99": kl_stats["p99"],
         "actor/ppo_kl_max": kl_stats["max"],
     }
 

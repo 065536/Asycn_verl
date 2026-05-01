@@ -65,6 +65,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
 from verl.utils.py_functional import convert_to_regular_types
+from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import (
     gather_outputs_and_unpad,
@@ -256,6 +257,9 @@ class SignalFractionLRScheduler:
         fast_drop_rho: float,
         cooldown_steps: int,
         handoff_steps: int,
+        alpha_rate_limit: float = 0.0,
+        r_window_size: int = 0,
+        r_window_mode: str = "off",
         sign_gate_gamma: float = None,
         sign_gate_alpha_plus: float = None,
         alpha_replay_path: str = None,
@@ -292,9 +296,16 @@ class SignalFractionLRScheduler:
         self.fast_drop_rho = fast_drop_rho
         self.cooldown_steps = cooldown_steps
         self.handoff_steps = handoff_steps
+        self.alpha_rate_limit = max(0.0, float(alpha_rate_limit or 0.0))
+        self.r_window_size = max(0, int(r_window_size or 0))
+        self.r_window_mode = r_window_mode or "off"
+        if self.r_window_mode not in ("off", "replace_ema"):
+            raise ValueError(f"unsupported signal_fraction r_window_mode: {self.r_window_mode}")
+        self.r_window_enabled = self.r_window_size > 0 and self.r_window_mode != "off"
 
         # r-side: state
         self.r_ema: float = r_boot          # unified EMA (sym during warmup, asym after)
+        self.r_window: list[float] = []
         self.g_rms_ema: float = None        # bootstrapped on first valid step
         self._handoff_done: bool = False    # True once warmup has ended
         self._handoff_step: int = 0         # steps completed since handoff
@@ -326,6 +337,7 @@ class SignalFractionLRScheduler:
         self._alpha_replay_values: list[float] = []
         self._alpha_replay_by_step: dict[int, float] = {}
         self._last_alpha_replay_applied: float = 0.0
+        self._last_alpha_rate_limited: float = 0.0
         if self.alpha_replay_path:
             self._load_alpha_replay()
 
@@ -337,6 +349,8 @@ class SignalFractionLRScheduler:
         self._last_p_t: float = None
         self._last_a_t: float = None
         self._last_r_ctrl: float = r_boot
+        self._last_r_window: float = r_boot
+        self._last_r_window_count: int = 0
 
         # Initialize warmup start LR
         if num_warmup_steps > 0:
@@ -580,6 +594,10 @@ class SignalFractionLRScheduler:
                 fast_drop_triggered = True
                 self._cooldown_counter = self.cooldown_steps
             self._update_r_ema_post(r_obs)
+            if self.r_window_enabled:
+                self.r_window.append(float(r_obs))
+                if len(self.r_window) > self.r_window_size:
+                    self.r_window = self.r_window[-self.r_window_size :]
         # (if invalid, r̄ is held; cooldown state is unchanged)
 
         # ---- compute r_t_ctrl ----
@@ -589,6 +607,14 @@ class SignalFractionLRScheduler:
                 r_ctrl = self._sign_gate_r_ref
             else:
                 r_ctrl = self.sign_gate_gamma * self._sign_gate_r_ref
+        elif self.r_window_enabled:
+            if self.r_window:
+                r_window = float(sum(self.r_window) / len(self.r_window))
+            else:
+                r_window = float(self._last_r_ctrl)
+            self._last_r_window = r_window
+            self._last_r_window_count = len(self.r_window)
+            r_ctrl = float(max(r_window, self.r_min_ctrl))
         elif fast_drop_triggered and valid:
             # Immediate response: bypass EMA, use raw obs directly
             r_ctrl = float(max(r_obs, self.r_min_ctrl))
@@ -611,11 +637,23 @@ class SignalFractionLRScheduler:
         else:
             alpha_t = alpha_sf
 
+        # Optional low-bandwidth controller: prevent noisy r observations from
+        # creating high-frequency LR jumps. Replay baselines intentionally bypass
+        # this limiter below so their alpha sequences remain exact controls.
+        self._last_alpha_rate_limited = 0.0
+        if self.alpha_rate_limit > 0 and self._last_alpha > 0:
+            lo = self._last_alpha * (1.0 - self.alpha_rate_limit)
+            hi = self._last_alpha * (1.0 + self.alpha_rate_limit)
+            alpha_limited = float(max(lo, min(hi, alpha_t)))
+            self._last_alpha_rate_limited = float(alpha_limited != alpha_t)
+            alpha_t = alpha_limited
+
         # Optional alpha replay override (for shuffled/replay controls)
         alpha_replay = self._alpha_replay_override()
         if alpha_replay is not None:
             alpha_t = float(alpha_replay)
             self._last_alpha_replay_applied = 1.0
+            self._last_alpha_rate_limited = 0.0
         else:
             self._last_alpha_replay_applied = 0.0
 
@@ -679,6 +717,10 @@ class SignalFractionLRScheduler:
             "actor/in_handoff": float(self._handoff_done and self._handoff_step < self.handoff_steps),
             "actor/alpha_replay_applied": self._last_alpha_replay_applied,
             "actor/alpha_replay_enabled": float(self.alpha_replay_path is not None),
+            "actor/alpha_rate_limited": self._last_alpha_rate_limited,
+            "actor/r_window": self._last_r_window,
+            "actor/r_window_count": float(self._last_r_window_count),
+            "actor/r_window_enabled": float(self.r_window_enabled),
         }
         if self.g_rms_ema is not None:
             metrics["actor/g_rms_ema"] = self.g_rms_ema
@@ -696,6 +738,7 @@ class SignalFractionLRScheduler:
             "c_t": self.c_t,
             "phi_bar": self.phi_bar,
             "r_ema": self.r_ema,
+            "r_window": self.r_window,
             "g_rms_ema": self.g_rms_ema,
             "_handoff_done": self._handoff_done,
             "_handoff_step": self._handoff_step,
@@ -705,11 +748,14 @@ class SignalFractionLRScheduler:
             "_last_r_hat_raw": self._last_r_hat_raw,
             "_last_r_hat": self._last_r_hat,
             "_last_r_ctrl": self._last_r_ctrl,
+            "_last_r_window": self._last_r_window,
+            "_last_r_window_count": self._last_r_window_count,
             "_last_alpha": self._last_alpha,
             "_last_phi": self._last_phi,
             "_last_p_t": self._last_p_t,
             "_last_a_t": self._last_a_t,
             "_last_alpha_replay_applied": self._last_alpha_replay_applied,
+            "_last_alpha_rate_limited": self._last_alpha_rate_limited,
             "_sign_gate_r_ref": self._sign_gate_r_ref,
             "sign_gate_alpha_plus": self.sign_gate_alpha_plus,
         }
@@ -719,6 +765,9 @@ class SignalFractionLRScheduler:
         self.c_t = state_dict["c_t"]
         self.phi_bar = state_dict["phi_bar"]
         self.r_ema = state_dict.get("r_ema", self.r_boot)
+        self.r_window = list(state_dict.get("r_window", []))
+        if self.r_window_size > 0 and len(self.r_window) > self.r_window_size:
+            self.r_window = self.r_window[-self.r_window_size :]
         self.g_rms_ema = state_dict.get("g_rms_ema", None)
         self._handoff_done = state_dict.get("_handoff_done", False)
         self._handoff_step = state_dict.get("_handoff_step", 0)
@@ -728,11 +777,14 @@ class SignalFractionLRScheduler:
         self._last_r_hat_raw = state_dict.get("_last_r_hat_raw", 0.0)
         self._last_r_hat = state_dict.get("_last_r_hat", self.r_boot)
         self._last_r_ctrl = state_dict.get("_last_r_ctrl", self.r_boot)
+        self._last_r_window = state_dict.get("_last_r_window", self.r_boot)
+        self._last_r_window_count = state_dict.get("_last_r_window_count", len(self.r_window))
         self._last_alpha = state_dict.get("_last_alpha", self.c_t)
         self._last_phi = state_dict.get("_last_phi", None)
         self._last_p_t = state_dict.get("_last_p_t", None)
         self._last_a_t = state_dict.get("_last_a_t", None)
         self._last_alpha_replay_applied = state_dict.get("_last_alpha_replay_applied", 0.0)
+        self._last_alpha_rate_limited = state_dict.get("_last_alpha_rate_limited", 0.0)
         self._sign_gate_r_ref = state_dict.get("_sign_gate_r_ref", None)
         # sign_gate_alpha_plus is a constructor param, not mutable state; not restored from checkpoint
 
@@ -1102,6 +1154,37 @@ class FSDPEngine(BaseEngine):
                 num_cycles=num_cycles,
                 zero_indexed_step=zero_indexed_step,
             )
+        elif lr_scheduler_type == "signal_fraction":
+            lr_scheduler = SignalFractionLRScheduler(
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                c_init=optim_config.lr,
+                eta_c=optim_config.signal_fraction_eta_c,
+                c_min=optim_config.signal_fraction_c_min,
+                c_max=optim_config.signal_fraction_c_max,
+                phi_ema_beta=optim_config.signal_fraction_phi_ema_beta,
+                r_min_ctrl=optim_config.signal_fraction_r_min,
+                r_boot=optim_config.signal_fraction_r_boot,
+                r_ema_beta_sym=optim_config.signal_fraction_r_ema_beta_sym,
+                r_ema_beta_down=optim_config.signal_fraction_r_ema_beta_down,
+                r_ema_beta_up=optim_config.signal_fraction_r_ema_beta_up,
+                g_rms_ema_beta=optim_config.signal_fraction_g_rms_ema_beta,
+                d_min_abs=optim_config.signal_fraction_d_min_abs,
+                tau_rms=optim_config.signal_fraction_tau_rms,
+                fast_drop_rho=optim_config.signal_fraction_fast_drop_rho,
+                cooldown_steps=optim_config.signal_fraction_cooldown_steps,
+                handoff_steps=optim_config.signal_fraction_handoff_steps,
+                alpha_rate_limit=optim_config.signal_fraction_alpha_rate_limit,
+                r_window_size=optim_config.signal_fraction_r_window_size,
+                r_window_mode=optim_config.signal_fraction_r_window_mode,
+                sign_gate_gamma=optim_config.signal_fraction_sign_gate_gamma,
+                sign_gate_alpha_plus=optim_config.signal_fraction_sign_gate_alpha_plus,
+                alpha_replay_path=optim_config.signal_fraction_alpha_replay_path,
+                alpha_replay_shuffle=optim_config.signal_fraction_alpha_replay_shuffle,
+                alpha_replay_seed=optim_config.signal_fraction_alpha_replay_seed,
+                alpha_replay_start_step=optim_config.signal_fraction_alpha_replay_start_step,
+                alpha_replay_end_step=optim_config.signal_fraction_alpha_replay_end_step,
+            )
         else:
             raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
         return lr_scheduler
@@ -1232,6 +1315,163 @@ class FSDPEngine(BaseEngine):
     def get_context_parallel_group(self):
         raise NotImplementedError
 
+    @staticmethod
+    def _signal_fraction_slice_nested_tensor(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
+        try:
+            tensors = tensor.unbind(dim=0)
+            return torch.nested.as_nested_tensor(tensors[start:end], layout=torch.jagged)
+        except RuntimeError:
+            padded = tensor.to_padded_tensor(0)
+            lengths = tensor.offsets().diff().tolist()
+            tensors = [padded[i, ..., : lengths[i]] for i in range(start, end)]
+            return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+
+    def _signal_fraction_slice_batch(self, data: TensorDict, start: int, end: int) -> TensorDict:
+        sliced = {}
+        for key, value in data.items():
+            if isinstance(value, torch.Tensor):
+                if value.is_nested:
+                    sliced[key] = self._signal_fraction_slice_nested_tensor(value, start, end)
+                else:
+                    sliced[key] = value[start:end]
+            elif getattr(value, "shape", None):
+                sliced[key] = value[start:end]
+            else:
+                sliced[key] = value
+        return TensorDict(source=sliced, batch_size=[end - start], device=data.device)
+
+    def _signal_fraction_split_batch(self, data: TensorDict) -> tuple[TensorDict, TensorDict]:
+        rollout_n = int(getattr(self.optimizer_config, "signal_fraction_rollout_n", 1))
+        if rollout_n <= 0:
+            raise ValueError(f"signal_fraction_rollout_n must be positive, got {rollout_n}")
+
+        local_bsz = data.shape[0]
+        if local_bsz % rollout_n != 0:
+            raise ValueError(
+                f"signal_fraction requires local batch size divisible by rollout_n, got "
+                f"{local_bsz=} and {rollout_n=}"
+            )
+
+        n_groups = local_bsz // rollout_n
+        if n_groups < 2:
+            raise ValueError(
+                "signal_fraction requires at least 2 prompt groups per training rank. "
+                f"Got local_bsz={local_bsz}, rollout_n={rollout_n}. Increase "
+                "actor_rollout_ref.actor.ppo_mini_batch_size so per-rank mini batch "
+                "contains at least 2 groups."
+            )
+
+        uid_data = tu.get(data, "uid", default=None)
+        if uid_data is not None:
+            uid_values = uid_data.tolist() if hasattr(uid_data, "tolist") else list(uid_data)
+            for group_idx in range(n_groups):
+                group = uid_values[group_idx * rollout_n : (group_idx + 1) * rollout_n]
+                if len(set(group)) != 1:
+                    raise ValueError(
+                        "signal_fraction requires contiguous rollout groups before A1/A2 split. "
+                        "The current local batch appears reordered within prompt groups; disable "
+                        "trainer.balance_batch or use group-preserving balancing."
+                    )
+
+        split_groups = n_groups // 2
+        split_idx = split_groups * rollout_n
+        return self._signal_fraction_slice_batch(data, 0, split_idx), self._signal_fraction_slice_batch(
+            data, split_idx, local_bsz
+        )
+
+    def _clone_grads(self, params: list[torch.nn.Parameter]) -> list[torch.Tensor]:
+        return [
+            p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p, memory_format=torch.preserve_format)
+            for p in params
+        ]
+
+    def _signal_fraction_grad_stats(
+        self,
+        grad_a1: list[torch.Tensor],
+        params: list[torch.nn.Parameter],
+    ) -> tuple[float, float, float, float, float, float]:
+        local_stats = torch.zeros(4, device=get_device_id(), dtype=torch.float64)
+        upd_norm_sq_local = 0.0
+
+        for g1, p in zip(grad_a1, params, strict=True):
+            g2 = p.grad.detach() if p.grad is not None else torch.zeros_like(p, memory_format=torch.preserve_format)
+            g1f = g1.to(torch.float64).flatten()
+            g2f = g2.to(torch.float64).flatten()
+            local_stats[0] += torch.dot(g1f, g2f)
+            local_stats[1] += torch.dot(g1f, g1f)
+            local_stats[2] += torch.dot(g2f, g2f)
+            g_upd = (g1 + g2) / 2.0
+            p.grad = g_upd
+            upd_norm_sq_local += g_upd.to(torch.float64).norm().item() ** 2
+
+        local_stats[3] = upd_norm_sq_local
+        torch.distributed.all_reduce(local_stats, group=self.get_data_parallel_group())
+
+        if not hasattr(self, "_sf_n_params_global"):
+            n_params_local = sum(p.numel() for p in params)
+            n_params = torch.tensor(n_params_local, device=get_device_id(), dtype=torch.int64)
+            torch.distributed.all_reduce(n_params, group=self.get_data_parallel_group())
+            self._sf_n_params_global = int(n_params.item())
+
+        g_dot = local_stats[0].item()
+        g_a1_norm_sq = local_stats[1].item()
+        g_a2_norm_sq = local_stats[2].item()
+        denom = (g_a1_norm_sq + g_a2_norm_sq) / 2.0
+        r_hat_raw = g_dot / (denom + 1e-12)
+        g_rms = float((local_stats[3].item() / max(self._sf_n_params_global, 1)) ** 0.5)
+        return g_dot, g_a1_norm_sq, g_a2_norm_sq, denom, r_hat_raw, g_rms
+
+    def train_batch(self, data: TensorDict, loss_function: Callable) -> dict:
+        if getattr(self.optimizer_config, "lr_scheduler_type", "constant") != "signal_fraction":
+            return super().train_batch(data=data, loss_function=loss_function)
+
+        maybe_fix_3d_position_ids(data)
+        data_a1, data_a2 = self._signal_fraction_split_batch(data)
+
+        # Signal-fraction needs the scheduler state for the current optimizer
+        # step before r-side control computes alpha_t.
+        self.lr_scheduler.step()
+
+        self.optimizer_zero_grad()
+        output_a1 = self.forward_backward_batch(data_a1, loss_function, forward_only=False)
+        params = [p for p in self.module.parameters() if p.requires_grad]
+        grad_a1 = self._clone_grads(params)
+
+        self.optimizer_zero_grad()
+        output_a2 = self.forward_backward_batch(data_a2, loss_function, forward_only=False)
+        g_dot, g_a1_norm_sq, g_a2_norm_sq, denom, r_hat_raw, g_rms = self._signal_fraction_grad_stats(grad_a1, params)
+
+        alpha_t = self.lr_scheduler.update_r_and_set_lr(g_dot, denom, g_rms, r_hat_raw)
+        grad_norm = self.optimizer_step()
+
+        outputs = {
+            "model_output": {},
+            "loss": output_a1.get("loss", []) + output_a2.get("loss", []),
+            "metrics": {},
+        }
+        for out in (output_a1, output_a2):
+            for key, value in out.get("metrics", {}).items():
+                outputs["metrics"].setdefault(key, []).extend(value if isinstance(value, list) else [value])
+
+        if self.is_mp_src_rank_with_outputs():
+            outputs["metrics"]["grad_norm"] = grad_norm
+            outputs["metrics"]["lr"] = alpha_t
+            outputs["metrics"].update(
+                {
+                    "actor/g_A1_dot_A2": [g_dot],
+                    "actor/g_dot_positive": [float(g_dot > 0)],
+                    "actor/g_norm_A1_sq": [g_a1_norm_sq],
+                    "actor/g_norm_A2_sq": [g_a2_norm_sq],
+                    "actor/g_rms": [g_rms],
+                    "actor/is_calibration_step": [0.0],
+                    "actor/signal_fraction_new_engine": [1.0],
+                }
+            )
+            for key, value in self.lr_scheduler.get_signal_fraction_metrics().items():
+                outputs["metrics"][key] = [value]
+
+        return outputs
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
@@ -1347,6 +1587,9 @@ class FSDPEngine(BaseEngine):
         """
         Advance FSDP scheduler and return updated learning rate.
         """
+        if isinstance(self.lr_scheduler, SignalFractionLRScheduler):
+            self.lr_scheduler.step()
+            return self.lr_scheduler.get_last_lr()[0]
         self.lr_scheduler.step()
         lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
         return lr

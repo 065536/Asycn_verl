@@ -156,6 +156,15 @@ class FSDPOptimizerConfig(OptimizerConfig):
     signal_fraction_cooldown_steps: int = 5
     # Handoff interpolation steps (warmup LR → c_t * r̄_t)
     signal_fraction_handoff_steps: int = 10
+    # Optional relative per-step alpha change limit after warmup/handoff.
+    # 0.05 means alpha_t is clipped to [0.95, 1.05] * previous alpha.
+    # Non-positive disables the limiter.
+    signal_fraction_alpha_rate_limit: float = 0.0
+    # Optional windowed continuous-r controller. When mode is "replace_ema",
+    # r_ctrl is driven by the mean of the latest W valid r observations instead
+    # of the per-step EMA/fast-drop path. 0/off keeps the original controller.
+    signal_fraction_r_window_size: int = 0
+    signal_fraction_r_window_mode: str = "off"
     # Sign-gate mode: two-level LR gate based on alignment sign.
     # gamma=None → continuous r-shaping (default); gamma=1.0 → constant LR (M baseline);
     # gamma=0.5 → half speed on misaligned steps (A experiment).
@@ -175,6 +184,9 @@ class FSDPOptimizerConfig(OptimizerConfig):
     # Replay active window [start_step, end_step]. Useful to preserve warmup/handoff.
     signal_fraction_alpha_replay_start_step: int = 21
     signal_fraction_alpha_replay_end_step: Optional[int] = None
+    # Rollouts per prompt group. The new engine path needs this to split A1/A2
+    # at prompt-group boundaries instead of response boundaries.
+    signal_fraction_rollout_n: int = 1
 
     def __post_init__(self):
         if self.warmup_style is not None:
@@ -185,6 +197,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
             self.lr_scheduler_type = self.warmup_style
         assert self.lr_scheduler_type in ["constant", "cosine", "entropy_adaptive", "signal_fraction"]
         assert self.entropy_adaptive_reference_mode in ["ema", "initial"]
+        assert self.signal_fraction_r_window_mode in ["off", "replace_ema"]
         return super().__post_init__()
 
 

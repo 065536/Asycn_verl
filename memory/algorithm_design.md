@@ -4,6 +4,127 @@ description: entadapt_initial 缺陷 + α_t=c_t·r̂_t 框架 + 4.21 诊断：c_
 type: project
 ---
 
+## 2026-04-30 controller redesign after noisy split-alignment diagnosis
+
+The current interpretation of split-batch alignment is deliberately weaker and
+cleaner:
+
+```text
+single-step alignment sign is weak;
+temporally aggregated alignment may still be useful.
+```
+
+Empirical diagnostic: `g_dot_positive` is only around `55%`, close to a random
+coin flip at the single-step sign level. Therefore the method should not be
+presented as a precise per-step reliability classifier, and future controllers
+should not trust one raw `g_A1^T g_A2` observation as a high-confidence decision.
+
+Updated claim:
+
+> split-batch alignment is a noisy but informative proxy. Its value is to induce
+> a state-aware, low-frequency LR trajectory, not to exactly estimate the
+> optimal LR at every PPO mini-update.
+
+This preserves the support-matched update-scale story from the D3/C310/shuffled
+controls:
+
+- D3 recovering much of B means coarse update-scale schedule explains a large
+  part of the gain.
+- B still beating D3 means state-dependent residual allocation may still matter.
+- Shuffled alpha is now treated as a secondary/confusing control, not the main
+  evidence source. The cleaner question is whether temporal aggregation of the
+  same signal improves the controller.
+
+### Next controller sequence
+
+Priority is to validate low-bandwidth control without introducing artificial
+stage priors:
+
+1. **Slow EMA**: reduce direct transmission of raw `r_obs` noise.
+2. **Alpha change-rate limit**: constrain per-step alpha jitter after computing
+   the signal-fraction LR.
+3. **3A windowed continuous-r**: replace the fast EMA input with the mean of the
+   last `W` valid `r_obs` values.
+
+Deferred:
+
+- stage-level baseline + residual adaptive: rejected as next main step because
+  it needs D3/stage prior and weakens the clean claim.
+- 3B windowed sign reliability: deferred because it introduces new mapping
+  hyperparameters (`lambda`, multiplier bounds, window size).
+- 3C hysteresis sign-gate: still useful later as a sign-gate repair, but not the
+  main controller line.
+
+### 3A experimental interpretation
+
+Run:
+
+| group | purpose |
+|---|---|
+| B-current repeat | same-batch baseline |
+| 3A-W5 | short temporal aggregation; should filter one-step noise while keeping responsiveness |
+| 3A-W10 | stronger low-pass test; checks whether low-frequency stage trend dominates |
+
+Interpretation:
+
+- W5/W10 > B: current B was overreacting to single-step noise; temporal
+  aggregation improves alignment-conditioned gain control.
+- W5 ~= B, W10 < B: moderate smoothing is safe, excessive low-pass loses useful
+  adaptivity.
+- W5/W10 < B: current B smoothing is already adequate or windowing over-damps.
+- W10 ~= D3: long window is mostly becoming a coarse schedule and losing
+  state-dependent residual value.
+
+## 2026-04-27 async c-fixed sweep: design boundary after new-engine port
+
+Current async Phase 1 goal is **only** to calibrate `c_fixed` under fully async partial rollout:
+
+```text
+α_t = c_fixed · r_ctrl,    c_fixed ≈ BASE_LR / r_boot,    r_boot=0.05
+```
+
+This is deliberately not a full `c_t` controller experiment. The active sweep remains:
+
+| BASE_LR | implied c_fixed |
+|---:|---:|
+| `7.5e-6` | `1.5e-4` |
+| `1e-5` | `2.0e-4` |
+| `1.25e-5` | `2.5e-4` |
+
+**Why this separation matters**:
+
+- fully async changes staleness, update cadence, gradient noise, KL/entropy trajectories, and partial-rollout truncation.
+- Therefore sync `c_fixed=2.5e-4` cannot be assumed to transfer.
+- This phase should choose a scale region only; it should not be used to make a final claim about r-side causality or full two-timescale feedback.
+
+**Current implementation semantics**:
+
+- r-side split-batch logic has been ported to the new async `TrainingWorker/FSDP engine` path.
+- A1/A2 are split at prompt-group boundaries, provided `trainer.balance_batch=False` preserves contiguous rollout groups.
+- C-side calibration is not ported. This is acceptable for this sweep because `eta_c=0` and `calib_frac=0`.
+
+**First analysis order after runs start**:
+
+1. mechanism:
+   - `actor/signal_fraction_new_engine=1`
+   - `actor/alpha_t` warmup/handoff/post-handoff
+   - `actor/r_hat`, `actor/r_ctrl`, floor frequency
+   - `actor/g_A1_dot_A2`, `actor/g_dot_positive`
+2. stability:
+   - `actor/ppo_kl_mean`
+   - `actor/grad_norm`
+   - entropy trajectory
+3. validation:
+   - final/peak/drop only after mechanism is confirmed.
+
+**Decision rule**:
+
+- `1.25e-5` stable and best → densify upward (`1.5e-5`, `1.75e-5`)
+- `1e-5` best → densify around mid (`8.75e-6`, `1.125e-5`)
+- `7.5e-6` best or higher points unstable → densify lower (`5e-6`, `6.25e-6`, `8.75e-6`)
+
+---
+
 ## Current algorithm: entadapt_initial (flawed)
 
 Formula: α(t) = α₀ × H(t)/H(0)
@@ -333,3 +454,140 @@ GPQA: A=0.3419 < M=0.3663。gamma=0.5 的刹车在 GPQA 对应步骤过于保守
 | `sync_sigfrac_cfixed_lr1.25e-5_seed1.sh` | 1 |
 
 原始 seed=42（3组）+ 6组 = 9次运行，3 seed × 3 condition。分析脚本（analyze.py）需更新以支持 mean ± std 汇总。
+
+---
+
+## 4.27 Baseline Controls: Mean Alpha, Jitter, and Decay Confounds
+
+### 4.27 C310 / S baseline 分析结论
+
+4.27 用户上传了 4.26 启动的 6 组 baseline 结果，分析报告：
+
+- `exp_data/4.27/analysis_report.md`
+
+条件：
+
+- **C310**: constant LR = `3.10e-6`，对齐 B 的实测 post-handoff mean alpha。
+- **S**: alpha-shuffled control，保留 B 的 alpha 分布，打乱 alpha 与 step/alignment 的对应。
+- 对照参照：4.26 的 **B** continuous r-shaping。
+
+核心结论：
+
+1. **B 的收益不能归因于 mean alpha 更高**：
+   - B step21-300 mean alpha ≈ `3.0953e-6`
+   - C310 step21-300 alpha 严格为 `3.1000e-6`
+   - avg5 final: B=`0.3443`, C310=`0.3322`
+   - paired avg5 diff B-C310=`+0.0121 ± 0.0067`，3/3 seed 为正
+
+2. **B 的收益不能归因于普通 LR jitter**：
+   - S step22-300 与 shuffled replay 序列逐点一致
+   - avg5 final: S=`0.3324`，基本等于 C310=`0.3322`
+   - paired avg5 diff B-S=`+0.0120 ± 0.0125`，2/3 seed 为正
+   - OLYMPIAD 上 B-S 为 3/3 seed 正
+
+3. **必须披露的机制细节**：
+   - alpha replay 日志存在 1-step offset：`REPLAY_START_STEP=21` 时，日志 step22-300 完全 replay；日志 step21 是 replay 前的 signal-fraction alpha。
+   - 这个 offset 不推翻 shuffled control，但论文/报告中不能写成 step21-300 完美 replay。
+
+可声明：
+
+- Adaptive gain allocation matters beyond average LR scale.
+- The marginal distribution of alpha is insufficient; coupling alpha to the training state/alignment signal is needed to reproduce B's overall gains.
+
+不可声明：
+
+- B wins every benchmark（AIME2025/MINERVA 上 C310 与 B 持平或略高）。
+- shuffled replay 完美覆盖 step21-300（只能说 logged step22-300 exact replay）。
+
+### Remaining confound: state-independent decay
+
+4.27 分析后，剩余最关键质疑变为：
+
+> B 是否只是学到了一个普通 state-independent early/mid/late decay schedule，而不是依赖 step-level alignment-conditioned allocation？
+
+C310 和 S 已经排除：
+
+- 不是 mean alpha 更高；
+- 不是无序 LR jitter。
+
+但它们没有排除：
+
+- 一个手工设计的 monotone/piecewise decay schedule 也能达到 B。
+
+因此下一步最关键 baseline 是 **D3: piecewise stage-matched decay**。
+
+### D3 design: strongest hand-crafted decay baseline
+
+D3 直接复制 B 的阶段级 alpha 形状，但去掉 per-step alignment coupling。
+
+使用 4.26 B 三 seed pooled 阶段均值：
+
+| phase | steps | alpha |
+|---|---:|---:|
+| early | 21-100 | `3.286384633e-6` |
+| mid | 101-200 | `3.370729357e-6` |
+| late | 201-300 | `2.667058466e-6` |
+| weighted post mean | 21-300 | `3.0953198319e-6` |
+
+注意：B 不是严格 monotone decay；mid 略高于 early。因此 D3 比简单 linear/cosine 更强，因为它复制了 B 的粗粒度非单调形状。
+
+D3 的判定逻辑：
+
+- 若 **B > D3**：coarse hand-crafted decay 不足以复现 B，step-level alignment-conditioned allocation 有独立价值。
+- 若 **D3 ≈ B**：B 的主要收益可能是自动形成了一个有效 coarse schedule，claim 需要降级为“自动发现 schedule”，而不是“细粒度 step-level allocation 必要”。
+- 若 **D3 > B**：当前 B 不是最终最优方法，alignment signal 仍有诊断价值，但实现需结合/改进 decay prior。
+
+### 4.28 D3 results and interpretation update
+
+用户上传了 D3 三 seed 结果到 `exp_data/4.28/`。
+
+5-task core avg final:
+
+| family | runs | best core | final core | final - best |
+|---|---:|---:|---:|---:|
+| B: `sigfrac_cfixed_lr1.25e-5` | 3 | `0.3443 @300` | `0.3443` | `0.0000` |
+| D3: `piecewise_stage_matched_decay_d3` | 3 | `0.3372 @270` | `0.3360` | `-0.0011` |
+| alpha shuffled | 3 | `0.3405 @290` | `0.3324` | `-0.0081` |
+| matched alpha 3.10e-6 | 3 | `0.3328 @280` | `0.3322` | `-0.0005` |
+| matched alpha 2.97e-6 | 3 | `0.3346 @260` | `0.3302` | `-0.0044` |
+
+D3 轨迹稳定：core avg 从 `0.2248` 提升到 `0.3360`，peak `0.3372@270`，末尾基本不掉。`actor/alpha_t` sanity-check 显示 step21-100 / 101-200 / 201-300 精确匹配 replay schedule。
+
+Interpretation:
+
+1. D3 是好事，不是否定 signal-fraction。它强力支持主轴：**update scale / support matching** 是收益来源。
+2. C310 / matched-alpha 不能达到 D3，说明平均 alpha 不够；时间结构很重要。
+3. Shuffled alpha 不能达到 B，说明无序 jitter 不够；alpha 与训练阶段/状态的耦合很重要。
+4. B 仍高于 D3 `+0.0083` core avg，说明 state-dependent signal-fraction 保留了粗 stage schedule 之外的剩余价值。
+
+Updated claim boundary:
+
+- 不再强写“fine-grained step-level allocation strictly necessary”。
+- 更稳的论文表述：
+
+> Signal-fraction primarily discovers and tracks a support-matched update-scale schedule. A strong stage-matched open-loop schedule recovers much of the gain, but still underperforms the adaptive controller, indicating residual value from state-dependent allocation.
+
+## 7B transfer plan（2026-04-28）
+
+Next model-scale test: DeepSeek-R1-Distill-Qwen-7B.
+
+First step is to re-sweep `c_fixed`; do not copy 1.5B's `c_fixed=2.5e-4` directly. Reasons:
+
+- `c_fixed` approximates `1/L`; model scale changes effective curvature.
+- 7B can change gradient RMS and A1/A2 alignment distribution.
+- The cleanest migration test is one degree of freedom: update scale.
+
+Resource choice:
+
+- Use **16 GPUs first**, not 32 GPUs.
+- Current per-job cap is about `128 GPU hours`; 32 GPUs gives only ~4h wall-clock, while 16 GPUs gives ~8h and is better for checkpoint/resume.
+
+First 7B sync c-fixed sweep:
+
+| BASE_LR | implied c_fixed | role |
+|---:|---:|---|
+| `5e-6` | `1.0e-4` | conservative low |
+| `7.5e-6` | `1.5e-4` | middle |
+| `1e-5` | `2.0e-4` | high but below 1.5B B |
+
+Use `eta_c=0.0`, `calib_frac=0.0`, `trainer.balance_batch=False`, and inspect dynamics before final scores.
