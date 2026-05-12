@@ -260,6 +260,7 @@ class SignalFractionLRScheduler:
         alpha_rate_limit: float = 0.0,
         r_window_size: int = 0,
         r_window_mode: str = "off",
+        r_window_invalid_value: Optional[float] = None,
         sign_gate_gamma: float = None,
         sign_gate_alpha_plus: float = None,
         alpha_replay_path: str = None,
@@ -302,6 +303,9 @@ class SignalFractionLRScheduler:
         if self.r_window_mode not in ("off", "replace_ema"):
             raise ValueError(f"unsupported signal_fraction r_window_mode: {self.r_window_mode}")
         self.r_window_enabled = self.r_window_size > 0 and self.r_window_mode != "off"
+        self.r_window_invalid_value = r_window_invalid_value
+        if self.r_window_invalid_value is not None:
+            self.r_window_invalid_value = float(max(0.0, min(1.0, self.r_window_invalid_value)))
 
         # r-side: state
         self.r_ema: float = r_boot          # unified EMA (sym during warmup, asym after)
@@ -598,6 +602,10 @@ class SignalFractionLRScheduler:
                 self.r_window.append(float(r_obs))
                 if len(self.r_window) > self.r_window_size:
                     self.r_window = self.r_window[-self.r_window_size :]
+        elif self.r_window_enabled and self.r_window_invalid_value is not None:
+            self.r_window.append(float(self.r_window_invalid_value))
+            if len(self.r_window) > self.r_window_size:
+                self.r_window = self.r_window[-self.r_window_size :]
         # (if invalid, r̄ is held; cooldown state is unchanged)
 
         # ---- compute r_t_ctrl ----
@@ -721,6 +729,9 @@ class SignalFractionLRScheduler:
             "actor/r_window": self._last_r_window,
             "actor/r_window_count": float(self._last_r_window_count),
             "actor/r_window_enabled": float(self.r_window_enabled),
+            "actor/r_window_invalid_value": (
+                -1.0 if self.r_window_invalid_value is None else float(self.r_window_invalid_value)
+            ),
         }
         if self.g_rms_ema is not None:
             metrics["actor/g_rms_ema"] = self.g_rms_ema
@@ -758,6 +769,7 @@ class SignalFractionLRScheduler:
             "_last_alpha_rate_limited": self._last_alpha_rate_limited,
             "_sign_gate_r_ref": self._sign_gate_r_ref,
             "sign_gate_alpha_plus": self.sign_gate_alpha_plus,
+            "r_window_invalid_value": self.r_window_invalid_value,
         }
 
     def load_state_dict(self, state_dict):
@@ -1177,6 +1189,7 @@ class FSDPEngine(BaseEngine):
                 alpha_rate_limit=optim_config.signal_fraction_alpha_rate_limit,
                 r_window_size=optim_config.signal_fraction_r_window_size,
                 r_window_mode=optim_config.signal_fraction_r_window_mode,
+                r_window_invalid_value=optim_config.signal_fraction_r_window_invalid_value,
                 sign_gate_gamma=optim_config.signal_fraction_sign_gate_gamma,
                 sign_gate_alpha_plus=optim_config.signal_fraction_sign_gate_alpha_plus,
                 alpha_replay_path=optim_config.signal_fraction_alpha_replay_path,

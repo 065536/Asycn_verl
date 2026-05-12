@@ -790,6 +790,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     alpha_rate_limit=optim_config.get("signal_fraction_alpha_rate_limit", 0.0),
                     r_window_size=optim_config.get("signal_fraction_r_window_size", 0),
                     r_window_mode=optim_config.get("signal_fraction_r_window_mode", "off"),
+                    r_window_invalid_value=optim_config.get("signal_fraction_r_window_invalid_value", None),
                     sign_gate_gamma=optim_config.get("signal_fraction_sign_gate_gamma", None),
                     sign_gate_alpha_plus=optim_config.get("signal_fraction_sign_gate_alpha_plus", None),
                     alpha_replay_path=optim_config.get("signal_fraction_alpha_replay_path", None),

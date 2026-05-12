@@ -193,6 +193,10 @@ trainer:
   # Maximum number of critic checkpoints to keep
   max_critic_ckpt_to_keep: null
 
+  # Maximum number of global_step_* checkpoint folders to keep.
+  # If null, RayPPOTrainer falls back to max actor/critic checkpoint retention.
+  max_global_ckpt_to_keep: null
+
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300
 

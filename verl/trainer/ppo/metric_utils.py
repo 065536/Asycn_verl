@@ -78,6 +78,18 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def _tensor_std(tensor: torch.Tensor) -> float:
+    if tensor.numel() == 0:
+        return 0.0
+    return torch.std(tensor.float(), unbiased=False).detach().item()
+
+
+def _tensor_abs_mean(tensor: torch.Tensor) -> float:
+    if tensor.numel() == 0:
+        return 0.0
+    return torch.mean(torch.abs(tensor.float())).detach().item()
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -162,18 +174,23 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/score/mean": score_mean,
         "critic/score/max": score_max,
         "critic/score/min": score_min,
+        "critic/score/std": _tensor_std(non_aborted_sequence_score),
         # reward
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
+        "critic/rewards/std": _tensor_std(non_aborted_sequence_reward),
         # adv
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/std": _tensor_std(valid_adv),
+        "critic/advantages/abs_mean": _tensor_abs_mean(valid_adv),
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),
         "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns/std": _tensor_std(valid_returns),
         **(
             {
                 # values

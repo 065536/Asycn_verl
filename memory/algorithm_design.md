@@ -4,6 +4,277 @@ description: entadapt_initial 缺陷 + α_t=c_t·r̂_t 框架 + 4.21 诊断：c_
 type: project
 ---
 
+## 2026-05-06 W10 readout: promising but not settled
+
+The 1.5B multi-seed follow-up changed the controller priority:
+
+```text
+W10 windowed continuous-r is the most promising current variant, but it has not
+yet solved the noise/stability problem.
+```
+
+### B-current reference is already multi-seed
+
+B-current has three historical complete seeds:
+
+| run | best avg5 | final avg5 | final - best |
+|---|---:|---:|---:|
+| B seed42 old | 0.3470 | 0.3470 | +0.0000 |
+| B seed0 old | 0.3458 | 0.3419 | -0.0040 |
+| B seed1 old | 0.3471 | 0.3442 | -0.0029 |
+| **mean** | **0.3466** | **0.3440** | **-0.0023** |
+
+There is also a new B-current diagnostic rerun with final avg5 `0.3385`.
+Do not claim that B-current lacks seeds. The fair caveat is only that old B
+seeds and latest W10 seeds were not all launched under exactly the same logging
+batch.
+
+### W10 evidence
+
+Current W10 results:
+
+| run | best avg5 | final avg5 | final - best |
+|---|---:|---:|---:|
+| W10 seed0 new | 0.3456 | 0.3419 | -0.0037 |
+| W10 seed1 new | 0.3624 | 0.3600 | -0.0024 |
+| W10 seed42 old | 0.3460 | 0.3219 | -0.0241 |
+| **mean** | **0.3513** | **0.3413** | **-0.0101** |
+
+Interpretation:
+
+- W10 has the highest recent peak and the strongest new-seed result.
+- New seed0/seed1 W10 mean final is `0.3510`, higher than slow EMA, alpha rate
+  limit, matched constant, and the newest B rerun.
+- Including old seed42, W10 final mean falls below B-current because of a large
+  late drop.
+- Therefore W10 supports the **temporal aggregation direction**, not a final
+  controller claim.
+
+Recommended advisor-facing statement:
+
+> Single-step r is too noisy. Window aggregation, especially W10, is the most
+> promising way we have found to extract useful low-frequency structure, but the
+> result is still seed-sensitive and needs stability confirmation.
+
+### Comparison to other low-frequency variants
+
+Recent completed seed0/seed1 readout:
+
+| group | seeds | best avg5 | final avg5 | final - best |
+|---|---:|---:|---:|---:|
+| W10 | 2 | 0.3540 | 0.3510 | -0.0030 |
+| slow EMA 0.95 | 2 | 0.3408 | 0.3344 | -0.0064 |
+| alpharlim0.05 | 1 complete | 0.3405 | 0.3366 | -0.0039 |
+| matched constant 3.10e-6 | 1 | 0.3407 | 0.3320 | -0.0087 |
+
+Design implication:
+
+- Slow EMA alone is not enough; it changes the effective LR scale and remains
+  seed-sensitive.
+- Alpha rate limit is a useful safety/stability knob, not the main source of
+  performance.
+- W10 is currently the only new controller variant worth targeted confirmation.
+
+### Next experiments
+
+Do not broaden the sweep. Run targeted W10 confirmation:
+
+```bash
+RESUME_MODE=disable \
+SEED=42 \
+SIGFRAC_RUN_SUFFIX="_windowr_w10_seed42_rerun" \
+SIGFRAC_R_WINDOW_SIZE=10 \
+SIGFRAC_R_WINDOW_MODE="replace_ema" \
+bash /data/250010176/codes/verl/new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+
+RESUME_MODE=disable \
+SEED=2 \
+SIGFRAC_RUN_SUFFIX="_windowr_w10_seed2" \
+SIGFRAC_R_WINDOW_SIZE=10 \
+SIGFRAC_R_WINDOW_MODE="replace_ema" \
+bash /data/250010176/codes/verl/new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+```
+
+Interpretation after these runs:
+
+- If W10 seed42 rerun and seed2 are both close to seed0/seed1, W10 becomes the
+  main controller candidate.
+- If one repeats the old seed42 late drop, the method should be framed as
+  increasing peak/opportunity rather than solving final stability.
+- If W10 remains unstable, shift back toward base schedule + small residual
+  adaptive signal instead of pure r-side controller.
+
+## 2026-05-05 multi-seed controller follow-up
+
+The latest single-seed low-frequency controller results are too close to support
+a strong design conclusion. Current interpretation:
+
+```text
+the r_t noise problem is not solved;
+single-seed differences between B / slow EMA / alpha-rate-limit / windowing are
+not enough to distinguish controller quality from seed noise.
+```
+
+Therefore the current experiment priority is **multi-seed confirmation**, not
+adding more variants.
+
+Runs launched:
+
+| group | seeds launched | reason |
+|---|---:|---|
+| `alpharlim0.05` | 0, 1 | seed42 was stable and close to B |
+| `slowema_ret0.95` | 0, 1 | seed42 reached high peak but did not preserve it |
+| `windowr_w10` | 0, 1 | seed42 tested stronger low-pass control but had weak final |
+
+New scripts:
+
+```bash
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpharlim0.05_seed0.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpharlim0.05_seed1.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_seed0.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_seed1.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w10_seed0.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w10_seed1.sh
+```
+
+Decision rule:
+
+- If a variant improves multi-seed final avg5 and reduces peak-to-final drop
+  versus B, treat it as a real controller improvement.
+- If only best/peak improves but final does not, describe it as increased
+  exploration rather than solved reliability control.
+- If mean differences are small relative to seed variance, the advisor-facing
+  conclusion should be that simple low-pass variants are not distinguishable
+  yet.
+
+## 2026-05-05 diagnostic runs launched
+
+After adding PPO ratio-tail, clip high/low, and train-batch dispersion metrics,
+diagnostic runs were launched to collect those new signals:
+
+| run | role |
+|---|---|
+| current B (`sync_sigfrac_cfixed_lr1.25e-5.sh`) | main adaptive baseline with new diagnostics |
+| matched constant (`sync_matched_alpha_3.10e-6.sh`) | same-scale constant LR comparison |
+
+These are not new controller experiments. They are intended to answer whether
+late-stage degradation is better explained by safety/tail metrics than by
+`KL mean`, `ratio_std`, or single-step `r_hat` sign.
+
+Analysis target:
+
+```text
+metric_t -> future late-stage avg5 drop / train-score drift / response-length
+drift, especially after stage demeaning.
+```
+
+## 2026-05-05 r_hat x pg_loss diagnostic pivot
+
+Offline analysis on six local 1.5B controller JSONL files tested whether
+`r_hat` becomes more informative when combined with PPO learning pressure
+(`pg_loss`). High/low was defined by the median within each run-stage.
+
+Artifacts:
+
+- `paper/figures/rhat_pg_loss_opportunity_diagnostic.png`
+- `paper/analysis/rhat_pg_loss_opportunity_diagnostic.md`
+
+Main finding:
+
+```text
+high r_hat + high pg_loss has the strongest future avg5 / train-score gain when
+all stages are pooled, but this pattern does not hold cleanly in late stage.
+```
+
+Design implication:
+
+- `r_hat` alone should not be treated as a strong controller signal.
+- `pg_loss` looks like a stronger opportunity signal.
+- `r_hat` may help qualify whether that learning pressure is usable.
+- Any new controller should avoid the rule "increase LR whenever both are high"
+  in late stage.
+
+Most promising next controller family:
+
+```text
+base schedule (D3/WSD) + small early/mid opportunity residual
+```
+
+Late-stage behavior should be controlled by safety/tail diagnostics rather than
+`pg_loss` alone. New tail diagnostics have been added for future runs:
+`ratio_p95`, `ratio_p99`, ratio threshold fractions, high/low PPO clip fractions,
+and score/reward/advantage dispersion metrics.
+
+## 2026-05-05 low-frequency ablation readout
+
+Local result files checked under `deepseek1.5b_lr/`:
+
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_alpharlim0.05.jsonl`
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95.jsonl`
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_alpharlim0.05.jsonl`
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.98.jsonl`
+
+No local JSONL/log/checkpoint was found for the true 3A windowed continuous-r
+runs:
+
+- `*_windowr_w5*`
+- `*_windowr_w10*`
+
+Therefore the current readout is **not** a 3A window readout. It is a readout of
+slow EMA and alpha-rate-limit ablations.
+
+### 5-task avg results
+
+| run | max step | best avg5 | final avg5 | final - best |
+|---|---:|---:|---:|---:|
+| `alpharlim0.05` | 300 | `0.3428 @290` | `0.3403 @300` | `-0.0025` |
+| `slowema_ret0.95` | 300 | `0.3483 @250` | `0.3407 @300` | `-0.0075` |
+| `slowema_ret0.95_alpharlim0.05` | 300 | `0.3365 @270` | `0.3324 @300` | `-0.0041` |
+| `slowema_ret0.98` | 279 | `0.3378 @240` | `0.3240 @270` | `-0.0138` |
+
+Previous B reference remains roughly:
+
+```text
+B current: best/final core avg ≈ 0.3443 @300
+```
+
+### Interpretation
+
+The experiments are close enough that they do **not** establish a clear win over
+B. Current conclusion:
+
+```text
+noise is not solved;
+simple slow EMA / alpha-rate limiting only partially changes the controller and
+does not provide a significant performance improvement.
+```
+
+More detailed reading:
+
+- `slowema_ret0.95` reaches the highest observed peak (`0.3483`), which is a
+  useful sign that larger effective alpha / slower smoothing can push the model
+  into a better mid-training region. However it does not hold the gain and drops
+  to `0.3407`, so it is not a clean improvement.
+- `alpharlim0.05` is the most stable among these runs (`final-best=-0.0025`) and
+  suppresses alpha jitter, but its final score remains close to B and not better.
+- `slowema_ret0.98` is too slow and underperforms.
+- `slowema_ret0.95 + alpharlim0.05` also underperforms, suggesting that stacking
+  two low-pass mechanisms can over-damp useful adaptivity.
+
+### Updated design implication
+
+Do not continue blindly sweeping EMA/rate-limit. The evidence supports a more
+careful claim:
+
+> low-frequency control is plausible, but naive low-pass filtering does not yet
+> extract a clearly better reliability signal.
+
+The next clean test remains the actual 3A windowed controller (`W=5`, `W=10`),
+with explicit verification that `actor/r_window_enabled=1` appears in logs. If
+W5/W10 also fail to separate from B, then continuous `r_obs` should be treated as
+too noisy for a strong controller, and the method should shift toward coarse
+schedule discovery / weak state-proxy claims.
+
 ## 2026-04-30 controller redesign after noisy split-alignment diagnosis
 
 The current interpretation of split-batch alignment is deliberately weaker and

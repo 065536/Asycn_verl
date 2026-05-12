@@ -1,10 +1,104 @@
 # Project Status
 
-**Last updated**: 2026-04-30 (low-frequency signal-fraction controller checkpoint)
+**Last updated**: 2026-05-05 (multi-seed controller runs launched)
 
 ---
 
-## Current Engineering Checkpoint (2026-04-30)
+## Current Run Queue (2026-05-05)
+
+After the latest single-seed low-frequency controller results, the main issue is
+not which new controller to add next. The main issue is whether the observed
+differences are larger than seed noise.
+
+Launched 1.5B multi-seed follow-up runs:
+
+| group | seeds launched | why |
+|---|---:|---|
+| `alpharlim0.05` | 0, 1 | seed42 was stable and close to B; test consistency |
+| `slowema_ret0.95` | 0, 1 | seed42 had high peak but nontrivial late drop; test whether this is real |
+| `windowr_w10` | 0, 1 | seed42 had high peak and weak final; test low-pass/windowing robustness |
+
+Launched scripts:
+
+```bash
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpharlim0.05_seed0.sh
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpharlim0.05_seed1.sh
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_seed0.sh
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_seed1.sh
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w10_seed0.sh
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w10_seed1.sh
+```
+
+Script update:
+
+- `sync_sigfrac_cfixed_lr1.25e-5.sh` accepts `SEED=${SEED:-42}`.
+- New wrappers use unique suffixes (`*_seed0`, `*_seed1`) to avoid overwriting
+  seed42 outputs.
+
+Analysis rule:
+
+```text
+Do not claim the r_t noise problem is solved from single-seed runs.
+Wait for multi-seed mean/std on final avg5, best avg5, and peak-to-final drop.
+```
+
+---
+
+## Current Result Checkpoint (2026-05-05)
+
+Local analysis found completed outputs for slow EMA / alpha-rate-limit
+ablations, but **not** for the true 3A windowed continuous-r runs.
+
+Available local JSONL files:
+
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_alpharlim0.05.jsonl`
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95.jsonl`
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_alpharlim0.05.jsonl`
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.98.jsonl`
+
+Missing locally:
+
+- `*_windowr_w5*`
+- `*_windowr_w10*`
+
+5-task core avg:
+
+| run | max step | best avg5 | final avg5 | final - best |
+|---|---:|---:|---:|---:|
+| `alpharlim0.05` | 300 | `0.3428 @290` | `0.3403 @300` | `-0.0025` |
+| `slowema_ret0.95` | 300 | `0.3483 @250` | `0.3407 @300` | `-0.0075` |
+| `slowema_ret0.95_alpharlim0.05` | 300 | `0.3365 @270` | `0.3324 @300` | `-0.0041` |
+| `slowema_ret0.98` | 279 | `0.3378 @240` | `0.3240 @270` | `-0.0138` |
+
+Updated interpretation:
+
+```text
+The noise problem is not solved.
+Simple slow EMA / alpha-rate limiting does not clearly improve over B.
+The results are close enough that they should be treated as weak evidence.
+```
+
+Detailed read:
+
+- `slowema_ret0.95` reaches the highest peak (`0.3483`), which suggests larger
+  mean alpha / slower smoothing can improve mid-training exploration.
+- It drops to `0.3407` by step 300, so the gain is not stable.
+- `alpharlim0.05` is the most stable among these four runs but does not clearly
+  improve final quality.
+- `slowema_ret0.98` and `slowema_ret0.95_alpharlim0.05` underperform, suggesting
+  excessive low-pass control loses useful adaptivity.
+
+Next required sanity for true 3A:
+
+```text
+actor/r_window_enabled = 1.0
+actor/r_window_count grows toward W
+experiment/log/jsonl name contains windowr_w5 or windowr_w10
+```
+
+---
+
+## Previous Engineering Checkpoint (2026-04-30)
 
 The main 1.5B signal-fraction line has shifted from trusting raw single-step
 split alignment to testing whether **low-frequency temporal aggregation** makes

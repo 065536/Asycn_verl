@@ -30,6 +30,7 @@ USER_CKPTS_DIR=${CKPTS_DIR:-""}
 
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-2}
 MAX_CRITIC_CKPT_TO_KEEP=${MAX_CRITIC_CKPT_TO_KEEP:-2}
+MAX_GLOBAL_CKPT_TO_KEEP=${MAX_GLOBAL_CKPT_TO_KEEP:-2}
 
 # Resource allocation: default 16 GPUs = 2 nodes * 8 GPUs. Override NNODES=4
 # for a 32-GPU run when the scheduler budget allows shorter wall-clock jobs.
@@ -115,7 +116,7 @@ echo "HEAD_IP=$HEAD_IP IS_HEAD=$IS_HEAD RANK=${RANK:-unset} NODE_RANK=${NODE_RAN
 echo "DeepSeek7B sync cfixed: BASE_LR=${BASE_LR}, LR_TAG=${LR_TAG}, SEED=${SEED}"
 echo "Total GPUs: ${NNODES} nodes * ${NGPUS_PER_NODE} GPUs/node = $((NNODES * NGPUS_PER_NODE))"
 echo "Validation: VAL_N_RESP_PER_PROMPT=${val_n_resp_per_prompt}, TEST_FREQ=${test_freq}, VAL_BEFORE_TRAIN=${val_before_train}"
-echo "Checkpointing: SAVE_FREQ=${save_freq}"
+echo "Checkpointing: SAVE_FREQ=${save_freq}, MAX_GLOBAL_CKPT_TO_KEEP=${MAX_GLOBAL_CKPT_TO_KEEP}, MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP}, MAX_CRITIC_CKPT_TO_KEEP=${MAX_CRITIC_CKPT_TO_KEEP}"
 
 RAY=/data/250010176/yrh/miniconda3/envs/verl2/bin/ray
 $RAY stop -f || true
@@ -236,6 +237,7 @@ if [ "$IS_HEAD" = "1" ]; then
     ${RESUME_FROM_PATH:+trainer.resume_from_path="${RESUME_FROM_PATH}"} \
     trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP} \
     trainer.max_critic_ckpt_to_keep=${MAX_CRITIC_CKPT_TO_KEEP} \
+    trainer.max_global_ckpt_to_keep=${MAX_GLOBAL_CKPT_TO_KEEP} \
     trainer.log_val_generations=10 \
     trainer.balance_batch=False \
     2>&1 | tee -a "$LOG_FILE"

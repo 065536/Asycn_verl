@@ -20,6 +20,8 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
+import shutil
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -308,6 +310,103 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+
+    def _get_max_global_ckpt_to_keep(self, max_actor_ckpt_to_keep=None, max_critic_ckpt_to_keep=None):
+        max_global_ckpt_to_keep = self.config.trainer.get("max_global_ckpt_to_keep", None)
+        if max_global_ckpt_to_keep is not None:
+            return int(max_global_ckpt_to_keep)
+
+        candidates = [max_actor_ckpt_to_keep]
+        if self.use_critic:
+            candidates.append(max_critic_ckpt_to_keep)
+        candidates = [int(value) for value in candidates if value is not None]
+        if not candidates:
+            return None
+        return max(candidates)
+
+    def _prune_old_global_step_checkpoints(self, max_ckpt_to_keep):
+        if max_ckpt_to_keep is None or int(max_ckpt_to_keep) <= 0:
+            return
+
+        checkpoint_root = self.config.trainer.default_local_dir
+        if not checkpoint_root or not os.path.isdir(checkpoint_root):
+            return
+
+        step_dirs = self._list_global_step_checkpoints(checkpoint_root)
+
+        if len(step_dirs) <= max_ckpt_to_keep:
+            return
+
+        keep_paths = {path for _, path in step_dirs[-max_ckpt_to_keep:]}
+        current_path = os.path.join(checkpoint_root, f"global_step_{self.global_steps}")
+        keep_paths.add(current_path)
+
+        for _, path in step_dirs:
+            if path in keep_paths:
+                continue
+            print(f"Pruning old global checkpoint folder: {os.path.abspath(path)}")
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _list_global_step_checkpoints(self, checkpoint_root):
+        step_pattern = re.compile(r"^global_step_(\d+)$")
+        step_dirs = []
+        for name in os.listdir(checkpoint_root):
+            match = step_pattern.match(name)
+            if match is None:
+                continue
+            path = os.path.join(checkpoint_root, name)
+            if os.path.isdir(path):
+                step_dirs.append((int(match.group(1)), path))
+        step_dirs.sort(key=lambda item: item[0])
+        return step_dirs
+
+    def _validate_saved_checkpoint_folder(self, global_step_folder):
+        role_paths = [os.path.join(global_step_folder, "actor")]
+        if self.use_critic:
+            role_paths.append(os.path.join(global_step_folder, str(Role.Critic)))
+
+        bad_files = []
+        for role_path in role_paths:
+            if not os.path.isdir(role_path):
+                raise RuntimeError(f"Checkpoint role folder is missing: {role_path}")
+            for root, _, files in os.walk(role_path):
+                for filename in files:
+                    if not filename.endswith(".pt"):
+                        continue
+                    path = os.path.join(root, filename)
+                    if os.path.getsize(path) == 0:
+                        bad_files.append(path)
+
+        if bad_files:
+            examples = ", ".join(os.path.abspath(path) for path in bad_files[:5])
+            raise RuntimeError(
+                f"Checkpoint at {global_step_folder} has {len(bad_files)} empty tensor files. "
+                f"Examples: {examples}"
+            )
+
+    def _load_checkpoint_from_folder(self, global_step_folder):
+        print(f"Load from checkpoint folder: {global_step_folder}")
+        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+
+        print(f"Setting global step to {self.global_steps}")
+        print(f"Resuming from {global_step_folder}")
+
+        actor_path = os.path.join(global_step_folder, "actor")
+        critic_path = os.path.join(global_step_folder, str(Role.Critic))
+        self.actor_rollout_wg.load_checkpoint(
+            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+        )
+        if self.use_critic:
+            self.critic_wg.load_checkpoint(
+                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            )
+
+        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        if os.path.exists(dataloader_local_path):
+            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+            self.train_dataloader.load_state_dict(dataloader_state_dict)
+        else:
+            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -880,6 +979,10 @@ class RayPPOTrainer:
         max_critic_ckpt_to_keep = (
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
+        max_global_ckpt_to_keep = self._get_max_global_ckpt_to_keep(
+            max_actor_ckpt_to_keep=max_actor_ckpt_to_keep,
+            max_critic_ckpt_to_keep=max_critic_ckpt_to_keep,
+        )
 
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
@@ -904,6 +1007,8 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        self._validate_saved_checkpoint_folder(local_global_step_folder)
+
         # latest checkpointed iteration tracker (for atomic usage)
         if (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -919,6 +1024,8 @@ class RayPPOTrainer:
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+
+        self._prune_old_global_step_checkpoints(max_global_ckpt_to_keep)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -939,6 +1046,7 @@ class RayPPOTrainer:
             if global_step_folder is None:
                 print("Training from scratch")
                 return 0
+            load_candidates = [path for _, path in reversed(self._list_global_step_checkpoints(checkpoint_folder))]
         else:
             if self.config.trainer.resume_mode == "resume_path":
                 assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
@@ -949,33 +1057,20 @@ class RayPPOTrainer:
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
-        print(f"Load from checkpoint folder: {global_step_folder}")
-        # set global step
-        self.global_steps = int(global_step_folder.split("global_step_")[-1])
+            load_candidates = [global_step_folder]
 
-        print(f"Setting global step to {self.global_steps}")
-        print(f"Resuming from {global_step_folder}")
+        load_errors = []
+        for candidate in load_candidates:
+            try:
+                self._load_checkpoint_from_folder(candidate)
+                return
+            except Exception as exc:
+                if self.config.trainer.resume_mode != "auto":
+                    raise
+                print(f"Warning: failed to load checkpoint {candidate}: {repr(exc)}")
+                load_errors.append((candidate, repr(exc)))
 
-        actor_path = os.path.join(global_step_folder, "actor")
-        critic_path = os.path.join(global_step_folder, str(Role.Critic))
-        # load actor
-        self.actor_rollout_wg.load_checkpoint(
-            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
-        )
-        # load critic
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(
-                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
-            )
-
-        # load dataloader,
-        # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+        raise RuntimeError(f"All auto-resume checkpoint candidates failed to load: {load_errors}")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""

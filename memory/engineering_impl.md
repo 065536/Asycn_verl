@@ -4,6 +4,157 @@ description: Concrete implementation of α_t = c_t·r̂_t; code status as of 202
 type: project
 ---
 
+## Script note (2026-05-06): W10 confirmation commands
+
+No new script is required to rerun W10 seed42 or launch W10 seed2. The base
+script already supports `SEED`, `SIGFRAC_RUN_SUFFIX`, and window controls.
+
+Use explicit suffixes so new logs/checkpoints do not collide with earlier W10
+runs:
+
+```bash
+RESUME_MODE=disable \
+SEED=42 \
+SIGFRAC_RUN_SUFFIX="_windowr_w10_seed42_rerun" \
+SIGFRAC_R_WINDOW_SIZE=10 \
+SIGFRAC_R_WINDOW_MODE="replace_ema" \
+bash /data/250010176/codes/verl/new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+
+RESUME_MODE=disable \
+SEED=2 \
+SIGFRAC_RUN_SUFFIX="_windowr_w10_seed2" \
+SIGFRAC_R_WINDOW_SIZE=10 \
+SIGFRAC_R_WINDOW_MODE="replace_ema" \
+bash /data/250010176/codes/verl/new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+```
+
+Expected names:
+
+- `sync_sigfrac_cfixed_lr1.25e-5_windowr_w10_seed42_rerun_*.log`
+- `sync_sigfrac_cfixed_lr1.25e-5_windowr_w10_seed2_*.log`
+- checkpoint dirs with matching `DeepSeek1.5B-Sync-8gpu-sigfrac-cfixed-lr1.25e-5_windowr_w10_*` suffixes.
+
+## Script update (2026-05-05): multi-seed wrappers for controller ablations
+
+The base 1.5B c-fixed signal-fraction script now accepts a seed from the
+environment:
+
+```bash
+SEED=${SEED:-42}
+...
+data.seed=${SEED}
+```
+
+Default behavior is unchanged for existing scripts because the default remains
+`42`.
+
+Added multi-seed wrappers for the highest-priority controller follow-up:
+
+```text
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpharlim0.05_seed0.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_alpharlim0.05_seed1.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_seed0.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_seed1.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w10_seed0.sh
+new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5_windowr_w10_seed1.sh
+```
+
+Each wrapper sets both `SEED` and a unique `SIGFRAC_RUN_SUFFIX`, so logs,
+checkpoints, experiment names, and JSONL outputs should remain separated from
+seed42 and from each other.
+
+Bash syntax checks passed for the edited base script and representative wrappers.
+
+## Diagnostic logging update (2026-05-05): PPO tails and dispersion metrics
+
+Added future-run diagnostics without changing training behavior.
+
+Files:
+
+- `verl/trainer/ppo/core_algos.py`
+- `verl/trainer/ppo/metric_utils.py`
+
+New PPO ratio-tail metrics:
+
+```text
+actor/ratio_p95
+actor/ratio_p99
+actor/ratio_frac_gt_1p2
+actor/ratio_frac_lt_0p8
+actor/ratio_frac_gt_1p5
+```
+
+New split PPO clip metrics:
+
+```text
+actor/pg_clipfrac_high
+actor/pg_clipfrac_low
+```
+
+New train-batch dispersion metrics:
+
+```text
+critic/score/std
+critic/rewards/std
+critic/advantages/std
+critic/advantages/abs_mean
+critic/returns/std
+```
+
+Verification:
+
+- `python3 -m py_compile verl/trainer/ppo/core_algos.py verl/trainer/ppo/metric_utils.py`
+- `verl2` smoke test for `_build_ratio_kl_metrics()` passed.
+
+Diagnostic runs started after this logging change:
+
+```bash
+bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+bash new_experiments/signal_fraction_lr/sync_matched_alpha_3.10e-6.sh
+```
+
+Expected use: compare new tail/safety metrics between current B and matched
+constant LR. These runs should be read as diagnostics, not as new algorithm
+variants.
+
+## Local run status (2026-05-05): low-frequency ablation results available, window results missing
+
+Available local JSONL outputs:
+
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_alpharlim0.05.jsonl`
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95.jsonl`
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_alpharlim0.05.jsonl`
+- `deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.98.jsonl`
+
+Not found locally:
+
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_windowr_w5.jsonl`
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_windowr_w10.jsonl`
+- any matching `windowr` log or checkpoint.
+
+This means the available analysis is for slow EMA / alpha-rate-limit ablations,
+not the true 3A windowed continuous-r experiment.
+
+Controller diagnostics from available runs:
+
+| run | alpha mean | alpha std | mean `|Δalpha|` | p95 `|Δalpha|` | `g_dot_positive` |
+|---|---:|---:|---:|---:|---:|
+| `alpharlim0.05` | `3.08e-6` | `0.80e-6` | `0.11e-6` | `0.21e-6` | `0.561` |
+| `slowema_ret0.95` | `6.02e-6` | `2.55e-6` | `1.56e-6` | `6.35e-6` | `0.489` |
+| `slowema_ret0.95_alpharlim0.05` | `6.12e-6` | `2.17e-6` | `0.17e-6` | `0.44e-6` | `0.479` |
+| `slowema_ret0.98` | `5.27e-6` | `2.24e-6` | `1.74e-6` | `5.82e-6` | `0.544` |
+
+Key engineering check for future 3A runs:
+
+```text
+actor/r_window_enabled must be 1.0
+actor/r_window_count should grow toward W
+output JSONL name should contain windowr_w5 or windowr_w10
+```
+
+If those metrics are absent or `actor/r_window_enabled=0`, the run is not a 3A
+windowed controller run.
+
 ## Implementation status (2026-04-30): low-frequency r-side controller variants
 
 The 1.5B signal-fraction c-fixed script now supports three low-frequency

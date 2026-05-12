@@ -9,6 +9,8 @@ VERL_ROOT=/data/250010176/codes/verl/verl
 DATA_ROOT=/data/250010176/data
 MODEL_PATH=/data/250010176/codes/models/DeepSeek-R1-Distill-Qwen-1.5B
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+SEED=${SEED:-42}
+SIGFRAC_BASE_LR=${SIGFRAC_BASE_LR:-1.25e-5}
 SIGFRAC_RUN_SUFFIX=${SIGFRAC_RUN_SUFFIX:-""}
 SIGFRAC_CKPT_NAME="DeepSeek1.5B-Sync-8gpu-sigfrac-cfixed-lr1.25e-5${SIGFRAC_RUN_SUFFIX}"
 SIGFRAC_LOG_NAME="sync_sigfrac_cfixed_lr1.25e-5${SIGFRAC_RUN_SUFFIX}"
@@ -23,6 +25,11 @@ SIGFRAC_R_EMA_BETA_UP=${SIGFRAC_R_EMA_BETA_UP:-0.1}
 SIGFRAC_ALPHA_RATE_LIMIT=${SIGFRAC_ALPHA_RATE_LIMIT:-0.0}
 SIGFRAC_R_WINDOW_SIZE=${SIGFRAC_R_WINDOW_SIZE:-0}
 SIGFRAC_R_WINDOW_MODE=${SIGFRAC_R_WINDOW_MODE:-off}
+SIGFRAC_R_WINDOW_INVALID_VALUE=${SIGFRAC_R_WINDOW_INVALID_VALUE:-null}
+VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
+VAL_N=${VAL_N:-16}
+TEST_FREQ=${TEST_FREQ:-10}
+LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-10}
 
 # Resume training configuration
 RESUME_MODE=${RESUME_MODE:-"disable"}  # Options: "auto", "resume_path", "disable"
@@ -88,9 +95,11 @@ IS_HEAD=0
 NODE_RANK_CAND="${SENSECORE_PYTORCH_NODE_RANK:-${NODE_RANK:-}}"
 if [ "${NODE_RANK_CAND:-}" = "0" ] || [ "${RANK:-}" = "0" ]; then IS_HEAD=1; fi
 echo "HEAD_IP=$HEAD_IP IS_HEAD=$IS_HEAD RANK=${RANK:-unset} NODE_RANK=${NODE_RANK_CAND:-unset}"
+echo "Data seed: ${SEED}"
 echo "Signal fraction EMA betas: sym=${SIGFRAC_R_EMA_BETA_SYM}, down=${SIGFRAC_R_EMA_BETA_DOWN}, up=${SIGFRAC_R_EMA_BETA_UP}"
 echo "Signal fraction alpha rate limit: ${SIGFRAC_ALPHA_RATE_LIMIT}"
-echo "Signal fraction r-window: size=${SIGFRAC_R_WINDOW_SIZE}, mode=${SIGFRAC_R_WINDOW_MODE}"
+echo "Signal fraction r-window: size=${SIGFRAC_R_WINDOW_SIZE}, mode=${SIGFRAC_R_WINDOW_MODE}, invalid_value=${SIGFRAC_R_WINDOW_INVALID_VALUE}"
+echo "Validation: val_before_train=${VAL_BEFORE_TRAIN}, val_n=${VAL_N}, test_freq=${TEST_FREQ}, log_val_generations=${LOG_VAL_GENERATIONS}"
 
 RAY=/data/250010176/yrh/miniconda3/envs/verl2/bin/ray
 $RAY stop -f || true
@@ -114,7 +123,7 @@ if [ "$IS_HEAD" = "1" ]; then
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILES}" \
     data.prompt_key=prompt \
-    data.seed=42 \
+    data.seed=${SEED} \
     data.truncation='left' \
     data.max_prompt_length=1024 \
     data.max_response_length=8192 \
@@ -141,7 +150,7 @@ if [ "$IS_HEAD" = "1" ]; then
     ++actor_rollout_ref.rollout.name=vllm \
     ++actor_rollout_ref.model.path="${MODEL_PATH}" \
     ++actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    ++actor_rollout_ref.actor.optim.lr=1.25e-5 \
+    ++actor_rollout_ref.actor.optim.lr=${SIGFRAC_BASE_LR} \
     ++actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     ++actor_rollout_ref.actor.optim.weight_decay=0.1 \
     ++actor_rollout_ref.actor.optim.lr_scheduler_type=signal_fraction \
@@ -156,6 +165,7 @@ if [ "$IS_HEAD" = "1" ]; then
     ++actor_rollout_ref.actor.optim.signal_fraction_alpha_rate_limit=${SIGFRAC_ALPHA_RATE_LIMIT} \
     ++actor_rollout_ref.actor.optim.signal_fraction_r_window_size=${SIGFRAC_R_WINDOW_SIZE} \
     ++actor_rollout_ref.actor.optim.signal_fraction_r_window_mode="${SIGFRAC_R_WINDOW_MODE}" \
+    ++actor_rollout_ref.actor.optim.signal_fraction_r_window_invalid_value=${SIGFRAC_R_WINDOW_INVALID_VALUE} \
     ++actor_rollout_ref.actor.optim.signal_fraction_r_min=0.01 \
     ++actor_rollout_ref.actor.optim.signal_fraction_calib_frac=0.0 \
     ++actor_rollout_ref.actor.ppo_mini_batch_size=32 \
@@ -180,7 +190,7 @@ if [ "$IS_HEAD" = "1" ]; then
     ++actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
     ++actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     ++actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    ++actor_rollout_ref.rollout.val_kwargs.n=16 \
+    ++actor_rollout_ref.rollout.val_kwargs.n=${VAL_N} \
     ++actor_rollout_ref.rollout.profiler.ranks=[] \
     ++actor_rollout_ref.rollout.profiler.tool_config.npu.contents=[] \
     ++actor_rollout_ref.rollout.profiler.tool_config.torch.contents=[] \
@@ -200,8 +210,8 @@ if [ "$IS_HEAD" = "1" ]; then
     trainer.experiment_name="${SIGFRAC_EXPERIMENT_NAME}" \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \
     trainer.nnodes="${NNODES}" \
-    trainer.val_before_train=True \
-    trainer.test_freq=10 \
+    trainer.val_before_train=${VAL_BEFORE_TRAIN} \
+    trainer.test_freq=${TEST_FREQ} \
     trainer.save_freq=50 \
     trainer.total_epochs=10 \
     trainer.total_training_steps=300 \
@@ -210,7 +220,7 @@ if [ "$IS_HEAD" = "1" ]; then
     ${RESUME_FROM_PATH:+trainer.resume_from_path="${RESUME_FROM_PATH}"} \
     trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP:-2} \
     trainer.max_critic_ckpt_to_keep=${MAX_CRITIC_CKPT_TO_KEEP:-2} \
-    trainer.log_val_generations=10 \
+    trainer.log_val_generations=${LOG_VAL_GENERATIONS} \
     2>&1 | tee -a "$LOG_FILE"
 
   echo "Training completed successfully"

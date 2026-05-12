@@ -165,6 +165,10 @@ class FSDPOptimizerConfig(OptimizerConfig):
     # of the per-step EMA/fast-drop path. 0/off keeps the original controller.
     signal_fraction_r_window_size: int = 0
     signal_fraction_r_window_mode: str = "off"
+    # Optional value to append to the r-window when the current r observation is
+    # invalid. None preserves the original valid-only window. For bias checks,
+    # set to 0.0 or r_min to include misaligned/invalid steps in the window.
+    signal_fraction_r_window_invalid_value: Optional[float] = None
     # Sign-gate mode: two-level LR gate based on alignment sign.
     # gamma=None → continuous r-shaping (default); gamma=1.0 → constant LR (M baseline);
     # gamma=0.5 → half speed on misaligned steps (A experiment).

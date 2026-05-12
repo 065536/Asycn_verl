@@ -1292,6 +1292,38 @@ def _masked_stats(values: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
     }
 
 
+def _masked_quantile(values: torch.Tensor, mask: torch.Tensor, q: float, max_items: int = 200_000) -> float:
+    """Compute a quantile for masked values."""
+    if values.shape == mask.shape:
+        valid = values[mask > 0]
+    else:
+        valid = values.reshape(-1)
+
+    if valid.numel() == 0:
+        return 0.0
+
+    # torch.quantile has backend-dependent limits for very large tensors. These
+    # tail metrics are diagnostics, so use deterministic strided subsampling.
+    if valid.numel() > max_items:
+        stride = int(np.ceil(valid.numel() / max_items))
+        valid = valid[::stride]
+
+    return torch.quantile(valid.detach().float().cpu(), q).item()
+
+
+def _masked_fraction(predicate: torch.Tensor, mask: torch.Tensor) -> float:
+    """Compute the masked fraction of entries satisfying a boolean predicate."""
+    if predicate.shape == mask.shape:
+        valid = predicate[mask > 0]
+    else:
+        valid = predicate.reshape(-1)
+
+    if valid.numel() == 0:
+        return 0.0
+
+    return valid.float().mean().item()
+
+
 def _build_ratio_kl_metrics(
     ratio_values: torch.Tensor, ppo_kl_values: torch.Tensor, response_mask: torch.Tensor
 ) -> dict[str, float]:
@@ -1301,6 +1333,11 @@ def _build_ratio_kl_metrics(
         "actor/ratio_mean": ratio_stats["mean"],
         "actor/ratio_std": ratio_stats["std"],
         "actor/ratio_max": ratio_stats["max"],
+        "actor/ratio_p95": _masked_quantile(ratio_values, response_mask, 0.95),
+        "actor/ratio_p99": _masked_quantile(ratio_values, response_mask, 0.99),
+        "actor/ratio_frac_gt_1p2": _masked_fraction(ratio_values > 1.2, response_mask),
+        "actor/ratio_frac_lt_0p8": _masked_fraction(ratio_values < 0.8, response_mask),
+        "actor/ratio_frac_gt_1p5": _masked_fraction(ratio_values > 1.5, response_mask),
         "actor/ppo_kl_mean": kl_stats["mean"],
         "actor/ppo_kl_max": kl_stats["max"],
     }
@@ -1375,6 +1412,8 @@ def compute_policy_loss_vanilla(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac_high = verl_F.masked_mean((ratio > (1 + cliprange_high)).float(), response_mask)
+    pg_clipfrac_low = verl_F.masked_mean((ratio < (1 - cliprange_low)).float(), response_mask)
 
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
@@ -1394,6 +1433,8 @@ def compute_policy_loss_vanilla(
 
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/pg_clipfrac_high": pg_clipfrac_high.detach().item(),
+        "actor/pg_clipfrac_low": pg_clipfrac_low.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }

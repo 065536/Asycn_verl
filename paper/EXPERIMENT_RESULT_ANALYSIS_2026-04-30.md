@@ -1,210 +1,196 @@
-# DeepSeek-1.5B Signal-Fraction 实验结果分析（截至 2026-04-30）
+# DeepSeek-1.5B Signal-Fraction 4.30 总报告（Scale-Confound 修订版）
 
-## 0. 执行摘要（先给结论）
+版本：2026-05-02
 
-基于 4.14、4.23、4.24–4.28 与 4.30 的连续证据，当前最稳妥结论是：
+## 1) 一句话结论
 
-1. **单步 split alignment 是弱信号（`g_dot_positive` 约 55%）**，不适合做硬门控，但可能作为低频状态代理。  
-2. **B-current（fixed-c + continuous-r）收益真实存在**，且不能被「均值 LR 更高」或「随机抖动」完全解释。  
-3. 4.30 的主问题不是再证“r 有没有信息”，而是：**如何在弱信号下提取低频成分，降低后期退化（late degradation）**。  
-4. 评估重点必须从“单个 final 分数”升级为“**性能 + 控制轨迹 + 稳定性 tail**”三位一体；否则无法区分「有效自适应」与「退化成保守 open-loop」。
+4.30 阶段的关键不是“证明低频控制已经更好”，而是重新确认：
+split-batch alignment 是弱但有信息的低频状态代理。当前结果中，`alpharlim0.05`
+最干净地体现了稳定性收益；slow-EMA 结果存在显著 alpha-scale confound，需 scale-matched rerun 后再做因果解释。
 
----
+## 2) 本次分析对象（4 个 run）
 
-## 1. 分析目标与证据来源
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_alpharlim0.05.jsonl`
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95.jsonl`
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.95_alpharlim0.05.jsonl`
+- `deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_slowema_ret0.98.jsonl`
 
-### 1.1 本文档回答的问题
+核心指标口径：
 
-- Q1：B-current 的收益是否只是 scale 差异？
-- Q2：4.30 的 low-frequency controller（slow EMA / window-r / alpha-rate-limit）是否真正改善“控制质量”？
-- Q3：若某方法 final 接近，如何判断是否值得进入多 seed 扩展？
+`core(step)=mean(val-core/{AIME,AIME2025,Idavidrein/gpqa,MINERVA,OLYMPIAD_BENCH}/acc/mean@16)`
 
-### 1.2 证据来源（按时间）
+## 3) 4.30 组内对比
 
-- `exp_data/4.14/ANALYSIS.md`：open-loop 干预边界（β sweep、cosine/floor、advvar）。
-- `exp_data/4.23/ANALYSIS.md`：c-fixed / continuous-r 第一轮结论与 confound 提示。
-- `memory/engineering_impl.md`：4.24–4.28 B/C310/S/D3 对照逻辑、4.30 工程落地细节。
-- `paper/PROJECT_STATUS.md`：4.30 checkpoint 的统一问题定义与当前推荐实验路径。
+| Run | core_init | core_best@step | core_final | net_gain | drop(final-best) |
+|---|---:|---:|---:|---:|---:|
+| slowema_ret0.95 | 0.230333 | 0.348250@250 | **0.340750** | +0.110417 | -0.007500 |
+| alpharlim0.05 | 0.224833 | 0.342833@290 | 0.340333 | **+0.115500** | **-0.002500** |
+| slowema_ret0.95 + alpharlim0.05 | 0.223500 | 0.336458@270 | 0.332375 | +0.108875 | -0.004083 |
+| slowema_ret0.98 | 0.222417 | 0.337833@240 | 0.324042 | +0.101625 | -0.013792 |
 
----
+## 4) 最关键修正：Scale-Confound Check
 
-## 2. 历史结论重建：为什么 4.30 是“自然下一步”
+历史参考：B-current typical alpha 约 `3.1e-6`（项目既有口径）。
 
-## 2.1 4.14：open-loop 有上限，不是“全无效”
+| Run | alpha_mean | alpha_last | 相对 B-current alpha_mean | 解释 |
+|---|---:|---:|---:|---|
+| slowema_ret0.95 | 6.17e-6 | 4.87e-6 | ~2.0x | 严重 scale confound |
+| alpharlim0.05 | 3.42e-6 | 2.50e-6 | ~1.1x | 轻度偏高，可接受但需标注 |
+| slowema_ret0.95 + alpharlim0.05 | 6.29e-6 | 2.64e-6 | ~2.0x | 严重 scale confound |
+| slowema_ret0.98 | 5.45e-6 | 4.52e-6 | ~1.8x | 严重 scale confound |
 
-4.14 的精确定性应为：
+因此：
 
-- 固定 entropy bonus 不稳健（β 小无效、β 大爆炸）。
-- `cosine_floor` 是当时最强 open-loop，但仍弱于 `sync_lr3e-6`。
-- `advvar_ent` 调整了探索分配，但未解决后期 mismatch。
+- slowema_ret0.95 虽然 final 在 4.30 四组中最高，但不能直接归因为“slow EMA 更好”。
+- alpharlim0.05 是目前最干净的稳定性信号。
 
-**因此结论不是 open-loop 完全无效，而是其上限受限**：它可缓解部分阶段问题，但无法可靠处理阶段内状态变化。
+## 5) 关键判断修订
 
-## 2.2 4.23：先看到 scale 主导，再识别 confound
+1. **alpharlim0.05 是当前最可信的 stability-improvement candidate。**
+   - near-best final（0.340333）
+   - 最小 late regression（-0.0025）
+   - `mean|Δalpha|` 显著更低（1.55e-7）
+   - rate limit 触发率 57%，说明控制带宽确实被改变
 
-4.23 清晰显示：
+2. **slowema_ret0.95 的收益目前仍被 scale confound 覆盖。**
+   - 其 mean alpha 接近 B-current 的 2 倍，不能直接得出“低频平滑带来收益”的因果结论。
 
-- effective alpha 的慢尺度（slow scale）是一阶因素；
-- continuous-r 的独立贡献仍未被直接识别；
-- `r_min` 偏高导致 `r_ctrl` 贴底频繁，压缩可观测的连续调制空间。
+3. **combined 方案不应描述为“更保守”。**
+   - `alpha_mean` 反而最高（6.29e-6）。
+   - 更合理解释：slow EMA 与 rate limit 交互导致 alpha 轨迹失真（早期偏高，后期修正受限）。
 
-这一步的价值在于：把“方法看起来有效”拆成了“scale 贡献 vs 状态调制贡献”。
+4. **ret0.98 的问题更像“响应太慢”，不是简单“更保守”。**
+   - `alpha_last` 仍偏高（4.52e-6），且 late regression 更大。
+   - 符合“过慢响应错过 late-stage 风险信号”的机制预期。
 
-## 2.3 4.24–4.28：因果补链（B/C310/S/D3）
+## 6) 当前报告缺失的基线上下文
 
-这组对照是 4.30 的逻辑根基：
+仅看 4.30 四组不足以回答“控制器是否真正改进”，还必须并列历史基线：
 
-- **B-current（fixed-c + continuous-r）**：当前主候选。  
-- **C310（matched constant LR）**：对齐 mean alpha 后仍弱于 B，排除纯 mean-scale 解释。  
-- **S（shuffled alpha）**：保留分布但打乱时序后退化，证明“alpha 与状态时序对齐”有信息。  
-- **D3（stage-matched decay）**：接近 B 但通常略低，说明 coarse stage 解释了大头，但 stage 内 state-dependent modulation 仍有增量价值。
+- B-current（主方法）
+- D3（coarse schedule）
+- C310（mean-alpha matched constant）
+- S shuffled（alpha distribution shuffled）
+- M 2.97e-6（fixed LR）
 
-**结论**：4.30 研究 low-frequency controller 不是跳步，而是沿已验证因果链继续前进。
+没有这些对照时，只能做组内比较，不能做完整机制归因。
 
----
+## 7) 下一步优先级（修订）
 
-## 3. 4.30 的正确问题定义（必须统一口径）
+1. **第一优先级：** `alpharlim0.05` 多 seed。
+2. **第二优先级：** `slowema_ret0.95` 先做 scale-matched rerun（调低 c_fixed，使 mean alpha 回到约 `3.1e-6` 到 `3.4e-6`），再考虑多 seed。
+3. **第三优先级：** 继续 W5/W10（windowed-r）；当前报告尚未回答 temporal aggregation 是否有效。
 
-4.30 不应再表述为“单步 sign 分类准确率提升多少”，而应统一为：
+## 8) 可直接引用的结论文本
 
-> 在单步弱信号条件下，是否能通过低频聚合构造更稳健的 alpha 轨迹，
-> 从而减少 late degradation，且不牺牲最终性能。
+**English**  
+`alpharlim0.05` gives the cleanest stability signal in 4.30: near-best final core with the smallest late regression and substantially reduced alpha high-frequency variation.  
+`slowema_ret0.95` reaches the highest final core among the four variants, but its mean alpha is substantially larger than B-current / alpharlim, so the gain cannot yet be attributed solely to low-frequency smoothing.  
 
-当前候选变体：
+**中文**  
+4.30 阶段最干净的稳定性正信号来自 `alpharlim0.05`：在保持较高 final core 的同时，late regression 最小且 alpha 高频抖动显著下降。  
+`slowema_ret0.95` 虽然在四组内 final 最高，但其 mean alpha 显著偏大，当前仍存在 scale confound，不能直接归因为低频控制收益。
 
-- **Slow EMA**：`ret0.95`, `ret0.98`
-- **Alpha rate limit**：`alpharlim0.05`
-- **Windowed-r**：`W5`, `W10`
+## 9) 与历史基线（4.27/4.28）的统一解释
 
-这三类分别作用于：
+为了避免把 4.30 的局部现象误读成“方法最终结论”，应将其放入已完成的 C310 / S / D3 / B 证据链中：
 
-- 信号平滑（降低瞬时噪声）
-- 执行器约束（抑制过快控制变化）
-- 观测聚合（提高低频成分占比）
+### 9.1 历史基线定量锚点（来自 4.27/4.28 已完成分析）
 
----
+> 注：下表用于“历史锚点”而非同批次严格 apples-to-apples 对照；4.30 主体仍是组内 4-run 比较。
 
-## 4. 指标体系（详细版）：必须记录什么，为什么记录
+| Family / Baseline | 典型设置 | core_final（5-task avg） | 备注 |
+|---|---|---:|---|
+| B-current | `sigfrac_cfixed_lr1.25e-5` | **0.3443** | 4.26/4.28 主方法参考 |
+| D3 | stage-matched piecewise decay | 0.3360 | 强 open-loop schedule baseline |
+| C310 | constant `3.10e-6` | 0.3322 | mean-alpha matched constant |
+| S | shuffled alpha replay | 0.3324 | 保留 alpha 分布、打乱时序耦合 |
+| M | matched alpha `2.97e-6` | 0.3302 | fixed-LR 对照 |
 
-## 4.1 性能层：判断“好不好”
+结合 4.30 的 `alpharlim0.05 core_final=0.3403` 与 `slowema_ret0.95 core_final=0.3408`，当前最稳妥解读是：
 
-每个 benchmark 统一输出：
+- 4.30 的两个较优点位处在 **D3 之上、B-current 附近**；
+- 但 slowema 点位仍受 scale confound，不可直接当作“机制优于 B”的证据；
+- `alpharlim0.05` 因 scale 更接近 B-current，当前可作为更干净的稳定性候选。
 
-- `step0`, `best`, `best_step`, `final`
-- `drop = final - best`
-- `net_gain = final - step0`
+1. **C310（matched mean alpha）与 S（shuffled alpha）已排除两个常见混杂：**
+   - B 的收益不是来自更高 mean alpha；
+   - B 的收益不是来自无序 jitter。
 
-core 聚合（建议 AIME/OLYMPIAD/GPQA/MINERVA 统一口径）：
+2. **D3（stage-matched open-loop decay）说明 coarse schedule 可以恢复大部分收益。**
+   - 这支持“support-matched update scale”是主轴；
+   - 也说明不应把全部收益归因为 step-level 精细控制。
 
-- `core_final_avg`, `core_best_avg`, `core_best_step`, `core_drop`
+3. **B 仍高于 D3，保留 residual state-dependent value 的证据。**
+   - 但该 residual 的主要载体更可能是低频状态分配，而不是单步 sign 决策。
 
-**解释重点**：`core_drop` 比 `best` 更能反映后期控制质量。
+4. **4.30 的价值定位：**
+   - 不是重做 B vs D3 结论；
+   - 而是在 B-family 内继续回答“低频化后，controller 的稳定性与可解释性是否提升”。
 
-## 4.2 控制层：判断“怎么做到的”
+因此，4.30 与 4.27/4.28 不冲突，而是对同一主线的下一层验证：  
+`mean-scale` confound 与 `schedule` confound 已基本清理后，继续清理 `alpha bandwidth` confound。
 
-alpha 轨迹：
+## 10) Claim Boundary（建议写入论文/汇报）
 
-- `alpha_mean`, `alpha_std`, `alpha_p95_p5`
-- 分段均值：`alpha_early(21–100)`, `alpha_mid(101–200)`, `alpha_late(201–300)`
-- 高频变化：`mean|Δalpha|`, `p95|Δalpha|`, `max|Δalpha|`
+### 当前可以声明（supported）
 
-r 信号：
+- split alignment 在单步层面是弱信号，但在低频聚合后可作为有信息的状态代理。
+- `alpharlim0.05` 在 4.30 组内给出最干净的稳定性改进信号（最小 late regression + 较高 final）。
+- `slowema_ret0.95` 当前存在明显 scale confound，不能单独支持“低频平滑本身带来收益”的因果结论。
+- 现阶段更稳妥叙事应是：  
+  **signal-fraction 主要在发现/跟踪 support-matched update-scale；低频控制用于提高该过程的稳健性。**
 
-- `r_hat_raw_mean`, `r_hat_raw_pos_mean`, `r_hat_raw_neg_ratio`
-- `g_dot_positive`
-- `valid_ratio`, `invalid_ratio`, `valid_count`
+### 当前不能声明（unsupported）
 
-Window 专属（W5/W10）：
+- “slow EMA 优于 alpharlim0.05（因果上）”；
+- “combined 方案更保守因此更稳定”；
+- “ret0.98 只是更保守所以差”；
+- “4.30 已经证明 temporal aggregation 显著优于 B-current”。
 
-- `r_window_mean/std/IQR`
-- `r_window_early/mid/late`
-- `r_window_effective_size`
-- `r_window_empty_ratio`
-- `r_window_update_freq`
+## 11) 下一轮实验的判定门槛（避免重复无效算力）
 
-Rate-limit 专属：
+### A. `alpharlim0.05` 多 seed（Priority 1）
 
-- `rate_limit_trigger_ratio`
-- `upward_clip_ratio`, `downward_clip_ratio`
-- `alpha_raw_mean`, `alpha_limited_mean`
-- `mean_abs_clip`
+最低门槛（建议）：
 
-## 4.3 稳定性层：判断“代价与风险”
+- 3 seed 下 `core_final` 平均不低于 B-current；
+- `final-best` 持续优于 B-current（late regression 更小）；
+- `mean|Δalpha|` 稳定低于 B-current；
+- 不出现显著 entropy/kl 异常漂移。
 
-- KL：`mean/p95/max/late_mean/late_p95`
-- grad norm：`mean/p95/max/late_mean/late_p95`
-- PPO 相关：`ratio_mean/std`, `clipfrac`, `approx_kl`
-- 状态变量：`entropy early/mid/late/final`, `response_len early/mid/late/final/std`
+若满足，`alpharlim` 可进入“默认低频稳态控制候选”。
 
-**关键判断**：如果 final 接近但某方法 KL/grad tail 明显更低，优先该方法做默认候选。
+### B. `slowema_ret0.95` scale-matched rerun（Priority 2）
 
----
+先把 mean alpha 调回 B-current 区间（约 `3.1e-6 ~ 3.4e-6`）再比较。  
+判定重点：
 
-## 5. 对照设计与主表模板（可直接复用）
+- 若 scale-matched 后仍优于 B/alpharlim，才可支持“低频平滑有独立增益”；
+- 若优势消失，当前 slow EMA 收益主要来自 scale 而非 smoothing 机制。
 
-## 5.1 最小对照集合（每个新方法必须同表）
+### C. W5/W10 windowed-r（Priority 3）
 
-- B-current
-- D3
-- C310
-- S（shuffled）
-- M（matched mean-alpha constant）
+解释矩阵沿用 `PROJECT_STATUS.md`：
 
-## 5.2 主表（建议）
+- W5/W10 > B：当前 B 对单步噪声反应过强，temporal aggregation 有效；
+- W5 ~= B, W10 < B：中等低通有效，过强低通损失适应性；
+- W5/W10 < B：现有 B 平滑已足够或 window 过阻尼；
+- W10 ~= D3：长窗近似 coarse schedule，state-dependent residual 变弱。
 
-| method | core_final | core_best | core_drop | alpha_mean | alpha_late | mean\|Δalpha\| | KL_p95_late | entropy_final |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
+## 12) 分析流程约束（方法学）
 
-## 5.3 补充表（window/rate-limit）
+结合项目历史 bug 与协作规范，后续报告建议固定如下顺序：
 
-| method | g_dot_pos | r_valid_ratio | r_floor_ratio | r_window_empty | limiter_trigger | mean_abs_clip |
-|---|---:|---:|---:|---:|---:|---:|
+1. **先机制再分数**：先看 `alpha_t/r_hat/r_ctrl/g_dot_positive`，再看 val-core。
+2. **先核对执行再解释机制**：特别是 replay/window/limiter 配置后，先确认日志行为符合预期。
+3. **一次只比较一个自由度**：避免把 scale、bandwidth、gate 变化混在一个结论里。
+4. **区分“更稳定”与“更保守”**：如果 mean alpha 显著变小，应优先视为保守化，而非直接归因于控制质量提升。
 
----
+## 13) 面向后续写作的标准英文段落（可复用）
 
-## 6. 判读矩阵（实验结果出来后按此落结论）
+`The 4.30 batch should be interpreted as a bandwidth-control ablation within the signal-fraction family, not as a standalone proof of causal superiority for any single variant.`
 
-1. **W5/W10 > B-current 且 drop 更小**  
-   → 低频聚合有效，进入多 seed。  
+`Among the four runs, alpharlim0.05 provides the cleanest stability evidence (near-best final core with the smallest late regression) under a relatively matched alpha scale, while slowema_ret0.95 remains scale-confounded and requires a scale-matched rerun before causal attribution.`
 
-2. **W5 ≈ B，W10 < B**  
-   → 适度平滑有益，过平滑欠响应；优先 W5。  
-
-3. **W5/W10 ≈ D3**  
-   → 退化为 coarse schedule，stage 内信息利用不足。  
-
-4. **W5/W10 < C310 或 S**  
-   → 控制失败，优先排查 `valid稀疏 / empty fallback / floor贴底 / late alpha过低`。  
-
-5. **alpharlim 稳定性更好但 final 下降**  
-   → 方向正确但阈值过紧；先放宽 limit 再否定机制。  
-
----
-
-## 7. 决策门槛（Go / No-Go）
-
-为避免“看起来差不多”，建议固定门槛：
-
-- **Go-1（强通过）**：`core_final > B` 且 `core_drop` 更小。  
-- **Go-2（稳健通过）**：`core_final ≈ B`（差异在噪声内）但 `mean|Δalpha|` 与 KL/grad tail 显著更低。  
-- **Conditional**：`B > new > D3`，说明有信号但过平滑，进入小网格调参。  
-- **No-Go**：`new ≤ D3` 或显著低于 C310/S，暂停主线推进。
-
----
-
-## 8. 下一轮执行清单（可直接给实验同学）
-
-1. 跑完：`W5`, `W10`, `ret0.95`, `ret0.98`, `alpharlim0.05`（必要时加 `ret0.95+alpharlim0.05`）。
-2. 每个 run 导出统一 CSV：性能层 / 控制层 / 稳定性层全字段。
-3. 先做单 seed 判读矩阵，再决定多 seed 扩展（建议优先 top-2）。
-4. 若 window 方法退化，先调 `W` 和 floor，再考虑复杂控制器（不要直接跳到多参数混合策略）。
-
----
-
-## 9. 总结（一句话版本）
-
-截至 2026-04-30，主结论不是“找到了更准的单步信号”，而是：
-
-> 已确认 B-current 的收益包含真实状态对齐成分；
-> 4.30 的关键是把弱单步信号变成可用低频控制，
-> 并用“性能 + 轨迹 + tail 稳定性”三层指标证明其增益可复现、可解释、可扩展。
+`Together with prior C310/S/D3 controls, the current evidence supports a conservative claim: signal-fraction's primary benefit is support-matched update-scale tracking, and low-frequency control is a mechanism to improve robustness of that allocation under noisy split alignment.`

@@ -18,6 +18,7 @@ A unified tracking interface that supports logging data to different backend
 import dataclasses
 import json
 import logging
+import numbers
 import os
 import time
 from enum import Enum
@@ -182,7 +183,14 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                backend_data = data
+                if default_backend == "swanlab":
+                    backend_data = {
+                        key: value
+                        for key, value in data.items()
+                        if isinstance(value, numbers.Number) or dataclasses.is_dataclass(value)
+                    }
+                logger_instance.log(data=backend_data, step=step)
 
     def __del__(self):
         if "wandb" in self.logger:
