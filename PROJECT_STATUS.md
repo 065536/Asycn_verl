@@ -1,6 +1,34 @@
 # Project Status
 
-**Last updated**: 2026-05-06 (W10 multi-seed readout)
+**Last updated**: 2026-05-12 (ratio_of_sums multi-seed launch plan)
+
+## 2026-05-12 Progress Update
+
+Today we prepared the next multi-seed controller batch using the new
+`ratio_of_sums` r-window estimator mode.
+
+What changed in code/config:
+
+- `signal_fraction_r_window_mode` now supports `ratio_of_sums` in optimizer config validation.
+- signal-fraction scheduler can consume explicit window numerator/denominator
+  streams and compute `r_window = sum(num) / sum(den)` over the rolling window.
+- both DP actor and new engine path now pass `denom` as numerator and `g_dot`
+  as denominator into the scheduler for this mode.
+
+Planned runs for today (multi-seed, W=10):
+
+```bash
+RESUME_MODE=disable SEED=0  SIGFRAC_RUN_SUFFIX="_ratio_of_sums_w10_seed0"  SIGFRAC_R_WINDOW_SIZE=10 SIGFRAC_R_WINDOW_MODE="ratio_of_sums" bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+RESUME_MODE=disable SEED=1  SIGFRAC_RUN_SUFFIX="_ratio_of_sums_w10_seed1"  SIGFRAC_R_WINDOW_SIZE=10 SIGFRAC_R_WINDOW_MODE="ratio_of_sums" bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+RESUME_MODE=disable SEED=42 SIGFRAC_RUN_SUFFIX="_ratio_of_sums_w10_seed42" SIGFRAC_R_WINDOW_SIZE=10 SIGFRAC_R_WINDOW_MODE="ratio_of_sums" bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+RESUME_MODE=disable SEED=2  SIGFRAC_RUN_SUFFIX="_ratio_of_sums_w10_seed2"  SIGFRAC_R_WINDOW_SIZE=10 SIGFRAC_R_WINDOW_MODE="ratio_of_sums" bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+```
+
+Readout focus remains unchanged:
+
+- peak score (`best avg5`)
+- final stability (`final avg5`, `final-best`)
+- seed variance and late-drop risk vs current B and previous W10 baseline.
 
 ## Current Focus
 
