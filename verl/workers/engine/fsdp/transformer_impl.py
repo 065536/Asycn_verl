@@ -300,7 +300,7 @@ class SignalFractionLRScheduler:
         self.alpha_rate_limit = max(0.0, float(alpha_rate_limit or 0.0))
         self.r_window_size = max(0, int(r_window_size or 0))
         self.r_window_mode = r_window_mode or "off"
-        if self.r_window_mode not in ("off", "replace_ema"):
+        if self.r_window_mode not in ("off", "replace_ema", "ratio_of_sums"):
             raise ValueError(f"unsupported signal_fraction r_window_mode: {self.r_window_mode}")
         self.r_window_enabled = self.r_window_size > 0 and self.r_window_mode != "off"
         self.r_window_invalid_value = r_window_invalid_value
@@ -310,6 +310,8 @@ class SignalFractionLRScheduler:
         # r-side: state
         self.r_ema: float = r_boot          # unified EMA (sym during warmup, asym after)
         self.r_window: list[float] = []
+        self.r_window_num: list[float] = []
+        self.r_window_den: list[float] = []
         self.g_rms_ema: float = None        # bootstrapped on first valid step
         self._handoff_done: bool = False    # True once warmup has ended
         self._handoff_step: int = 0         # steps completed since handoff
@@ -538,6 +540,8 @@ class SignalFractionLRScheduler:
         d_t: float,
         g_rms_t: float,
         r_hat_raw: float,
+        r_window_num: Optional[float] = None,
+        r_window_den: Optional[float] = None,
     ) -> float:
         """Process the raw r̂_t estimate, update EMA, and set optimizer LR.
 
@@ -599,13 +603,29 @@ class SignalFractionLRScheduler:
                 self._cooldown_counter = self.cooldown_steps
             self._update_r_ema_post(r_obs)
             if self.r_window_enabled:
-                self.r_window.append(float(r_obs))
+                if self.r_window_mode == "ratio_of_sums":
+                    self.r_window_num.append(float(d_t if r_window_num is None else r_window_num))
+                    self.r_window_den.append(float(g_dot if r_window_den is None else r_window_den))
+                    if len(self.r_window_num) > self.r_window_size:
+                        self.r_window_num = self.r_window_num[-self.r_window_size :]
+                    if len(self.r_window_den) > self.r_window_size:
+                        self.r_window_den = self.r_window_den[-self.r_window_size :]
+                else:
+                    self.r_window.append(float(r_obs))
+                    if len(self.r_window) > self.r_window_size:
+                        self.r_window = self.r_window[-self.r_window_size :]
+        elif self.r_window_enabled and self.r_window_invalid_value is not None:
+            if self.r_window_mode == "ratio_of_sums":
+                self.r_window_num.append(float(self.r_window_invalid_value))
+                self.r_window_den.append(1.0)
+                if len(self.r_window_num) > self.r_window_size:
+                    self.r_window_num = self.r_window_num[-self.r_window_size :]
+                if len(self.r_window_den) > self.r_window_size:
+                    self.r_window_den = self.r_window_den[-self.r_window_size :]
+            else:
+                self.r_window.append(float(self.r_window_invalid_value))
                 if len(self.r_window) > self.r_window_size:
                     self.r_window = self.r_window[-self.r_window_size :]
-        elif self.r_window_enabled and self.r_window_invalid_value is not None:
-            self.r_window.append(float(self.r_window_invalid_value))
-            if len(self.r_window) > self.r_window_size:
-                self.r_window = self.r_window[-self.r_window_size :]
         # (if invalid, r̄ is held; cooldown state is unchanged)
 
         # ---- compute r_t_ctrl ----
@@ -616,12 +636,15 @@ class SignalFractionLRScheduler:
             else:
                 r_ctrl = self.sign_gate_gamma * self._sign_gate_r_ref
         elif self.r_window_enabled:
-            if self.r_window:
+            if self.r_window_mode == "ratio_of_sums" and self.r_window_num and self.r_window_den:
+                r_window = float(sum(self.r_window_num) / max(sum(self.r_window_den), 1e-12))
+                self._last_r_window_count = float(min(len(self.r_window_num), len(self.r_window_den)))
+            elif self.r_window:
                 r_window = float(sum(self.r_window) / len(self.r_window))
+                self._last_r_window_count = float(len(self.r_window))
             else:
                 r_window = float(self._last_r_ctrl)
             self._last_r_window = r_window
-            self._last_r_window_count = len(self.r_window)
             r_ctrl = float(max(r_window, self.r_min_ctrl))
         elif fast_drop_triggered and valid:
             # Immediate response: bypass EMA, use raw obs directly
@@ -750,6 +773,8 @@ class SignalFractionLRScheduler:
             "phi_bar": self.phi_bar,
             "r_ema": self.r_ema,
             "r_window": self.r_window,
+            "r_window_num": self.r_window_num,
+            "r_window_den": self.r_window_den,
             "g_rms_ema": self.g_rms_ema,
             "_handoff_done": self._handoff_done,
             "_handoff_step": self._handoff_step,
@@ -778,8 +803,14 @@ class SignalFractionLRScheduler:
         self.phi_bar = state_dict["phi_bar"]
         self.r_ema = state_dict.get("r_ema", self.r_boot)
         self.r_window = list(state_dict.get("r_window", []))
+        self.r_window_num = list(state_dict.get("r_window_num", []))
+        self.r_window_den = list(state_dict.get("r_window_den", []))
         if self.r_window_size > 0 and len(self.r_window) > self.r_window_size:
             self.r_window = self.r_window[-self.r_window_size :]
+        if self.r_window_size > 0 and len(self.r_window_num) > self.r_window_size:
+            self.r_window_num = self.r_window_num[-self.r_window_size :]
+        if self.r_window_size > 0 and len(self.r_window_den) > self.r_window_size:
+            self.r_window_den = self.r_window_den[-self.r_window_size :]
         self.g_rms_ema = state_dict.get("g_rms_ema", None)
         self._handoff_done = state_dict.get("_handoff_done", False)
         self._handoff_step = state_dict.get("_handoff_step", 0)
@@ -1454,7 +1485,14 @@ class FSDPEngine(BaseEngine):
         output_a2 = self.forward_backward_batch(data_a2, loss_function, forward_only=False)
         g_dot, g_a1_norm_sq, g_a2_norm_sq, denom, r_hat_raw, g_rms = self._signal_fraction_grad_stats(grad_a1, params)
 
-        alpha_t = self.lr_scheduler.update_r_and_set_lr(g_dot, denom, g_rms, r_hat_raw)
+        alpha_t = self.lr_scheduler.update_r_and_set_lr(
+            g_dot,
+            denom,
+            g_rms,
+            r_hat_raw,
+            r_window_num=denom,
+            r_window_den=g_dot,
+        )
         grad_norm = self.optimizer_step()
 
         outputs = {

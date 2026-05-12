@@ -160,9 +160,10 @@ class FSDPOptimizerConfig(OptimizerConfig):
     # 0.05 means alpha_t is clipped to [0.95, 1.05] * previous alpha.
     # Non-positive disables the limiter.
     signal_fraction_alpha_rate_limit: float = 0.0
-    # Optional windowed continuous-r controller. When mode is "replace_ema",
-    # r_ctrl is driven by the mean of the latest W valid r observations instead
-    # of the per-step EMA/fast-drop path. 0/off keeps the original controller.
+    # Optional windowed continuous-r controller.
+    # - "replace_ema": r_ctrl uses the mean of latest W valid r observations.
+    # - "ratio_of_sums": r_ctrl uses (sum numerator)/(sum denominator) over W.
+    # 0/off keeps the original controller.
     signal_fraction_r_window_size: int = 0
     signal_fraction_r_window_mode: str = "off"
     # Optional value to append to the r-window when the current r observation is
@@ -201,7 +202,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
             self.lr_scheduler_type = self.warmup_style
         assert self.lr_scheduler_type in ["constant", "cosine", "entropy_adaptive", "signal_fraction"]
         assert self.entropy_adaptive_reference_mode in ["ema", "initial"]
-        assert self.signal_fraction_r_window_mode in ["off", "replace_ema"]
+        assert self.signal_fraction_r_window_mode in ["off", "replace_ema", "ratio_of_sums"]
         return super().__post_init__()
 
 

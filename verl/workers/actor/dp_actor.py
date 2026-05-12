@@ -763,7 +763,14 @@ class DataParallelPPOActor(BasePPOActor):
         # ================================================================== #
         sched = getattr(self, "actor_lr_scheduler", None)
         if sched is not None:
-            alpha_t = sched.update_r_and_set_lr(g_dot, denom, g_rms_t, r_hat_raw)
+            alpha_t = sched.update_r_and_set_lr(
+                g_dot,
+                denom,
+                g_rms_t,
+                r_hat_raw,
+                r_window_num=denom,
+                r_window_den=g_dot,
+            )
         else:
             alpha_t = self.actor_optimizer.param_groups[0]["lr"]
 
