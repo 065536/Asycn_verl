@@ -30,6 +30,8 @@ VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN:-True}
 VAL_N=${VAL_N:-16}
 TEST_FREQ=${TEST_FREQ:-10}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-10}
+RAY_DEBUG_MONITOR=${RAY_DEBUG_MONITOR:-0}
+RAY_NUM_CPUS=${RAY_NUM_CPUS:-$(nproc)}
 
 # Resume training configuration
 RESUME_MODE=${RESUME_MODE:-"disable"}  # Options: "auto", "resume_path", "disable"
@@ -67,7 +69,9 @@ fi
 
 LOG_DIR=${VERL_ROOT}/logs
 LOG_FILE="${LOG_DIR}/${SIGFRAC_LOG_NAME}_${TIMESTAMP}.log"
+RAY_LOG_DIR="${LOG_DIR}/ray/${SIGFRAC_LOG_NAME}_${TIMESTAMP}"
 mkdir -p "$CKPTS_DIR" "$LOG_DIR"
+mkdir -p "$RAY_LOG_DIR"
 
 if [ -n "${MASTER_ADDR:-}" ]; then HN="$MASTER_ADDR"; elif [ -n "${NODE_0_IP:-}" ]; then HN="$NODE_0_IP"; else HN="$(hostname -I | awk '{print $1}')"; fi
 HEAD_IP="$(getent hosts "$HN" | awk '{print $1}' | head -1)"
@@ -100,14 +104,17 @@ echo "Signal fraction EMA betas: sym=${SIGFRAC_R_EMA_BETA_SYM}, down=${SIGFRAC_R
 echo "Signal fraction alpha rate limit: ${SIGFRAC_ALPHA_RATE_LIMIT}"
 echo "Signal fraction r-window: size=${SIGFRAC_R_WINDOW_SIZE}, mode=${SIGFRAC_R_WINDOW_MODE}, invalid_value=${SIGFRAC_R_WINDOW_INVALID_VALUE}"
 echo "Validation: val_before_train=${VAL_BEFORE_TRAIN}, val_n=${VAL_N}, test_freq=${TEST_FREQ}, log_val_generations=${LOG_VAL_GENERATIONS}"
+echo "Ray debug monitor: ${RAY_DEBUG_MONITOR}, Ray num cpus: ${RAY_NUM_CPUS}"
+echo "Ray log dir: ${RAY_LOG_DIR}"
 
 RAY=/data/250010176/yrh/miniconda3/envs/verl2/bin/ray
+export RAY_TMPDIR="${RAY_LOG_DIR}"
 $RAY stop -f || true
 pkill -f redis-server || true
-rm -rf /tmp/ray || true
+rm -rf "${RAY_LOG_DIR}"/* || true
 
 if [ "$IS_HEAD" = "1" ]; then
-  $RAY start --head --node-ip-address="$HEAD_IP" --port=6379 --dashboard-port=8265 --num-cpus=$(nproc)
+  $RAY start --head --temp-dir="${RAY_LOG_DIR}" --node-ip-address="$HEAD_IP" --port=6379 --dashboard-port=8265 --num-cpus="${RAY_NUM_CPUS}"
   ready=0
   for i in $(seq 1 30); do
     if $RAY status >/dev/null 2>&1; then ready=1; break; fi
@@ -118,6 +125,26 @@ if [ "$IS_HEAD" = "1" ]; then
     exit 1
   fi
   export RAY_ADDRESS="$HEAD_IP:6379"
+
+  RAY_MONITOR_PID=""
+  if [ "${RAY_DEBUG_MONITOR}" = "1" ]; then
+    (
+      while true; do
+        echo "[ray-monitor] $(date -Is) ===== ray status ====="
+        $RAY status || true
+        sleep 60
+      done
+    ) >>"$LOG_FILE" 2>&1 &
+    RAY_MONITOR_PID=$!
+    echo "Started ray monitor pid=${RAY_MONITOR_PID}"
+  fi
+
+  cleanup_ray_debug() {
+    if [ -n "${RAY_MONITOR_PID}" ]; then
+      kill "${RAY_MONITOR_PID}" >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup_ray_debug EXIT
 
   python3 -m verl.trainer.main_ppo \
     data.train_files="${TRAIN_FILE}" \
@@ -222,12 +249,25 @@ if [ "$IS_HEAD" = "1" ]; then
     trainer.max_critic_ckpt_to_keep=${MAX_CRITIC_CKPT_TO_KEEP:-2} \
     trainer.log_val_generations=${LOG_VAL_GENERATIONS} \
     2>&1 | tee -a "$LOG_FILE"
+  train_exit_code=${PIPESTATUS[0]}
+
+  if [ "${train_exit_code}" -ne 0 ] && [ "${RAY_DEBUG_MONITOR}" = "1" ]; then
+    echo "Training failed with exit code ${train_exit_code}. Dumping Ray logs..." | tee -a "$LOG_FILE"
+    ls -lt "${RAY_LOG_DIR}/session_latest/logs" | head -n 50 | tee -a "$LOG_FILE" || true
+    tail -n 200 "${RAY_LOG_DIR}/session_latest/logs/raylet.out" | tee -a "$LOG_FILE" || true
+    tail -n 200 "${RAY_LOG_DIR}/session_latest/logs/gcs_server.out" | tee -a "$LOG_FILE" || true
+    tail -n 200 "${RAY_LOG_DIR}/session_latest/logs/monitor.log" | tee -a "$LOG_FILE" || true
+  fi
+
+  if [ "${train_exit_code}" -ne 0 ]; then
+    exit "${train_exit_code}"
+  fi
 
   echo "Training completed successfully"
   $RAY stop || true
   exit 0
 else
-  $RAY start --address="$HEAD_IP:6379" --num-cpus=$(nproc)
+  $RAY start --address="$HEAD_IP:6379" --temp-dir="${RAY_LOG_DIR}" --num-cpus="${RAY_NUM_CPUS}"
   echo "Worker joined cluster"
   while $RAY status >/dev/null 2>&1; do sleep 10; done
   echo "Ray cluster stopped, worker exiting"
