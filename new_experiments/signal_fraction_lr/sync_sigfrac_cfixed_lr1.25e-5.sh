@@ -32,6 +32,10 @@ TEST_FREQ=${TEST_FREQ:-10}
 LOG_VAL_GENERATIONS=${LOG_VAL_GENERATIONS:-10}
 RAY_DEBUG_MONITOR=${RAY_DEBUG_MONITOR:-0}
 RAY_NUM_CPUS=${RAY_NUM_CPUS:-$(nproc)}
+RAY_BASE_DIR=${RAY_BASE_DIR:-/tmp/ray}
+RAY_RUN_ID=${RAY_RUN_ID:-$(date +"%m%d%H%M%S")}
+# Set to 1 when actively debugging Ray internals.
+RAY_VERBOSE_LOGS=${RAY_VERBOSE_LOGS:-0}
 
 # Resume training configuration
 RESUME_MODE=${RESUME_MODE:-"disable"}  # Options: "auto", "resume_path", "disable"
@@ -70,8 +74,14 @@ fi
 LOG_DIR=${VERL_ROOT}/logs
 LOG_FILE="${LOG_DIR}/${SIGFRAC_LOG_NAME}_${TIMESTAMP}.log"
 RAY_LOG_DIR="${LOG_DIR}/ray/${SIGFRAC_LOG_NAME}_${TIMESTAMP}"
+# Keep Ray temp dir short to avoid AF_UNIX path length limit (107 bytes).
+RAY_TEMP_DIR="${RAY_BASE_DIR}/r_${RAY_RUN_ID}"
+if [ "${#RAY_TEMP_DIR}" -gt 35 ]; then
+  echo "RAY temp dir base is too long, fallback to /tmp/ray to avoid socket path overflow"
+  RAY_TEMP_DIR="/tmp/ray/r_${RAY_RUN_ID}"
+fi
 mkdir -p "$CKPTS_DIR" "$LOG_DIR"
-mkdir -p "$RAY_LOG_DIR"
+mkdir -p "$RAY_LOG_DIR" "$RAY_TEMP_DIR"
 
 if [ -n "${MASTER_ADDR:-}" ]; then HN="$MASTER_ADDR"; elif [ -n "${NODE_0_IP:-}" ]; then HN="$NODE_0_IP"; else HN="$(hostname -I | awk '{print $1}')"; fi
 HEAD_IP="$(getent hosts "$HN" | awk '{print $1}' | head -1)"
@@ -81,6 +91,14 @@ source /data/250010176/yrh/miniconda3/etc/profile.d/conda.sh
 conda activate verl2
 cd "${VERL_ROOT}/.."
 export PYTHONPATH="${VERL_ROOT}/..:${PYTHONPATH:-}"
+
+if [ "${RAY_VERBOSE_LOGS}" != "1" ]; then
+  # Avoid inheriting noisy debug env vars from previous shell sessions.
+  unset RAY_BACKEND_LOG_LEVEL
+  unset RAY_LOG_TO_STDERR
+  unset RAY_LOG_TO_STDOUT
+  export RAY_DEDUP_LOGS=1
+fi
 
 # Data: 17k-sampled train, DeepScaler test sets (same as 32b)
 DEEPSCALER_DIR=/data/250010176/dataset/deepscaler
@@ -105,16 +123,31 @@ echo "Signal fraction alpha rate limit: ${SIGFRAC_ALPHA_RATE_LIMIT}"
 echo "Signal fraction r-window: size=${SIGFRAC_R_WINDOW_SIZE}, mode=${SIGFRAC_R_WINDOW_MODE}, invalid_value=${SIGFRAC_R_WINDOW_INVALID_VALUE}"
 echo "Validation: val_before_train=${VAL_BEFORE_TRAIN}, val_n=${VAL_N}, test_freq=${TEST_FREQ}, log_val_generations=${LOG_VAL_GENERATIONS}"
 echo "Ray debug monitor: ${RAY_DEBUG_MONITOR}, Ray num cpus: ${RAY_NUM_CPUS}"
+echo "Ray verbose logs: ${RAY_VERBOSE_LOGS}"
 echo "Ray log dir: ${RAY_LOG_DIR}"
+echo "Ray temp dir: ${RAY_TEMP_DIR}"
 
 RAY=/data/250010176/yrh/miniconda3/envs/verl2/bin/ray
-export RAY_TMPDIR="${RAY_LOG_DIR}"
+export RAY_TMPDIR="${RAY_TEMP_DIR}"
 $RAY stop -f || true
 pkill -f redis-server || true
-rm -rf "${RAY_LOG_DIR}"/* || true
+rm -rf "${RAY_TEMP_DIR}"/* || true
+
+dump_ray_start_logs() {
+  echo "Ray startup diagnostics from ${RAY_TEMP_DIR}/session_latest/logs"
+  ls -lt "${RAY_TEMP_DIR}/session_latest/logs" | head -n 80 || true
+  tail -n 300 "${RAY_TEMP_DIR}/session_latest/logs/gcs_server.out" || true
+  tail -n 300 "${RAY_TEMP_DIR}/session_latest/logs/raylet.out" || true
+  tail -n 300 "${RAY_TEMP_DIR}/session_latest/logs/monitor.log" || true
+  tail -n 300 "${RAY_TEMP_DIR}/session_latest/logs/dashboard.log" || true
+}
 
 if [ "$IS_HEAD" = "1" ]; then
-  $RAY start --head --temp-dir="${RAY_LOG_DIR}" --node-ip-address="$HEAD_IP" --port=6379 --dashboard-port=8265 --num-cpus="${RAY_NUM_CPUS}"
+  if ! $RAY start --head --temp-dir="${RAY_TEMP_DIR}" --node-ip-address="$HEAD_IP" --port=6379 --dashboard-port=8265 --num-cpus="${RAY_NUM_CPUS}"; then
+    echo "Ray head process failed during start command"
+    dump_ray_start_logs
+    exit 1
+  fi
   ready=0
   for i in $(seq 1 30); do
     if $RAY status >/dev/null 2>&1; then ready=1; break; fi
@@ -122,6 +155,7 @@ if [ "$IS_HEAD" = "1" ]; then
   done
   if [ "$ready" -ne 1 ]; then
     echo "Ray head failed to start"
+    dump_ray_start_logs
     exit 1
   fi
   export RAY_ADDRESS="$HEAD_IP:6379"
@@ -253,10 +287,10 @@ if [ "$IS_HEAD" = "1" ]; then
 
   if [ "${train_exit_code}" -ne 0 ] && [ "${RAY_DEBUG_MONITOR}" = "1" ]; then
     echo "Training failed with exit code ${train_exit_code}. Dumping Ray logs..." | tee -a "$LOG_FILE"
-    ls -lt "${RAY_LOG_DIR}/session_latest/logs" | head -n 50 | tee -a "$LOG_FILE" || true
-    tail -n 200 "${RAY_LOG_DIR}/session_latest/logs/raylet.out" | tee -a "$LOG_FILE" || true
-    tail -n 200 "${RAY_LOG_DIR}/session_latest/logs/gcs_server.out" | tee -a "$LOG_FILE" || true
-    tail -n 200 "${RAY_LOG_DIR}/session_latest/logs/monitor.log" | tee -a "$LOG_FILE" || true
+    ls -lt "${RAY_TEMP_DIR}/session_latest/logs" | head -n 50 | tee -a "$LOG_FILE" || true
+    tail -n 200 "${RAY_TEMP_DIR}/session_latest/logs/raylet.out" | tee -a "$LOG_FILE" || true
+    tail -n 200 "${RAY_TEMP_DIR}/session_latest/logs/gcs_server.out" | tee -a "$LOG_FILE" || true
+    tail -n 200 "${RAY_TEMP_DIR}/session_latest/logs/monitor.log" | tee -a "$LOG_FILE" || true
   fi
 
   if [ "${train_exit_code}" -ne 0 ]; then
@@ -267,7 +301,7 @@ if [ "$IS_HEAD" = "1" ]; then
   $RAY stop || true
   exit 0
 else
-  $RAY start --address="$HEAD_IP:6379" --temp-dir="${RAY_LOG_DIR}" --num-cpus="${RAY_NUM_CPUS}"
+  $RAY start --address="$HEAD_IP:6379" --temp-dir="${RAY_TEMP_DIR}" --num-cpus="${RAY_NUM_CPUS}"
   echo "Worker joined cluster"
   while $RAY status >/dev/null 2>&1; do sleep 10; done
   echo "Ray cluster stopped, worker exiting"
