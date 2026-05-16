@@ -1,10 +1,46 @@
 ---
 name: Algorithm Design — Current Framework and Open Questions
-description: entadapt_initial 缺陷 + α_t=c_t·r̂_t 框架 + 4.21 诊断：c_t dead → p_min guard 删除；guard 设计原则确立
+description: entadapt_initial 缺陷 + α_t=c_t·r̂_t 框架 + 5.15 ratio_of_sums W10 结果：不如 B-current 和 replace_ema，方向关闭
 type: project
 ---
 
-## 2026-05-06 W10 readout: promising but not settled
+## 2026-05-15 ratio_of_sums W10 rerun: underperforms B-current and replace_ema
+
+Bug 17 修复后重跑 3 seed（seed42 失败为空文件）。机制确认正常工作（r_window ∈ [0.014, 0.037]，
+window count 稳定 10，r_window_enabled=1 全程），但**性能低于 B-current 和 W10 replace_ema**。
+
+### Results
+
+| method | seeds | mean best | mean final | mean drop |
+|---|---:|---:|---:|---:|
+| B-current | 3 | 0.3466 | **0.3440** | -0.0023 |
+| W10 replace_ema | 3 | 0.3513 | 0.3413 | -0.0101 |
+| **ratio_of_sums W10** | 3 | 0.3393 | 0.3345 | -0.0048 |
+
+ratio_of_sums 比 B 低 0.0095，比 replace_ema 低 0.0068。
+
+### Why it failed to help
+
+1. **r_hat_raw ≈ 0 post-warmup**: pooling 10 steps of cross-power/auto-power
+   did not rescue the numerator from noise. Phase means are O(1e-4).
+2. **g_dot_positive ≈ 50%**: no improvement over other methods.
+3. **alpha_t scale too high**: post-warmup mean ~4.6e-6 vs B's ~3.1e-6.
+   ratio_of_sums produces systematically higher r_window → inflated LR.
+4. PPO stability was fine (KL ~3.8e-4, ratio_p95 ~1.03), so the issue is
+   controller quality, not training instability.
+
+### Decision
+
+ratio_of_sums W10 方向关闭。replace_ema 仍是 temporal aggregation family 中的
+最佳变体。详细分析：`exp_data/5.15_ratio_of_sums_w10_rerun.md`。
+
+## 2026-05-14 ratio_of_sums W10: implementation bug invalidates all runs (RESOLVED)
+
+Bug 17: call site passed `r_window_num=denom` and `r_window_den=g_dot`, inverting
+the fraction. All four original seed runs were destroyed. Fixed by single swap.
+Reruns completed 2026-05-15 — see results above.
+
+
 
 The 1.5B multi-seed follow-up changed the controller priority:
 

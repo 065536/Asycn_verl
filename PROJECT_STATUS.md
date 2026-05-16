@@ -1,34 +1,150 @@
 # Project Status
 
-**Last updated**: 2026-05-12 (ratio_of_sums multi-seed launch plan)
+**Last updated**: 2026-05-15 (ratio_of_sums W10 rerun results after Bug 17 fix)
 
-## 2026-05-12 Progress Update
+## 2026-05-15 ratio_of_sums W10 Rerun Results (Post Bug-17 Fix)
 
-Today we prepared the next multi-seed controller batch using the new
-`ratio_of_sums` r-window estimator mode.
+### Run status
 
-What changed in code/config:
+Four seeds relaunched after Bug 17 fix. Three completed, one failed:
 
-- `signal_fraction_r_window_mode` now supports `ratio_of_sums` in optimizer config validation.
-- signal-fraction scheduler can consume explicit window numerator/denominator
-  streams and compute `r_window = sum(num) / sum(den)` over the rolling window.
-- both DP actor and new engine path now pass `denom` as numerator and `g_dot`
-  as denominator into the scheduler for this mode.
+| seed | status | steps | file size |
+|---:|---|---:|---|
+| 0 | ✅ complete | 0-300 | 3.8 MB |
+| 1 | ✅ complete | 0-300 | 3.8 MB |
+| 2 | ✅ complete | 0-300 | 3.8 MB |
+| 42 | ❌ failed | 0 (empty file) | 0 bytes |
 
-Planned runs for today (multi-seed, W=10):
+seed42 JSONL is empty — the run either never started or crashed before writing
+any metrics. Needs investigation or relaunch.
 
-```bash
-RESUME_MODE=disable SEED=0  SIGFRAC_RUN_SUFFIX="_ratio_of_sums_w10_seed0"  SIGFRAC_R_WINDOW_SIZE=10 SIGFRAC_R_WINDOW_MODE="ratio_of_sums" bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
-RESUME_MODE=disable SEED=1  SIGFRAC_RUN_SUFFIX="_ratio_of_sums_w10_seed1"  SIGFRAC_R_WINDOW_SIZE=10 SIGFRAC_R_WINDOW_MODE="ratio_of_sums" bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
-RESUME_MODE=disable SEED=42 SIGFRAC_RUN_SUFFIX="_ratio_of_sums_w10_seed42" SIGFRAC_R_WINDOW_SIZE=10 SIGFRAC_R_WINDOW_MODE="ratio_of_sums" bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
-RESUME_MODE=disable SEED=2  SIGFRAC_RUN_SUFFIX="_ratio_of_sums_w10_seed2"  SIGFRAC_R_WINDOW_SIZE=10 SIGFRAC_R_WINDOW_MODE="ratio_of_sums" bash new_experiments/signal_fraction_lr/sync_sigfrac_cfixed_lr1.25e-5.sh
+### Mechanism sanity check (PASSED)
+
+- `actor/r_window_enabled` = 1.0 throughout (ratio_of_sums mode active)
+- `actor/r_window_count` stabilizes at 10 by mid-training (window fully filled)
+- `actor/r_window` ∈ [0.014, 0.037] — correct range, no longer inverted
+- `actor/c_t` = 2.5e-4 post-handoff (frozen as expected with eta_c=0)
+- `actor/alpha_t` post-warmup mean ≈ 4.6e-6, range [2.5e-6, 8.8e-6]
+
+### Core avg5 results
+
+| seed | best avg5 | @step | final avg5 | @step | drop |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.3365 | 300 | 0.3365 | 300 | +0.0000 |
+| 1 | 0.3352 | 270 | 0.3257 | 300 | -0.0095 |
+| 2 | 0.3463 | 230 | 0.3414 | 300 | -0.0049 |
+| **mean** | **0.3393** | | **0.3345** | | **-0.0048** |
+| std | 0.0049 | | 0.0065 | | 0.0039 |
+
+### Comparison with references
+
+| method | seeds | mean best avg5 | mean final avg5 | mean drop |
+|---|---:|---:|---:|---:|
+| **B-current** | 3 | **0.3466** | **0.3440** | -0.0023 |
+| W10 replace_ema | 3 | 0.3513 | 0.3413 | -0.0101 |
+| **ratio_of_sums W10** | 3 | 0.3393 | 0.3345 | -0.0048 |
+
+- ratio_of_sums vs B-current: **-0.0095** final avg5
+- ratio_of_sums vs W10 replace_ema: **-0.0068** final avg5
+- ratio_of_sums is the weakest of the three
+
+### Key diagnostic findings
+
+1. **r_hat_raw ≈ 0 in all post-warmup phases**: even after pooling 10 steps of
+   cross-power and auto-power, the signal is noise-dominated. Phase means are
+   O(1e-4) to O(1e-3), fluctuating around zero.
+
+2. **g_dot_positive ≈ 50%**: warmup 62% → late 50%. ratio_of_sums pooling did
+   not improve the sign signal reliability compared to replace_ema or B-current.
+
+3. **alpha_t scale is higher than B**: post-warmup mean ~4.6e-6 vs B's ~3.1e-6.
+   The ratio_of_sums estimator produces higher r_window values than the EMA
+   path, inflating effective LR. This may explain part of the performance gap.
+
+4. **PPO stability is fine**: KL mean ~3.8e-4, ratio_p95 ~1.03, entropy
+   declining normally (0.55→0.32), grad_norm ~0.040. No safety concern.
+
+5. **Training score improving normally**: score/mean from -0.60 to +0.12,
+   response length stable ~2600-2700. The method trains, just less effectively.
+
+### Interpretation
+
+The theoretical motivation for ratio_of_sums (Welch-style pooled estimator for
+more stable r̂_t) is valid, but empirically it **does not outperform** the
+simpler replace_ema windowed mean or even B-current's fast EMA. Possible
+explanations:
+
+- Pooling cross-power sums does not solve the fundamental problem that
+  E[ĝ_A1^T ĝ_A2] ≈ ||g||² is very small relative to noise variance when
+  r_t ≈ 0.02. The denominator pooling helps slightly, but the numerator
+  remains noise-dominated.
+- The ratio_of_sums estimator produces systematically higher r_window values
+  than per-step ratio averaging, causing alpha_t to be ~50% larger than B.
+  This excess LR may explain the performance gap.
+
+### Decision
+
+ratio_of_sums W10 does not warrant further investigation. The replace_ema
+windowed controller remains the better variant in the temporal aggregation
+family. Detailed analysis report: `exp_data/5.15_ratio_of_sums_w10_rerun.md`.
+
+---
+
+## 2026-05-14 ratio_of_sums W10: Bug 17 — numerator/denominator swapped → 4 runs destroyed
+
+### Bug 17 summary
+
+The `ratio_of_sums` r-window estimator had **numerator and denominator swapped**
+at the call site. All four ratio_of_sums W10 runs (seed 0/1/2/42) are invalid.
+
+Bug location: `verl/workers/engine/fsdp/transformer_impl.py:1493-1494`
+
+```python
+# Before (wrong):
+r_window_num=denom,   # auto-power → was treated as numerator
+r_window_den=g_dot,   # cross-power → was treated as denominator
+
+# After (fixed):
+r_window_num=g_dot,   # cross-power = Σ ĝ_A1ᵀ ĝ_A2
+r_window_den=denom,   # auto-power  = (||ĝ_A1||² + ||ĝ_A2||²) / 2
 ```
 
-Readout focus remains unchanged:
+Consequence: `r_window = sum(auto-power) / sum(cross-power)` ≈ 2–80 instead of
+the correct ∈ (0, 1]. This caused `alpha_t = c_t × r_ctrl` to explode
+100–5000× above normal, destroying the policy within the first few post-warmup
+steps.
 
-- peak score (`best avg5`)
-- final stability (`final avg5`, `final-best`)
-- seed variance and late-drop risk vs current B and previous W10 baseline.
+Fix: single swap of the two arguments. Committed 2026-05-14.
+
+### Destroyed run postmortem
+
+Four runs completed 300 steps each but produced no usable training:
+
+| seed | alpha_t (post-warmup mean) | r_window range | response_len (early→late) | score (early→late) |
+|---:|---:|---|---|---|
+| 0 | 6.35e-4 (212× normal) | [2.5, 130] | 3897 → 1 | -0.88 → -1.00 |
+| 1 | 2.34e-3 (780× normal) | [0.04, 34] | 3845 → 759 | -0.88 → -1.00 |
+| 2 | 2.60e-3 (867× normal) | [10, 23] | 3940 → 1 | -0.89 → -1.00 |
+| 42 | 1.95e-2 (6500× normal) | [58, 80] | 3600 → 182 | -0.88 → -1.00 |
+
+All four seeds: entropy collapsed to ~0 (or diverged to uniform), response
+length dropped to 1 token, g_dot_positive = 0% post-warmup, score = -1.0.
+Validation on all benchmarks = 0 at step 300.
+
+Data files (invalid, kept for reference):
+
+```text
+deepseek1.5b_lr/deepseek1.5b_sync_8gpu_sigfrac_cfixed_lr1.25e-5_ratio_of_sums_w10_seed{0,1,2,42}.jsonl
+```
+
+### Next step
+
+Four seeds have been relaunched with the bug fix. Awaiting results.
+
+## 2026-05-12 Progress Update (superseded by Bug 17 postmortem above)
+
+Prepared multi-seed ratio_of_sums W10 runs. All four completed but results are
+invalid due to Bug 17. See above.
 
 ## Current Focus
 

@@ -1,7 +1,41 @@
 ---
 name: Engineering Implementation — Signal-Fraction Adaptive LR
-description: Concrete implementation of α_t = c_t·r̂_t; code status as of 2026-04-22; p_min guard removed; phi_t degenerate-loss bug fixed
+description: Concrete implementation of α_t = c_t·r̂_t; code status as of 2026-05-14; Bug 17 ratio_of_sums num/den swap fixed
 type: project
+---
+
+## Bug 17 (2026-05-14): ratio_of_sums r_window_num/r_window_den swapped
+
+**Symptom**: all four ratio_of_sums W10 runs (seed 0/1/2/42) had `r_window` in
+range [2, 130] instead of (0, 1]. `alpha_t` exploded 100–6500× above normal.
+Models collapsed to 1-token output within the first few post-warmup steps.
+
+**Root cause**: call site in the new-engine signal-fraction path passed arguments
+in wrong order:
+
+```python
+# transformer_impl.py:1493-1494 (before fix)
+r_window_num=denom,   # auto-power (should be denominator)
+r_window_den=g_dot,   # cross-power (should be numerator)
+```
+
+The scheduler computes `r_window = sum(num_list) / sum(den_list)`. With the swap,
+it computed `sum(auto-power) / sum(cross-power)` ≈ denom/g_dot >> 1.
+
+**Fix**: swap the two arguments:
+
+```python
+# transformer_impl.py:1493-1494 (after fix)
+r_window_num=g_dot,   # cross-power = Σ ĝ_A1ᵀ ĝ_A2
+r_window_den=denom,   # auto-power  = (||ĝ_A1||² + ||ĝ_A2||²) / 2
+```
+
+**Verification**: `python3 -m py_compile` passed.
+
+**Note**: the DP actor path (`dp_actor.py`) was not checked for the same issue;
+it may have the same swap if it also passes `r_window_num`/`r_window_den`. Check
+before running ratio_of_sums on the legacy sync path.
+
 ---
 
 ## Script note (2026-05-06): W10 confirmation commands

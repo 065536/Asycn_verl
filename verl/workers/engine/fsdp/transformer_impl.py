@@ -1490,8 +1490,8 @@ class FSDPEngine(BaseEngine):
             denom,
             g_rms,
             r_hat_raw,
-            r_window_num=denom,
-            r_window_den=g_dot,
+            r_window_num=g_dot,
+            r_window_den=denom,
         )
         grad_norm = self.optimizer_step()
 

@@ -768,8 +768,8 @@ class DataParallelPPOActor(BasePPOActor):
                 denom,
                 g_rms_t,
                 r_hat_raw,
-                r_window_num=denom,
-                r_window_den=g_dot,
+                r_window_num=g_dot,
+                r_window_den=denom,
             )
         else:
             alpha_t = self.actor_optimizer.param_groups[0]["lr"]
