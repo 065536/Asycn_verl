@@ -39,6 +39,16 @@ When analyzing multi-seed or multi-config experiments, first confirm the mechani
 **Why**: "More conservative" and "more stable" are different outcomes; a method that just reduces LR uniformly would also look stable but provides no insight.
 **How to apply**: For Phase 1/2 cfixed experiments, check (1) effective LR range separates as expected across configs, (2) r-side shape is independent of c_fixed, (3) then compare val curves.
 
+**Always log raw components, not just final fractions.**
+Any fraction metric (e.g. between_frac) must be recomputable from raw components (V_between, V_within_raw, N, K) stored in the same log. Otherwise a normalization fix requires rerunning all experiments.
+**Why**: 5.19 a2q normalization correction required rerunning 9 experiments because only the final fraction was logged, not the raw components.
+**How to apply**: For every derived metric, ensure all inputs are also logged. Prefer saving per-response/per-prompt arrays (npz) so any offline reanalysis is possible.
+
+**Do not conflate different decomposition axes.**
+Sampling-axis decomposition (between/within prompt) and factor-axis decomposition (A² vs Q vs interaction) are orthogonal. They cannot be compared as four additive noise terms.
+**Why**: User explicitly corrected the framing: "不能写 N_t = N_prompt + N_rollout + N_advantage + N_score，这是错的。"
+**How to apply**: Always state which axis a decomposition operates on. Use the two-dimensional framework: sampling axis × factor axis.
+
 **Experimental design: do not test two free variables simultaneously.**
 When c_t and r̂_t are both unknown, fix c first (eta_c=0 sweep), then test r independently.
 **Why**: User explicitly insisted on this separation: "先找到 c_t 再说 r_t".

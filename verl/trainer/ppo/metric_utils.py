@@ -15,6 +15,7 @@
 Metrics related to the PPO trainer.
 """
 
+import os
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
@@ -443,6 +444,430 @@ def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None
     )
 
     return metrics
+
+
+def compute_variance_decomposition_metrics(
+    batch: DataProto,
+) -> dict[str, float]:
+    """Compute variance source decomposition diagnostics for RL gradient noise analysis.
+
+    Returns scalar metrics dict (logged every step).
+    Call ``save_noise_decomp_tables`` separately for the heavy per-response / per-prompt tables.
+    """
+    metrics: dict[str, float] = {}
+
+    required_keys = {"token_level_scores", "advantages", "response_mask"}
+    if not required_keys.issubset(batch.batch.keys()):
+        return metrics
+    if "uid" not in batch.non_tensor_batch:
+        return metrics
+
+    with torch.no_grad():
+        scores_per_token = batch.batch["token_level_scores"]
+        response_mask = batch.batch["response_mask"]
+        advantages = batch.batch["advantages"]
+        uids = batch.non_tensor_batch["uid"]
+
+        reward_scalar = scores_per_token.sum(dim=-1)
+        resp_lengths = response_mask.sum(dim=-1).float()
+
+        uid_to_indices: dict[str, list[int]] = defaultdict(list)
+        bsz = reward_scalar.shape[0]
+        for idx in range(bsz):
+            uid_to_indices[uids[idx]].append(idx)
+
+        n_prompts = len(uid_to_indices)
+        if n_prompts == 0:
+            return metrics
+
+        adv_scalar = verl_F.masked_mean(advantages, response_mask, axis=-1)
+
+        has_score_energy = "sum_pi_squared" in batch.batch and "old_log_probs" in batch.batch
+        if has_score_energy:
+            pi_t = torch.exp(batch.batch["old_log_probs"])
+            sum_pi_sq = batch.batch["sum_pi_squared"]
+            q_per_token = (1.0 - 2.0 * pi_t + sum_pi_sq).clamp(min=0.0)
+            q_response = (q_per_token * response_mask).sum(dim=-1)
+
+        N = n_prompts
+        K = bsz // N if N > 0 else 1
+        metrics["noise_decomp/n_prompts"] = float(N)
+        metrics["noise_decomp/n_responses_per_prompt"] = float(K)
+
+        # ── per-prompt reward structure ──
+        prompt_ids_ordered = []
+        prompt_reward_mean = []
+        prompt_reward_std = []
+        prompt_success_rate = []
+        prompt_n_unique = []
+        prompt_is_informative = []
+
+        adv_energy_per_prompt = []
+        prompt_mean_a2q = []
+
+        for uid, indices in uid_to_indices.items():
+            prompt_ids_ordered.append(uid)
+            indices_t = torch.tensor(indices, device=reward_scalar.device)
+            rewards_group = reward_scalar[indices_t]
+            advs_group = adv_scalar[indices_t]
+            k = len(indices)
+
+            r_mean = rewards_group.mean().item()
+            r_std = rewards_group.std(unbiased=False).item() if k > 1 else 0.0
+            p_i = (rewards_group == 1.0).float().mean().item()
+            n_uniq = int(rewards_group.unique().numel())
+
+            prompt_reward_mean.append(r_mean)
+            prompt_reward_std.append(r_std)
+            prompt_success_rate.append(p_i)
+            prompt_n_unique.append(n_uniq)
+            prompt_is_informative.append(1.0 if 0.0 < p_i < 1.0 else 0.0)
+
+            adv_energy_per_prompt.append((advs_group ** 2).mean().item())
+
+            if has_score_energy:
+                q_group = q_response[indices_t]
+                a2q_group = (advs_group ** 2) * q_group
+                prompt_mean_a2q.append(a2q_group.mean().item())
+
+        prompt_reward_std_arr = np.array(prompt_reward_std)
+        prompt_success_arr = np.array(prompt_success_rate)
+
+        # ── P0 reward informativeness stats ──
+        metrics["noise_decomp/reward_std/mean"] = float(prompt_reward_std_arr.mean())
+        metrics["noise_decomp/reward_std/median"] = float(np.median(prompt_reward_std_arr))
+        metrics["noise_decomp/reward_std/p25"] = float(np.percentile(prompt_reward_std_arr, 25))
+        metrics["noise_decomp/reward_std/p75"] = float(np.percentile(prompt_reward_std_arr, 75))
+        metrics["noise_decomp/reward_n_unique/mean"] = float(np.mean(prompt_n_unique))
+        metrics["noise_decomp/success_rate/mean"] = float(prompt_success_arr.mean())
+        metrics["noise_decomp/success_rate/std"] = float(prompt_success_arr.std())
+        metrics["noise_decomp/frac_informative"] = float(np.mean(prompt_is_informative))
+        metrics["noise_decomp/frac_all_correct"] = float((prompt_success_arr == 1.0).mean())
+        metrics["noise_decomp/frac_all_wrong"] = float((prompt_success_arr == 0.0).mean())
+
+        metrics["noise_decomp/adv_energy/mean"] = float(np.mean(adv_energy_per_prompt))
+        metrics["noise_decomp/adv_energy/std"] = float(np.std(adv_energy_per_prompt))
+        metrics["noise_decomp/adv_scalar/abs_mean"] = float(adv_scalar.abs().mean().item())
+
+        # ── success rate histogram bins ──
+        metrics["noise_decomp/success_rate_bin_0"] = float((prompt_success_arr == 0.0).mean())
+        metrics["noise_decomp/success_rate_bin_0_25"] = float(
+            ((prompt_success_arr > 0.0) & (prompt_success_arr <= 0.25)).mean()
+        )
+        metrics["noise_decomp/success_rate_bin_25_75"] = float(
+            ((prompt_success_arr > 0.25) & (prompt_success_arr < 0.75)).mean()
+        )
+        metrics["noise_decomp/success_rate_bin_75_1"] = float(
+            ((prompt_success_arr >= 0.75) & (prompt_success_arr < 1.0)).mean()
+        )
+        metrics["noise_decomp/success_rate_bin_1"] = float((prompt_success_arr == 1.0).mean())
+
+        # ── Advantage-based between/within (unconditional, runs without score energy) ──
+        if n_prompts > 1:
+            prompt_adv_means = []
+            within_adv_vars = []
+            for uid, indices in uid_to_indices.items():
+                indices_t = torch.tensor(indices, device=adv_scalar.device)
+                advs_group = adv_scalar[indices_t]
+                prompt_adv_means.append(advs_group.mean().item())
+                if len(indices) > 1:
+                    within_adv_vars.append(advs_group.var(unbiased=False).item())
+
+            prompt_means_arr = np.array(prompt_adv_means)
+            adv_between_var = float(np.var(prompt_means_arr))
+            adv_within_var = float(np.mean(within_adv_vars)) if within_adv_vars else 0.0
+            adv_total_var = adv_between_var + adv_within_var
+
+            metrics["noise_decomp/adv_between_prompt_var"] = adv_between_var
+            metrics["noise_decomp/adv_within_prompt_var"] = adv_within_var
+            metrics["noise_decomp/adv_total_var"] = adv_total_var
+            if adv_total_var > 0:
+                metrics["noise_decomp/adv_between_frac"] = adv_between_var / adv_total_var
+                metrics["noise_decomp/adv_within_frac"] = adv_within_var / adv_total_var
+
+            metrics["noise_decomp/prompt_adv_mean/std"] = float(prompt_means_arr.std())
+            metrics["noise_decomp/prompt_adv_mean/abs_mean"] = float(np.abs(prompt_means_arr).mean())
+            metrics["noise_decomp/prompt_adv_mean/max"] = float(np.abs(prompt_means_arr).max())
+
+        # ── Score-energy-dependent metrics ──
+        if has_score_energy:
+            q_mean_per_token = (q_per_token * response_mask).sum() / response_mask.sum()
+            metrics["noise_decomp/score_energy_q/mean"] = float(q_mean_per_token.item())
+            metrics["noise_decomp/q_response/mean"] = float(q_response.mean().item())
+            metrics["noise_decomp/q_response/std"] = float(q_response.std(unbiased=False).item())
+
+            a_sq_all = adv_scalar ** 2
+            q_all = q_response
+            h_all = a_sq_all * q_all
+
+            a2q_all_t = torch.tensor(
+                [v for pm in prompt_mean_a2q for v in [pm]], dtype=torch.float64
+            ) if prompt_mean_a2q else torch.zeros(0, dtype=torch.float64)
+
+            eps = 1e-12
+
+            # ── means / std / CV² for A², Q, H ──
+            a_sq_f64 = a_sq_all.double()
+            q_f64 = q_all.double()
+            h_f64 = h_all.double()
+
+            a2_mean_v = float(a_sq_f64.mean().item())
+            q_mean_v = float(q_f64.mean().item())
+            h_mean_v = float(h_f64.mean().item())
+            a2_std_v = float(a_sq_f64.std(unbiased=False).item())
+            q_std_v = float(q_f64.std(unbiased=False).item())
+            h_std_v = float(h_f64.std(unbiased=False).item())
+            a2_var_v = a2_std_v ** 2
+            q_var_v = q_std_v ** 2
+            h_var_v = h_std_v ** 2
+
+            metrics["noise_decomp/mean_a2"] = a2_mean_v
+            metrics["noise_decomp/mean_q"] = q_mean_v
+            metrics["noise_decomp/mean_h"] = h_mean_v
+            metrics["noise_decomp/std_a2"] = a2_std_v
+            metrics["noise_decomp/std_q"] = q_std_v
+            metrics["noise_decomp/std_h"] = h_std_v
+            metrics["noise_decomp/cv2_a2"] = a2_var_v / (a2_mean_v ** 2 + eps)
+            metrics["noise_decomp/cv2_q"] = q_var_v / (q_mean_v ** 2 + eps)
+            metrics["noise_decomp/cv2_h"] = h_var_v / (h_mean_v ** 2 + eps)
+
+            # ── Corr(A², Q) and interaction ratio ──
+            cov_a2_q = float(((a_sq_f64 - a2_mean_v) * (q_f64 - q_mean_v)).mean().item())
+            corr_a2_q = cov_a2_q / (a2_std_v * q_std_v + eps)
+            metrics["noise_decomp/corr_a2_q"] = corr_a2_q
+            interaction_ratio = h_mean_v / (a2_mean_v * q_mean_v + eps)
+            metrics["noise_decomp/interaction_ratio_a2q"] = interaction_ratio
+
+            # ── Response length diagnostics ──
+            resp_len_f64 = resp_lengths.double()
+            resp_len_mean = float(resp_len_f64.mean().item())
+            resp_len_std = float(resp_len_f64.std(unbiased=False).item())
+            metrics["noise_decomp/resp_length/mean"] = resp_len_mean
+            metrics["noise_decomp/resp_length/std"] = resp_len_std
+
+            q_over_t = q_all.float() / (resp_lengths + 1.0)
+            metrics["noise_decomp/q_over_t/mean"] = float(q_over_t.mean().item())
+            metrics["noise_decomp/q_over_t/std"] = float(q_over_t.std(unbiased=False).item())
+
+            corr_a2_t = float(
+                ((a_sq_f64 - a2_mean_v) * (resp_len_f64 - resp_len_mean)).mean().item()
+                / (a2_std_v * resp_len_std + eps)
+            )
+            corr_q_t = float(
+                ((q_f64 - q_mean_v) * (resp_len_f64 - resp_len_mean)).mean().item()
+                / (q_std_v * resp_len_std + eps)
+            )
+            metrics["noise_decomp/corr_a2_t"] = corr_a2_t
+            metrics["noise_decomp/corr_q_t"] = corr_q_t
+
+            # ── Three-way between/within decomposition for A², Q, H ──
+            # Also do counterfactual: h_cfact_a = A²·Q̄, h_cfact_q = Ā²·Q
+            h_cfact_a = a_sq_all * q_mean_v
+            h_cfact_q = a2_mean_v * q_all
+
+            decomp_vars = {
+                "a2": a_sq_all, "q": q_all, "h": h_all,
+                "h_cfact_a": h_cfact_a, "h_cfact_q": h_cfact_q,
+            }
+
+            for dname, d_tensor in decomp_vars.items():
+                prompt_means_d = []
+                within_vars_d = []
+                for uid, indices in uid_to_indices.items():
+                    idx_t = torch.tensor(indices, device=d_tensor.device)
+                    grp = d_tensor[idx_t]
+                    prompt_means_d.append(grp.mean().item())
+                    if len(indices) > 1:
+                        within_vars_d.append(grp.var(unbiased=False).item())
+
+                if len(prompt_means_d) > 1:
+                    btwn = float(np.var(prompt_means_d))
+                    wthn = float(np.mean(within_vars_d)) if within_vars_d else 0.0
+                    wthn_corr = wthn / K if K > 0 else 0.0
+
+                    batch_btwn = btwn / N if N > 0 else 0.0
+                    batch_wthn = wthn / (N * K) if (N * K) > 0 else 0.0
+                    batch_total = batch_btwn + batch_wthn
+
+                    pfx = f"noise_decomp/factor_{dname}"
+                    metrics[f"{pfx}/between_var"] = btwn
+                    metrics[f"{pfx}/within_var_raw"] = wthn
+                    metrics[f"{pfx}/within_var_corrected"] = wthn_corr
+                    metrics[f"{pfx}/batch_between"] = batch_btwn
+                    metrics[f"{pfx}/batch_within"] = batch_wthn
+                    metrics[f"{pfx}/batch_total"] = batch_total
+                    if batch_total > 0:
+                        metrics[f"{pfx}/batch_between_frac"] = batch_btwn / batch_total
+                        metrics[f"{pfx}/batch_within_frac"] = batch_wthn / batch_total
+                    raw_total = btwn + wthn
+                    if raw_total > 0:
+                        metrics[f"{pfx}/raw_between_frac"] = btwn / raw_total
+                        metrics[f"{pfx}/raw_within_frac"] = wthn / raw_total
+
+            # ── Counterfactual variance attribution ──
+            var_h_a_only = float(h_cfact_a.double().var(unbiased=False).item())
+            var_h_q_only = float(h_cfact_q.double().var(unbiased=False).item())
+            var_interaction = h_var_v - var_h_a_only - var_h_q_only
+
+            metrics["noise_decomp/cfact_var_h"] = h_var_v
+            metrics["noise_decomp/cfact_var_a_only"] = var_h_a_only
+            metrics["noise_decomp/cfact_var_q_only"] = var_h_q_only
+            metrics["noise_decomp/cfact_var_interaction"] = var_interaction
+            if h_var_v > 0:
+                metrics["noise_decomp/cfact_frac_a_only"] = var_h_a_only / h_var_v
+                metrics["noise_decomp/cfact_frac_q_only"] = var_h_q_only / h_var_v
+                metrics["noise_decomp/cfact_frac_interaction"] = var_interaction / h_var_v
+
+            # ── Legacy a2q metrics (backward compat) ──
+            if len(prompt_mean_a2q) > 1:
+                h_arr = np.array(prompt_mean_a2q)
+                between_var = float(np.var(h_arr))
+                within_vars_legacy = []
+                for uid, indices in uid_to_indices.items():
+                    if len(indices) > 1:
+                        idx_t = torch.tensor(indices, device=reward_scalar.device)
+                        a2q_g = (adv_scalar[idx_t] ** 2) * q_response[idx_t]
+                        within_vars_legacy.append(a2q_g.var(unbiased=False).item())
+                within_var = float(np.mean(within_vars_legacy)) if within_vars_legacy else 0.0
+                metrics["noise_decomp/a2q_between_prompt_var"] = between_var
+                metrics["noise_decomp/a2q_within_prompt_var"] = within_var
+                total = between_var + within_var
+                if total > 0:
+                    metrics["noise_decomp/a2q_between_frac"] = between_var / total
+                    metrics["noise_decomp/a2q_within_frac"] = within_var / total
+
+            # ── prompt_h stats ──
+            if n_prompts > 1 and prompt_mean_a2q:
+                prompt_h = np.array(prompt_mean_a2q)
+                metrics["noise_decomp/prompt_h/mean"] = float(prompt_h.mean())
+                metrics["noise_decomp/prompt_h/std"] = float(prompt_h.std())
+                metrics["noise_decomp/prompt_h/max"] = float(prompt_h.max())
+                metrics["noise_decomp/prompt_h/p90"] = float(np.percentile(prompt_h, 90))
+
+    return metrics
+
+
+def save_noise_decomp_tables(
+    batch: DataProto,
+    global_step: int,
+    save_dir: str,
+) -> None:
+    """Save per-response and per-prompt tables as compressed npz.
+
+    Lightweight enough to call every N steps (e.g. every 5-10 steps).
+    Files: ``{save_dir}/noise_tables_step{global_step}.npz``
+
+    Per-response arrays (shape [bsz]):
+        prompt_idx, reward, advantage, advantage_sq, response_length,
+        score_energy_Q (if available), Q_per_token, H_a2q
+
+    Per-prompt arrays (shape [n_prompts]):
+        prompt_id, reward_mean, reward_std, success_rate, num_unique_rewards,
+        is_informative, a2_mean, q_mean, h_mean, a2_var, q_var, h_var
+    """
+    required_keys = {"token_level_scores", "advantages", "response_mask"}
+    if not required_keys.issubset(batch.batch.keys()):
+        return
+    if "uid" not in batch.non_tensor_batch:
+        return
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    with torch.no_grad():
+        scores_per_token = batch.batch["token_level_scores"]
+        response_mask = batch.batch["response_mask"]
+        advantages = batch.batch["advantages"]
+        uids = batch.non_tensor_batch["uid"]
+
+        reward_scalar = scores_per_token.sum(dim=-1).cpu().numpy().astype(np.float32)
+        resp_lengths = response_mask.sum(dim=-1).cpu().numpy().astype(np.float32)
+        adv_scalar = verl_F.masked_mean(advantages, response_mask, axis=-1).cpu().numpy().astype(np.float32)
+        adv_sq = (adv_scalar ** 2).astype(np.float32)
+
+        bsz = reward_scalar.shape[0]
+
+        has_score_energy = "sum_pi_squared" in batch.batch and "old_log_probs" in batch.batch
+
+        if has_score_energy:
+            pi_t = torch.exp(batch.batch["old_log_probs"])
+            sum_pi_sq = batch.batch["sum_pi_squared"]
+            q_per_token_t = (1.0 - 2.0 * pi_t + sum_pi_sq).clamp(min=0.0)
+            q_response_np = (q_per_token_t * response_mask).sum(dim=-1).cpu().numpy().astype(np.float32)
+            q_per_tok_np = q_response_np / (resp_lengths + 1.0)
+            h_a2q = adv_sq * q_response_np
+        else:
+            q_response_np = np.full(bsz, np.nan, dtype=np.float32)
+            q_per_tok_np = np.full(bsz, np.nan, dtype=np.float32)
+            h_a2q = np.full(bsz, np.nan, dtype=np.float32)
+
+        uid_to_indices: dict[str, list[int]] = defaultdict(list)
+        for idx in range(bsz):
+            uid_to_indices[uids[idx]].append(idx)
+
+        uid_list = list(uid_to_indices.keys())
+        uid_to_int = {u: i for i, u in enumerate(uid_list)}
+        prompt_idx_per_response = np.array([uid_to_int[uids[i]] for i in range(bsz)], dtype=np.int32)
+
+        n_prompts = len(uid_list)
+        p_reward_mean = np.empty(n_prompts, dtype=np.float32)
+        p_reward_std = np.empty(n_prompts, dtype=np.float32)
+        p_success_rate = np.empty(n_prompts, dtype=np.float32)
+        p_n_unique = np.empty(n_prompts, dtype=np.int32)
+        p_is_informative = np.empty(n_prompts, dtype=np.float32)
+        p_a2_mean = np.empty(n_prompts, dtype=np.float32)
+        p_q_mean = np.empty(n_prompts, dtype=np.float32)
+        p_h_mean = np.empty(n_prompts, dtype=np.float32)
+        p_a2_var = np.empty(n_prompts, dtype=np.float32)
+        p_q_var = np.empty(n_prompts, dtype=np.float32)
+        p_h_var = np.empty(n_prompts, dtype=np.float32)
+
+        for pi, uid in enumerate(uid_list):
+            idxs = uid_to_indices[uid]
+            rw = reward_scalar[idxs]
+            a2 = adv_sq[idxs]
+            q_arr = q_response_np[idxs]
+            h_arr = h_a2q[idxs]
+
+            p_reward_mean[pi] = rw.mean()
+            p_reward_std[pi] = rw.std() if len(idxs) > 1 else 0.0
+            p_success = (rw == 1.0).mean()
+            p_success_rate[pi] = p_success
+            p_n_unique[pi] = len(np.unique(rw))
+            p_is_informative[pi] = 1.0 if 0.0 < p_success < 1.0 else 0.0
+            p_a2_mean[pi] = a2.mean()
+            p_q_mean[pi] = q_arr.mean()
+            p_h_mean[pi] = h_arr.mean()
+            p_a2_var[pi] = a2.var() if len(idxs) > 1 else 0.0
+            p_q_var[pi] = q_arr.var() if len(idxs) > 1 else 0.0
+            p_h_var[pi] = h_arr.var() if len(idxs) > 1 else 0.0
+
+        fname = os.path.join(save_dir, f"noise_tables_step{global_step}.npz")
+        np.savez_compressed(
+            fname,
+            global_step=np.int32(global_step),
+            N=np.int32(n_prompts),
+            K=np.int32(bsz // n_prompts) if n_prompts > 0 else np.int32(0),
+            resp_prompt_idx=prompt_idx_per_response,
+            resp_reward=reward_scalar,
+            resp_advantage=adv_scalar,
+            resp_advantage_sq=adv_sq,
+            resp_score_energy_Q=q_response_np,
+            resp_Q_per_token=q_per_tok_np,
+            resp_response_length=resp_lengths,
+            resp_H_a2q=h_a2q,
+            prompt_id=np.array(uid_list, dtype=object),
+            prompt_reward_mean=p_reward_mean,
+            prompt_reward_std=p_reward_std,
+            prompt_success_rate=p_success_rate,
+            prompt_num_unique_rewards=p_n_unique,
+            prompt_is_informative=p_is_informative,
+            prompt_a2_mean=p_a2_mean,
+            prompt_q_mean=p_q_mean,
+            prompt_h_mean=p_h_mean,
+            prompt_a2_var=p_a2_var,
+            prompt_q_var=p_q_var,
+            prompt_h_var=p_h_var,
+        )
 
 
 def bootstrap_metric(

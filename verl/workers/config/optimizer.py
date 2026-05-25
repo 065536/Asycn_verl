@@ -193,16 +193,46 @@ class FSDPOptimizerConfig(OptimizerConfig):
     # at prompt-group boundaries instead of response boundaries.
     signal_fraction_rollout_n: int = 1
 
+    # ------------------------------------------------------------------ #
+    # Signal-Quality-Aware LR Scaling: α_t = α_base * q_t
+    # lr_scheduler_type = "signal_quality"
+    # ------------------------------------------------------------------ #
+    # Info gate: I_t source — "reward_std_median" or "frac_informative" or "bernoulli_var" or "mean_a2"
+    signal_quality_info_source: str = "reward_std_median"
+    # EMA beta for info signal
+    signal_quality_info_ema_beta: float = 0.9
+    # Minimum q_info value.  Design: q_min ≈ α_safe / α_base.
+    # With α_base=1e-5, q_min=0.3 → min LR = 3e-6 ≈ known-safe LR.
+    signal_quality_info_q_min: float = 0.3
+    # Number of warmup steps to compute I_ref
+    signal_quality_warmup_steps: int = 20
+    # Enable concentration penalty (q_conc)
+    signal_quality_use_concentration: bool = False
+    # Concentration source — "cv2_h" or "cv2_a2" or "top10_h_share"
+    signal_quality_conc_source: str = "cv2_h"
+    # EMA beta for concentration signal
+    signal_quality_conc_ema_beta: float = 0.9
+    # Minimum q_conc value
+    signal_quality_conc_q_min: float = 0.5
+    # Exponent γ for concentration penalty
+    signal_quality_conc_gamma: float = 0.5
+
     def __post_init__(self):
         if self.warmup_style is not None:
-            assert self.warmup_style in ["constant", "cosine"]
+            assert self.warmup_style in ["constant", "linear", "cosine"]
             warnings.warn(
                 "`warmup_style` is deprecated, use `lr_scheduler_type` instead.", DeprecationWarning, stacklevel=2
             )
             self.lr_scheduler_type = self.warmup_style
-        assert self.lr_scheduler_type in ["constant", "cosine", "entropy_adaptive", "signal_fraction"]
+        assert self.lr_scheduler_type in [
+            "constant", "linear", "cosine", "entropy_adaptive", "signal_fraction", "signal_quality",
+        ]
         assert self.entropy_adaptive_reference_mode in ["ema", "initial"]
         assert self.signal_fraction_r_window_mode in ["off", "replace_ema", "ratio_of_sums"]
+        assert self.signal_quality_info_source in [
+            "reward_std_median", "frac_informative", "bernoulli_var", "mean_a2",
+        ]
+        assert self.signal_quality_conc_source in ["cv2_h", "cv2_a2", "top10_h_share"]
         return super().__post_init__()
 
 

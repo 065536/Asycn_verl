@@ -1,7 +1,253 @@
 ---
 name: Algorithm Design — Current Framework and Open Questions
-description: entadapt_initial 缺陷 + α_t=c_t·r̂_t 框架 + 5.15 ratio_of_sums W10 结果：不如 B-current 和 replace_ema，方向关闭
+description: 5.20 Signal-Quality-Aware LR Scaling 完成：离线验证 + sensitivity 分析 + 分布式一致性修复 + Group C 实验就绪
 type: project
+---
+
+## 2026-05-20 Signal-Quality-Aware LR Scaling
+
+### 方法定位
+
+**不是** optimal LR estimator，**而是** Signal-Quality-Aware LR Scaling。
+
+```
+α_t = α_base · q_t,    q_t ∈ [q_min, 1]
+q_min = α_safe / α_base = 3.1e-6 / 1e-5 ≈ 0.3
+```
+
+含义：前期用 aggressive LR 学得快，后期 signal quality 下降时自动回退到 known-safe LR。
+
+### 离线验证结论
+
+1. **q_info 对 high-LR degradation 有预测力**：lr1e-5 三个 seed 全部在 validation drop 前/同时 q 下降
+2. **q_info 是 risk indicator，不是 deterministic predictor**：seed42 q 暴跌到 0.30，但 val 只掉 -0.005
+3. **stable LR 下 q 自然下降但不危险**：lr3.1e-6 下 reward informativeness 随训练降低（模型变好 → 更多 all-correct），但因 LR 低不造成伤害
+4. **支持我们的定位**：真正的风险不是 q_t↓ 本身，而是 α_eff = α_base × q_t 是否仍然过高
+
+### Sensitivity 分析结论
+
+| I_t 候选 | high-LR 刹车力度 | stable-LR 误报 | 判定 |
+|---|---|---|---|
+| **reward_std (mean)** | **-0.28** | **q_late=0.82** | ★ 最佳 |
+| frac_informative | -0.025 | q_late=1.00 | 太弱，几乎不刹车 |
+| bernoulli_var p(1-p) | **+0.02** | q_late=1.00 | **完全失败** — 无法区分模型变好和 collapse |
+| reward_var_mean | -0.20 | q_late=0.64 | 可用但 stable LR 下过度刹车 |
+
+β_I 在 0.7–0.95 间差异很小。β=0.95 false-alarm 最低。第一版用 β=0.9（更保守）。
+
+**bernoulli_var 失败原因**：用的是全局 success_rate/mean 的 p(1-p)，p=0.5 时最大，模型变好或 collapse 都让 p 偏离 0.5 → 无法区分方向。
+
+### seed1 是 info-only gate 的薄弱点
+
+seed1: q 只从 0.94 降到 0.88，但 val drop 达 -0.0746。可能原因：
+- seed1 退化不是 reward informativeness 驱动
+- 可能是 concentration / ratio-tail / KL risk
+- 如果 Group C 不修复 seed1，Group D (concentration gate) 有必要
+
+### 分布式一致性修复
+
+`_compute_signal_quality_indicators()` 重写：
+- 每个 rank 算 local sums → `all_reduce(SUM)` → global mean
+- 所有 rank 得到相同 q_t
+- **不再用 median**（无法 all_reduce）；`reward_std_median` 配置实际计算 `mean_i[sqrt(Var_k(R_i))]`
+- 始终用 uid 做 prompt group 聚合，不假设 batch 排列
+
+### 额外 logging（不参与控制，用于离线比较）
+
+每步记录 `actor/sq_alt_reward_var_mean`, `actor/sq_alt_bernoulli_var`, `actor/sq_alt_frac_informative`。
+如果 reward_std 对某 seed 不敏感，可以离线判断换哪个，不用重跑。
+
+### Scheduler timing
+
+`q_t` 从 step t 的 batch 计算，应用于 step t+1 的 LR。
+流程：`update_policy()` → metrics → `update_signal_quality(I_t)` → `scheduler.step()`
+
+### 实验状态
+
+**Group A/B**: 已有 Stage 1 数据（lr3.1e-6 和 lr1e-5，各 3 seeds）
+
+**Group C** (待启动): info-only gate
+
+```bash
+SQ_BASE_LR=1e-5 SQ_TAG=sq_info SEED=42 NCPUS=32 bash sync_signal_quality_lr.sh
+SQ_BASE_LR=1e-5 SQ_TAG=sq_info SEED=1  NCPUS=32 bash sync_signal_quality_lr.sh
+SQ_BASE_LR=1e-5 SQ_TAG=sq_info SEED=0  NCPUS=32 bash sync_signal_quality_lr.sh
+```
+
+**Group D** (C 之后): info + concentration gate
+
+```bash
+SQ_BASE_LR=1e-5 SQ_TAG=sq_info_conc SQ_USE_CONC=true SEED={42,1,0} NCPUS=32 bash sync_signal_quality_lr.sh
+```
+
+### 分析顺序
+
+1. 先看 `actor/sq_alpha_t` / `actor/sq_q_info` 动力学
+2. 确认 late α 在 3–6e-6 范围
+3. 再看 validation: peak-to-final drop, seed variance
+4. 比较 `actor/sq_alt_*` 替代指标
+
+### 预期
+
+- seed0: 最可能改善（offline q drop 到 0.50，val drop -0.085）
+- seed42: 可能无显著提升（原 drop 只 -0.005）
+- seed1: 关键测试 — 如果 C 修不了 seed1，D 有必要
+
+---
+
+## 2026-05-19 Stage 2 N×K 分析完成 + Normalization 校正 + 二维 Noise 框架
+
+### Stage 2 run status
+
+9 runs 中 6 个成功（n256k4 仅 seed42，n128k8 两 seed，n64k16 全 3 seed），3 个失败/缺失（外部 kill）。
+全部 9 runs 正在用更新后代码重跑（新增 factor decomposition + npz 表）。
+
+### 关键发现 1：a2q normalization 校正反转了原结论
+
+原 `a2q_between_frac` / `a2q_within_frac` 在 response level 做 law of total variance：
+- `between_var` = Var_x(μ_i)，其中 μ_i = (1/K)Σ_k z_{i,k} — 已做 1/K prompt-level 平均
+- `within_var` = E_x[Var_k(z_{i,k})] — response-level raw 方差
+
+但 batch gradient variance 是：
+```
+Var(ĝ) = (1/N) · between_var + (1/NK) · within_var
+```
+within 端多一个 1/K 缩减因子。原代码直接 between/(between+within) 漏了这个。
+
+校正后：
+
+| Config | K | raw within_frac | corrected between_frac |
+|---|---:|---:|---:|
+| n256k4 | 4 | 0.67 | **0.67** (prompt noise 主导) |
+| n128k8 | 8 | 0.87 | **0.56** (大致 50/50) |
+| n64k16 | 16 | 0.94 | **0.50** (精确 50/50) |
+
+**结论：baseline K=8 下 prompt-sampling noise 和 rollout noise 大致对半开，不是原以为的 "within 占 87%"。**
+
+### 关键发现 2：K 越大 → 更多 informative prompts → 更好 validation
+
+frac_informative 随 K 单调增加：K=4 → 0.40, K=8 → 0.57, K=16 → 0.66。
+n64k16 final avg5 = 0.3369 vs baseline n128k8 = 0.3265（+0.0104）。
+
+### 关键发现 3：r_hat 不受 N/K 影响
+
+r_hat ≈ 0.01-0.02 across all configs, g_dot_positive ≈ 50%。总 batch size 不变 SNR 不变。
+
+### 二维 Noise 框架（5.19 确立）
+
+不能把四种 noise source 做四项加和。正确层级：
+
+**维度 A（sampling axis）**：h = A²Q 的方差发生在哪个采样层面
+- V_between_batch = Var_x(μ_i) / N  — prompt sampling noise
+- V_within_batch = E_x[Var_k(h)] / (NK)  — rollout sampling noise
+
+**维度 B（factor axis）**：h = A²Q 的方差由哪个因子驱动
+- CV²(A²) vs CV²(Q) vs Corr(A², Q)
+- counterfactual: Var(A²·Q̄) + Var(Ā²·Q) + interaction = Var(A²Q)
+
+二维组合：每个 sampling axis 内部分解 A²/Q/interaction 贡献。
+
+### 新增 logging（5.19 实现）
+
+113 个 scalar metrics + per-response/per-prompt npz 表（每 5 步）。详见 engineering_impl.md。
+
+核心新增：
+- 三套 A²/Q/H between/within + batch-level corrected fractions
+- CV²(A²), CV²(Q), CV²(H), Corr(A²,Q), interaction_ratio
+- counterfactual variance attribution
+- success rate histogram (5 bins)
+- per-response/per-prompt npz 离线重算表
+
+### Stage 3 方向（修订）
+
+校正后两种 noise source 大致对半：
+
+| Finding | Algorithm direction |
+|---|---|
+| Between-prompt noise dominates at low K | Prompt diversity / stratification |
+| Within-prompt noise dominates at high K | Increase K / advantage estimator |
+| **Both ~equal at baseline K=8** | **Need combined approach** |
+| frac_informative increases with K | K is direct lever for reward signal quality |
+
+分析报告：`exp_data/stage2_nk_noise_analysis.md`
+分析脚本：`exp_data/stage2_nk_noise_analysis.py`
+
+---
+
+## 2026-05-16 方向转折：Variance Source Decomposition 优先于新 estimator 设计
+
+### 核心判断
+
+所有 r_t estimator 尝试（split-batch, EMA window, ratio_of_sums, logit-space M₂, parameter-space momentum）
+都有根本性问题。在继续设计新 estimator 之前，需要先回答：
+
+> RL 中的 gradient noise 到底来自哪一层 expectation 的有限样本估计？
+
+### Parameter-space momentum estimator 的问题
+
+用 A_t=EMA(||ĝ_t||²) 和 B_t=EMA(||m_t^Adam||²) 解出 r_t 的方案有 non-stationarity bias：
+- 推导假设 g_t 在 momentum 时间窗口内近似不变
+- 实际 E[||m_t||²] = ||ḡ_t||² + κ N_t，其中 ḡ_t 是过去梯度的加权平均
+- 信号衰减时 ||ḡ_t||² > ||g_t||² → r_t 被系统性高估 → LR 偏高
+- 这恰好在最危险的 late-stage regime 出错
+
+### Variance decomposition 诊断设计
+
+将 noise 分成四层：
+
+1. **Prompt sampling noise** — between-prompt variance of gradient contributions
+2. **Rollout sampling noise** — within-prompt, between-response variance
+3. **Reward/advantage signal sparsity** — fraction of prompts with mixed success/failure
+4. **Score-function / trajectory-length variance** — logit-space energy per token
+
+用 law of total variance：
+
+Var(ĝ) = (1/N)[Var_x(μ(x)) + E_x[Var(U|x)]]
+
+### 已实现的诊断 metrics
+
+在 `verl/trainer/ppo/metric_utils.py` 中添加 `compute_variance_decomposition_metrics()`，
+在 `ray_trainer.py` 中每步调用。新增 metrics：
+
+**Prompt-level reward informativeness:**
+- `noise_decomp/reward_std/mean` — 每组 reward std 的均值
+- `noise_decomp/reward_n_unique/mean` — 每组不同 reward 值数量
+- `noise_decomp/frac_informative` — Pr(0 < p_i < 1)，有效学习信号的 prompt 比例
+- `noise_decomp/success_rate/mean` — 平均成功率
+
+**Advantage energy:**
+- `noise_decomp/adv_energy/mean` — E_i[(1/K)Σ_k Â²_{i,k}]
+- `noise_decomp/adv_scalar/abs_mean` — |Â| 平均值
+
+**Score energy (需要 sum_pi_squared):**
+- `noise_decomp/score_energy_q/mean` — per-token q 均值
+- `noise_decomp/q_response/mean` — per-response Q 均值
+- `noise_decomp/a2q/mean` — Â² × Q 均值（advantage-weighted score energy）
+
+**Between/within-prompt variance decomposition:**
+- `noise_decomp/a2q_between_prompt_var` — Var_x(H_i) where H_i = mean(Â²Q | prompt i)
+- `noise_decomp/a2q_within_prompt_var` — E_x[Var(Â²Q | prompt x)]
+- `noise_decomp/a2q_between_frac` / `a2q_within_frac` — 相对占比
+
+### 诊断结果将引导算法方向
+
+| 发现 | 对应算法方向 |
+|---|---|
+| 有效 reward prompts 变少 | reward-informativeness-aware LR decay |
+| score energy 后期很大 | M₂ 路线做 noise diagnostic，不做 r_t estimator |
+| between-prompt variance 主导 | batch construction / prompt stratification |
+| within-prompt rollout variance 主导 | 增加 K / 调 temperature / 改 advantage estimator |
+
+### 文件变更
+
+- `verl/trainer/ppo/metric_utils.py` — 新增 `compute_variance_decomposition_metrics()`
+- `verl/trainer/ppo/ray_trainer.py` — import 并调用新函数
+
+### 下一步
+
+在现有 B-current 配置下跑一轮 diagnostic run，收集 300 步的 noise_decomp/* metrics，
+按 early/mid/late 分析各层 noise 的演变趋势。不启动新 estimator 实验。
+
 ---
 
 ## 2026-05-15 ratio_of_sums W10 rerun: underperforms B-current and replace_ema

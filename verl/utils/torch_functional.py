@@ -758,6 +758,54 @@ def get_cosine_schedule_with_warmup(
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+def get_linear_schedule_with_warmup(
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = 0.0,
+    last_epoch: int = -1,
+    init_lr_ratio: float = None,
+    zero_indexed_step: bool = True,
+):
+    """
+    Create a schedule with a learning rate that decreases linearly from initial LR to
+    min_lr_ratio * initial LR after an optional linear warmup.
+
+    Args:
+        optimizer (:class:`~torch.optim.Optimizer`):
+            The optimizer for which to schedule the learning rate.
+        num_warmup_steps (:obj:`int`):
+            The number of steps for the warmup phase.
+        num_training_steps (:obj:`int`):
+            The total number of training steps.
+        min_lr_ratio (:obj:`float`, `optional`, defaults to 0.0):
+            The minimum lr ratio w.r.t the maximum.
+        last_epoch (:obj:`int`, `optional`, defaults to -1):
+            The index of the last epoch when resuming training.
+        init_lr_ratio (:obj:`float`, `optional`, defaults to None):
+            The initial lr ratio w.r.t the maximum.
+        zero_indexed_step (:obj:`bool`, `optional`, defaults to True):
+            Whether the LR schedule uses 0-indexed steps.
+    Return:
+        :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
+    """
+    min_lr_ratio = 0.0 if min_lr_ratio is None else min_lr_ratio
+    assert 0.0 <= min_lr_ratio <= 1.0
+
+    init_lr_ratio = 0.0 if init_lr_ratio is None else init_lr_ratio
+    assert 0.0 <= init_lr_ratio <= 1.0
+
+    def lr_lambda(current_step):
+        if not zero_indexed_step:
+            current_step += 1
+        if current_step < num_warmup_steps:
+            return init_lr_ratio + (1.0 - init_lr_ratio) * (float(current_step) / float(max(1, num_warmup_steps)))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return max(min_lr_ratio, 1.0 - (1.0 - min_lr_ratio) * progress)
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
 def get_constant_schedule_with_warmup(
     optimizer: Optimizer,
     num_warmup_steps: int,

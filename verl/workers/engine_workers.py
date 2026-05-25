@@ -380,6 +380,23 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     else:
                         current_entropy = float(entropy_vals)
                     self.engine.update_entropy_for_lr(current_entropy)
+            # For signal-quality LR: feed batch-level signal quality indicators
+            if hasattr(self.engine, "update_signal_quality_for_lr"):
+                from verl.workers.fsdp_workers import _compute_signal_quality_indicators
+                optim_cfg = self.engine.optimizer_config
+                info_src = getattr(optim_cfg, "signal_quality_info_source", "reward_std_median")
+                conc_src = getattr(optim_cfg, "signal_quality_conc_source", "cv2_h")
+                info_val, conc_val, sq_extra = _compute_signal_quality_indicators(data, info_src, conc_src)
+                if info_val is not None:
+                    self.engine.update_signal_quality_for_lr(info_val, conc_val)
+                sq_metrics = self.engine.get_signal_quality_metrics()
+                if sq_metrics:
+                    output.setdefault("metrics", {}).update(sq_metrics)
+                output.setdefault("metrics", {}).update(sq_extra)
+                if info_val is not None:
+                    output["metrics"]["actor/sq_info_raw"] = info_val
+                if conc_val is not None:
+                    output["metrics"]["actor/sq_conc_raw"] = conc_val
             lr = self.engine.lr_scheduler_step()
         else:
             lr = None

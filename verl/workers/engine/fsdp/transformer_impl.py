@@ -193,6 +193,162 @@ class EntropyAdaptiveLRScheduler:
             self.reference_mode = state_dict["reference_mode"]
 
 
+class SignalQualityLRScheduler:
+    """Signal-Quality-Aware LR Scaling: α_t = α_base * q_t.
+
+    q_t = q_t^info * q_t^conc (if concentration enabled, else q_t = q_t^info).
+
+    Info gate (q_t^info):
+      Tracks a signal-availability indicator I_t (e.g. reward_std/median,
+      frac_informative, or E[A²]).  During warmup (first T_warm steps),
+      collects I_t to compute I_ref = mean(I_{1..T_warm}).  After warmup:
+        Ī_t = β_I * Ī_{t-1} + (1-β_I) * I_t
+        q_t^info = clip(Ī_t / I_ref, q_min_info, 1.0)
+
+    Concentration penalty (q_t^conc, optional):
+      Tracks C_t (e.g. CV²(H), CV²(A²), top-10% H share).  Same warmup
+      reference.  After warmup:
+        C̄_t = β_C * C̄_{t-1} + (1-β_C) * C_t
+        q_t^conc = clip((C_ref / (C̄_t + ε))^γ, q_min_conc, 1.0)
+
+    Supports linear warmup for base LR.
+    Signal quality state is updated externally via update_signal_quality().
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        num_warmup_steps: int,
+        info_ema_beta: float = 0.9,
+        info_q_min: float = 0.3,
+        sq_warmup_steps: int = 20,
+        use_concentration: bool = False,
+        conc_ema_beta: float = 0.9,
+        conc_q_min: float = 0.5,
+        conc_gamma: float = 0.5,
+    ):
+        self.optimizer = optimizer
+        self.num_warmup_steps = num_warmup_steps
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self.step_count = 0
+
+        self.info_ema_beta = info_ema_beta
+        self.info_q_min = info_q_min
+        self.sq_warmup_steps = sq_warmup_steps
+        self.use_concentration = use_concentration
+        self.conc_ema_beta = conc_ema_beta
+        self.conc_q_min = conc_q_min
+        self.conc_gamma = conc_gamma
+
+        self._info_warmup_vals: list[float] = []
+        self._info_ref: float = None
+        self._info_ema: float = None
+        self._q_info: float = 1.0
+
+        self._conc_warmup_vals: list[float] = []
+        self._conc_ref: float = None
+        self._conc_ema: float = None
+        self._q_conc: float = 1.0
+
+        self._q_total: float = 1.0
+
+        if num_warmup_steps > 0:
+            init_factor = 1.0 / num_warmup_steps
+            self._last_lr = [base_lr * init_factor for base_lr in self.base_lrs]
+            for lr, pg in zip(self._last_lr, self.optimizer.param_groups):
+                pg["lr"] = lr
+        else:
+            self._last_lr = list(self.base_lrs)
+
+    def update_signal_quality(self, info_value: float, conc_value: float = None):
+        """Update signal quality indicators.  Call once per training step."""
+        if self._info_ref is None:
+            self._info_warmup_vals.append(info_value)
+            if len(self._info_warmup_vals) >= self.sq_warmup_steps:
+                self._info_ref = float(sum(self._info_warmup_vals) / len(self._info_warmup_vals))
+                self._info_ema = info_value
+        else:
+            self._info_ema = self.info_ema_beta * self._info_ema + (1.0 - self.info_ema_beta) * info_value
+            if self._info_ref > 1e-12:
+                self._q_info = max(min(self._info_ema / self._info_ref, 1.0), self.info_q_min)
+            else:
+                self._q_info = 1.0
+
+        if self.use_concentration and conc_value is not None:
+            if self._conc_ref is None:
+                self._conc_warmup_vals.append(conc_value)
+                if len(self._conc_warmup_vals) >= self.sq_warmup_steps:
+                    self._conc_ref = float(sum(self._conc_warmup_vals) / len(self._conc_warmup_vals))
+                    self._conc_ema = conc_value
+            else:
+                self._conc_ema = self.conc_ema_beta * self._conc_ema + (1.0 - self.conc_ema_beta) * conc_value
+                ratio = self._conc_ref / (self._conc_ema + 1e-12)
+                self._q_conc = max(min(ratio ** self.conc_gamma, 1.0), self.conc_q_min)
+
+        self._q_total = self._q_info * self._q_conc
+
+    def step(self):
+        self.step_count += 1
+        if self.num_warmup_steps > 0 and self.step_count <= self.num_warmup_steps:
+            warmup_factor = self.step_count / self.num_warmup_steps
+        else:
+            warmup_factor = 1.0
+        scale = warmup_factor * self._q_total
+        self._last_lr = []
+        for base_lr, pg in zip(self.base_lrs, self.optimizer.param_groups):
+            new_lr = base_lr * scale
+            pg["lr"] = new_lr
+            self._last_lr.append(new_lr)
+
+    def get_last_lr(self):
+        return list(self._last_lr)
+
+    def get_signal_quality_metrics(self) -> dict:
+        warmup_done = 1.0 if self._info_ref is not None else 0.0
+        return {
+            "actor/sq_q_info": self._q_info,
+            "actor/sq_q_conc": self._q_conc,
+            "actor/sq_q_total": self._q_total,
+            "actor/sq_info_ref": self._info_ref if self._info_ref is not None else 0.0,
+            "actor/sq_info_ema": self._info_ema if self._info_ema is not None else 0.0,
+            "actor/sq_conc_ref": self._conc_ref if self._conc_ref is not None else 0.0,
+            "actor/sq_conc_ema": self._conc_ema if self._conc_ema is not None else 0.0,
+            "actor/sq_alpha_t": self._last_lr[0] if self._last_lr else 0.0,
+            "actor/sq_warmup_done": warmup_done,
+            "actor/sq_step": float(self.step_count),
+        }
+
+    def state_dict(self):
+        return {
+            "step_count": self.step_count,
+            "base_lrs": self.base_lrs,
+            "_last_lr": self._last_lr,
+            "_info_warmup_vals": self._info_warmup_vals,
+            "_info_ref": self._info_ref,
+            "_info_ema": self._info_ema,
+            "_q_info": self._q_info,
+            "_conc_warmup_vals": self._conc_warmup_vals,
+            "_conc_ref": self._conc_ref,
+            "_conc_ema": self._conc_ema,
+            "_q_conc": self._q_conc,
+            "_q_total": self._q_total,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.step_count = state_dict["step_count"]
+        self.base_lrs = state_dict["base_lrs"]
+        self._last_lr = state_dict["_last_lr"]
+        self._info_warmup_vals = state_dict.get("_info_warmup_vals", [])
+        self._info_ref = state_dict.get("_info_ref", None)
+        self._info_ema = state_dict.get("_info_ema", None)
+        self._q_info = state_dict.get("_q_info", 1.0)
+        self._conc_warmup_vals = state_dict.get("_conc_warmup_vals", [])
+        self._conc_ref = state_dict.get("_conc_ref", None)
+        self._conc_ema = state_dict.get("_conc_ema", None)
+        self._q_conc = state_dict.get("_q_conc", 1.0)
+        self._q_total = state_dict.get("_q_total", 1.0)
+
+
 class SignalFractionLRScheduler:
     """LR scheduler implementing the two-timescale signal-fraction decomposition.
 
@@ -1160,7 +1316,11 @@ class FSDPEngine(BaseEngine):
         return optimizer
 
     def _build_lr_scheduler(self, optimizer):
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        from verl.utils.torch_functional import (
+            get_constant_schedule_with_warmup,
+            get_cosine_schedule_with_warmup,
+            get_linear_schedule_with_warmup,
+        )
 
         optim_config = self.optimizer_config
 
@@ -1179,6 +1339,14 @@ class FSDPEngine(BaseEngine):
 
         if lr_scheduler_type == "constant":
             lr_scheduler = get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=num_warmup_steps)
+        elif lr_scheduler_type == "linear":
+            lr_scheduler = get_linear_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=total_steps,
+                min_lr_ratio=min_lr_ratio,
+                zero_indexed_step=zero_indexed_step,
+            )
         elif lr_scheduler_type == "entropy_adaptive":
             min_ratio = optim_config.entropy_adaptive_min_ratio
             ema_beta = optim_config.entropy_adaptive_ema_beta
@@ -1228,6 +1396,18 @@ class FSDPEngine(BaseEngine):
                 alpha_replay_seed=optim_config.signal_fraction_alpha_replay_seed,
                 alpha_replay_start_step=optim_config.signal_fraction_alpha_replay_start_step,
                 alpha_replay_end_step=optim_config.signal_fraction_alpha_replay_end_step,
+            )
+        elif lr_scheduler_type == "signal_quality":
+            lr_scheduler = SignalQualityLRScheduler(
+                optimizer=optimizer,
+                num_warmup_steps=num_warmup_steps,
+                info_ema_beta=optim_config.signal_quality_info_ema_beta,
+                info_q_min=optim_config.signal_quality_info_q_min,
+                sq_warmup_steps=optim_config.signal_quality_warmup_steps,
+                use_concentration=optim_config.signal_quality_use_concentration,
+                conc_ema_beta=optim_config.signal_quality_conc_ema_beta,
+                conc_q_min=optim_config.signal_quality_conc_q_min,
+                conc_gamma=optim_config.signal_quality_conc_gamma,
             )
         else:
             raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
@@ -1652,6 +1832,20 @@ class FSDPEngine(BaseEngine):
         """
         if isinstance(self.lr_scheduler, EntropyAdaptiveLRScheduler):
             self.lr_scheduler.update_entropy(entropy)
+
+    def update_signal_quality_for_lr(self, info_value: float, conc_value: float = None):
+        """Update signal quality indicators for signal-quality LR scheduler.
+
+        No-op if the scheduler is not a SignalQualityLRScheduler.
+        """
+        if isinstance(self.lr_scheduler, SignalQualityLRScheduler):
+            self.lr_scheduler.update_signal_quality(info_value, conc_value)
+
+    def get_signal_quality_metrics(self) -> dict:
+        """Return signal-quality LR metrics. Empty dict if not applicable."""
+        if isinstance(self.lr_scheduler, SignalQualityLRScheduler):
+            return self.lr_scheduler.get_signal_quality_metrics()
+        return {}
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         """

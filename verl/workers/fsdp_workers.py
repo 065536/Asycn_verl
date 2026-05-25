@@ -140,6 +140,163 @@ def get_vl_model_vision_tower(vl_model_instance):
     return None
 
 
+def _compute_signal_quality_indicators(data: "DataProto", info_source: str, conc_source: str):
+    """Compute signal quality indicators from a training batch (local shard).
+
+    Each DP rank holds a shard of prompts.  We compute shard-local sums/counts
+    then all_reduce to get *global* indicators so every rank sees the same q_t.
+
+    Returns ``(info_value, conc_value, extra_log)`` where:
+      - info_value: float used by the scheduler
+      - conc_value: float or None
+      - extra_log: dict of auxiliary indicators for offline comparison
+    """
+    from collections import defaultdict
+    import numpy as np
+    import verl.utils.torch_functional as verl_F
+
+    batch = data.batch
+    if "token_level_scores" not in batch or "response_mask" not in batch:
+        return None, None, {}
+
+    uids = data.non_tensor_batch.get("uid", None)
+    if uids is None:
+        return None, None, {}
+
+    with torch.no_grad():
+        scores = batch["token_level_scores"]
+        response_mask = batch["response_mask"]
+        reward_scalar = scores.sum(dim=-1).float().cpu().numpy()
+
+    uid_to_indices = defaultdict(list)
+    for idx in range(len(reward_scalar)):
+        uid_to_indices[uids[idx]].append(idx)
+
+    n_local_prompts = len(uid_to_indices)
+
+    prompt_reward_vars = []
+    prompt_bernoulli_vars = []
+    prompt_informative = 0
+    for uid, indices in uid_to_indices.items():
+        rw = reward_scalar[indices]
+        K = len(indices)
+        if K > 1:
+            prompt_reward_vars.append(float(np.var(rw)))
+            p_i = float((rw == 1.0).mean())
+            prompt_bernoulli_vars.append(p_i * (1.0 - p_i))
+            if 0.0 < p_i < 1.0:
+                prompt_informative += 1
+        else:
+            prompt_reward_vars.append(0.0)
+            prompt_bernoulli_vars.append(0.0)
+
+    local_reward_var_sum = float(sum(prompt_reward_vars))
+    local_bernoulli_var_sum = float(sum(prompt_bernoulli_vars))
+    local_informative_count = float(prompt_informative)
+    local_n_prompts = float(n_local_prompts)
+
+    use_dist = torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+
+    if use_dist:
+        buf = torch.tensor(
+            [local_reward_var_sum, local_bernoulli_var_sum,
+             local_informative_count, local_n_prompts],
+            dtype=torch.float64, device="cpu",
+        )
+        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+        global_reward_var_sum = buf[0].item()
+        global_bernoulli_var_sum = buf[1].item()
+        global_informative_count = buf[2].item()
+        global_n_prompts = buf[3].item()
+    else:
+        global_reward_var_sum = local_reward_var_sum
+        global_bernoulli_var_sum = local_bernoulli_var_sum
+        global_informative_count = local_informative_count
+        global_n_prompts = local_n_prompts
+
+    N = max(global_n_prompts, 1.0)
+    global_reward_var_mean = global_reward_var_sum / N
+    global_reward_std_mean = float(np.sqrt(max(global_reward_var_mean, 0.0)))
+    global_bernoulli_var_mean = global_bernoulli_var_sum / N
+    global_frac_informative = global_informative_count / N
+
+    info_value = None
+    if info_source == "reward_std_median":
+        info_value = global_reward_std_mean
+    elif info_source == "frac_informative":
+        info_value = global_frac_informative
+    elif info_source == "bernoulli_var":
+        info_value = global_bernoulli_var_mean
+    elif info_source == "mean_a2":
+        if "advantages" in batch:
+            with torch.no_grad():
+                adv = verl_F.masked_mean(batch["advantages"], response_mask, axis=-1)
+                local_a2_sum = float((adv ** 2).sum().cpu().item())
+                local_a2_count = float(adv.numel())
+            if use_dist:
+                buf2 = torch.tensor([local_a2_sum, local_a2_count], dtype=torch.float64, device="cpu")
+                torch.distributed.all_reduce(buf2, op=torch.distributed.ReduceOp.SUM)
+                info_value = buf2[0].item() / max(buf2[1].item(), 1.0)
+            else:
+                info_value = local_a2_sum / max(local_a2_count, 1.0)
+
+    conc_value = None
+    if conc_source in ("cv2_h", "cv2_a2") and "advantages" in batch:
+        with torch.no_grad():
+            adv = verl_F.masked_mean(batch["advantages"], response_mask, axis=-1)
+            a_sq = (adv ** 2).float()
+
+            if conc_source == "cv2_a2":
+                local_sum = float(a_sq.sum().cpu().item())
+                local_sum_sq = float((a_sq ** 2).sum().cpu().item())
+                local_cnt = float(a_sq.numel())
+                if use_dist:
+                    buf3 = torch.tensor([local_sum, local_sum_sq, local_cnt], dtype=torch.float64, device="cpu")
+                    torch.distributed.all_reduce(buf3, op=torch.distributed.ReduceOp.SUM)
+                    g_sum, g_sum_sq, g_cnt = buf3[0].item(), buf3[1].item(), buf3[2].item()
+                else:
+                    g_sum, g_sum_sq, g_cnt = local_sum, local_sum_sq, local_cnt
+                if g_cnt > 0:
+                    g_mean = g_sum / g_cnt
+                    g_var = g_sum_sq / g_cnt - g_mean ** 2
+                    if g_mean > 1e-12:
+                        conc_value = max(g_var, 0.0) / (g_mean ** 2)
+
+            elif conc_source == "cv2_h":
+                has_score = "sum_pi_squared" in batch and "old_log_probs" in batch
+                if has_score:
+                    pi_t = torch.exp(batch["old_log_probs"])
+                    sum_pi_sq = batch["sum_pi_squared"]
+                    q_per_token = (1.0 - 2.0 * pi_t + sum_pi_sq).clamp(min=0.0)
+                    q_response = (q_per_token * response_mask).sum(dim=-1).float()
+                    h = a_sq.cpu() * q_response.cpu()
+                else:
+                    h = a_sq.cpu()
+                local_h_sum = float(h.sum().item())
+                local_h_sum_sq = float((h ** 2).sum().item())
+                local_h_cnt = float(h.numel())
+                if use_dist:
+                    buf4 = torch.tensor([local_h_sum, local_h_sum_sq, local_h_cnt], dtype=torch.float64, device="cpu")
+                    torch.distributed.all_reduce(buf4, op=torch.distributed.ReduceOp.SUM)
+                    gh_sum, gh_sum_sq, gh_cnt = buf4[0].item(), buf4[1].item(), buf4[2].item()
+                else:
+                    gh_sum, gh_sum_sq, gh_cnt = local_h_sum, local_h_sum_sq, local_h_cnt
+                if gh_cnt > 0:
+                    gh_mean = gh_sum / gh_cnt
+                    gh_var = gh_sum_sq / gh_cnt - gh_mean ** 2
+                    if gh_mean > 1e-12:
+                        conc_value = max(gh_var, 0.0) / (gh_mean ** 2)
+
+    extra_log = {
+        "actor/sq_alt_reward_var_mean": global_reward_var_mean,
+        "actor/sq_alt_reward_std_mean": global_reward_std_mean,
+        "actor/sq_alt_bernoulli_var": global_bernoulli_var_mean,
+        "actor/sq_alt_frac_informative": global_frac_informative,
+    }
+
+    return info_value, conc_value, extra_log
+
+
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
@@ -724,7 +881,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # TODO: add more optimizer args into config
         if role == "actor" and optim_config is not None:
-            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+            from verl.utils.torch_functional import (
+                get_constant_schedule_with_warmup,
+                get_cosine_schedule_with_warmup,
+                get_linear_schedule_with_warmup,
+            )
 
             actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
 
@@ -743,6 +904,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if lr_scheduler_type == "constant":
                 actor_lr_scheduler = get_constant_schedule_with_warmup(
                     optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps
+                )
+            elif lr_scheduler_type == "linear":
+                actor_lr_scheduler = get_linear_schedule_with_warmup(
+                    optimizer=actor_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio,
                 )
             elif lr_scheduler_type == "cosine":
                 actor_lr_scheduler = get_cosine_schedule_with_warmup(
@@ -798,6 +966,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     alpha_replay_seed=optim_config.get("signal_fraction_alpha_replay_seed", 0),
                     alpha_replay_start_step=optim_config.get("signal_fraction_alpha_replay_start_step", 21),
                     alpha_replay_end_step=optim_config.get("signal_fraction_alpha_replay_end_step", None),
+                )
+            elif lr_scheduler_type == "signal_quality":
+                from verl.workers.engine.fsdp.transformer_impl import SignalQualityLRScheduler
+
+                actor_lr_scheduler = SignalQualityLRScheduler(
+                    optimizer=actor_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    info_ema_beta=optim_config.get("signal_quality_info_ema_beta", 0.9),
+                    info_q_min=optim_config.get("signal_quality_info_q_min", 0.3),
+                    sq_warmup_steps=optim_config.get("signal_quality_warmup_steps", 20),
+                    use_concentration=optim_config.get("signal_quality_use_concentration", False),
+                    conc_ema_beta=optim_config.get("signal_quality_conc_ema_beta", 0.9),
+                    conc_q_min=optim_config.get("signal_quality_conc_q_min", 0.5),
+                    conc_gamma=optim_config.get("signal_quality_conc_gamma", 0.5),
                 )
             else:
                 raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
@@ -1265,8 +1447,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     if isinstance(entropy_val, list):
                         entropy_val = sum(entropy_val) / len(entropy_val)
                     self.actor_lr_scheduler.update_entropy(float(entropy_val))
+            if hasattr(self.actor_lr_scheduler, "update_signal_quality"):
+                optim_cfg = self.config.actor.optim
+                info_src = getattr(optim_cfg, "signal_quality_info_source", "reward_std_median")
+                conc_src = getattr(optim_cfg, "signal_quality_conc_source", "cv2_h")
+                info_val, conc_val, sq_extra = _compute_signal_quality_indicators(data, info_src, conc_src)
+                if info_val is not None:
+                    self.actor_lr_scheduler.update_signal_quality(info_val, conc_val)
+                    metrics["actor/sq_info_raw"] = info_val
+                    if conc_val is not None:
+                        metrics["actor/sq_conc_raw"] = conc_val
+                metrics.update(sq_extra)
             if hasattr(self.actor_lr_scheduler, "get_signal_fraction_metrics"):
                 metrics.update(self.actor_lr_scheduler.get_signal_fraction_metrics())
+            if hasattr(self.actor_lr_scheduler, "get_signal_quality_metrics"):
+                metrics.update(self.actor_lr_scheduler.get_signal_quality_metrics())
             self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics

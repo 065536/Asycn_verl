@@ -1,646 +1,1215 @@
-\documentclass[11pt]{article}
+
+\documentclass[11pt,a4paper]{article}
 
 \usepackage[margin=1in]{geometry}
-\usepackage[T1]{fontenc}
-\usepackage[utf8]{inputenc}
-\usepackage{lmodern}
-\usepackage{amsmath,amssymb,amsthm,mathtools}
-\usepackage{bm}
-\usepackage{booktabs}
+\usepackage{amsmath,amssymb,mathtools,bm}
+\usepackage{booktabs,array,longtable,multirow}
 \usepackage{enumitem}
-\usepackage{hyperref}
 \usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{microtype}
 \usepackage{setspace}
 \usepackage{titlesec}
 
-\setstretch{1.15}
-\setlist[itemize]{topsep=3pt,itemsep=2pt,leftmargin=2em}
-\setlist[enumerate]{topsep=3pt,itemsep=2pt,leftmargin=2.2em}
-\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+    citecolor=blue!60!black
+}
 
-\titleformat{\section}{\Large\bfseries}{\thesection}{0.75em}{}
-\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.75em}{}
+\setlength{\parskip}{0.45em}
+\setlength{\parindent}{1.6em}
+\setstretch{1.12}
 
-\title{Reconstructed Project Logic\\[0.4em]
-\large Fixed Update Rules, Effective Learning Information, and Bidirectional Learning-Rate Control}
+\titleformat{\section}{\Large\bfseries\color{blue!50!black}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries\color{blue!35!black}}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\color{blue!30!black}}{\thesubsubsection}{0.6em}{}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert_2}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\CV}{\operatorname{CV}}
+\newcommand{\Corr}{\operatorname{Corr}}
+\newcommand{\sgn}{\operatorname{sgn}}
+
+\title{\textbf{From Effective Signal Quality in GRPO to Learning-Rate Control:\\
+RL Noise Decomposition, Empirical Findings, and Algorithmic Directions}}
 \author{}
-\date{\today}
+\date{May 20, 2026}
 
 \begin{document}
-
 \maketitle
 
-\section{One-paragraph version}
-
-The problem should no longer be framed as ``entropy decreases, so the learning rate should also decrease,'' nor as a story centered on support. A more accurate formulation is the following:
-
-\begin{quote}
-In RL, the objective itself does not change, but every update can only be approximated through policy-induced samples. Therefore, training quality depends on how much \textbf{effective learning information} the current batch contains. This quantity is not constant; it changes across training phases. Fixed update rules, especially a fixed learning rate together with hard clipping, ignore that change and can therefore harm both stability and performance.
-\end{quote}
-
-Accordingly, the method should not be described as ``entropy-based monotone learning-rate decay.'' Instead, it should be framed as:
-
-\begin{quote}
-\textbf{phase-aware, bidirectional learning-rate control}: use online signals to determine whether the current update budget is underestimated or overestimated, and then adjust update aggressiveness in both directions.
-\end{quote}
-
-Within this framework, \textbf{learning rate is the controller, clipping is the detector, and entropy is at most a phase signal.}
-
-\section{A new starting point: RL as sample-based optimization under policy-induced sampling}
-
-The central difficulty of RL is not that the objective is ill-defined, but that the objective cannot be computed exactly. In practice, every update is built from samples induced by the current policy, and then used to update the parameters:
+\begin{abstract}
+This report summarizes our updated analysis of learning-rate sensitivity in GRPO/PPO-style LLM reinforcement learning. The original goal was to derive an optimal learning-rate form from \(L\)-smoothness:
 \[
-\theta_{t+1}=\theta_t+\alpha_t \hat g_t.
+\alpha_t^\star
+=
+\frac{1}{L_t}
+\cdot
+\frac{\|g_t\|^2}{\|g_t\|^2+N_t},
+\]
+and then estimate the signal fraction. However, our experiments show that both batch-split \(r_t\) and momentum-based estimators are unreliable in the current LLM RL setting. Stage-2 and independent \(A^2,Q,H\) analyses suggest a different core issue: the effective policy-gradient signal is sparse, heavy-tailed, and concentrated on a small subset of prompts and responses. In particular, the response-level policy-gradient energy proxy
+\[
+H_{i,k}=A_{i,k}^2Q_{i,k}
+\]
+is highly concentrated, and the variance of \(H\) is primarily driven by the advantage-energy term \(A^2\) and its interaction with score/length energy \(Q\). Therefore, sampling-side correction is the more direct root-cause intervention, while LR scheduling is better understood as a low-intrusion risk-control mechanism. The recommended next direction is to move away from the previous PG-Moment/\(\lambda_M\) calibration scheme and toward \textbf{Signal-Quality-Aware LR Scaling}, where the base learning rate is modulated by effective advantage-signal availability and gradient-energy concentration risk.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Background: From ``Best LR'' to RL Signal Quality}
+
+\subsection{Optimal LR from \(L\)-Smoothness}
+
+Consider maximizing an RL objective:
+\[
+J(\theta)
+=
+\E_{x\sim \mathcal D,\ y\sim \pi_\theta(\cdot|x)}
+\left[R(x,y)\right].
+\]
+Assume that \(J\) is locally \(L_t\)-smooth around \(\theta_t\). With a stochastic policy-gradient update
+\[
+\theta_{t+1}=\theta_t+\alpha \hat g_t,
+\]
+we have the lower bound
+\[
+J(\theta_t+\alpha \hat g_t)
+\ge
+J(\theta_t)
++
+\alpha g_t^\top \hat g_t
+-
+\frac{L_t}{2}\alpha^2\|\hat g_t\|^2,
+\]
+where
+\[
+g_t=\nabla J(\theta_t).
+\]
+If
+\[
+\hat g_t = g_t+\epsilon_t,\qquad \E[\epsilon_t]=0,
+\]
+and
+\[
+N_t=\E\|\epsilon_t\|^2,
+\]
+then
+\[
+\E\|\hat g_t\|^2=\|g_t\|^2+N_t.
+\]
+The expected lower-bound improvement is therefore
+\[
+\E[\Delta J_{lb}(\alpha)]
+=
+\alpha \|g_t\|^2
+-
+\frac{L_t}{2}\alpha^2(\|g_t\|^2+N_t).
+\]
+Maximizing this quadratic in \(\alpha\) gives
+\[
+\alpha_t^\star
+=
+\frac{1}{L_t}
+\cdot
+\frac{\|g_t\|^2}{\|g_t\|^2+N_t}.
+\]
+Define the signal fraction
+\[
+r_t
+=
+\frac{\|g_t\|^2}{\|g_t\|^2+N_t}.
+\]
+Then
+\[
+\alpha_t^\star=\frac{r_t}{L_t}.
 \]
 
-Here, $\hat g_t$ is not the exact gradient. It is an estimate constructed from the current batch.
-
-This immediately gives the first basic principle:
-
-\begin{quote}
-\textbf{Whether an update is reliable depends first on whether the sample-based evidence behind that step is reliable enough.}
-\end{quote}
-
-In other words, RL training is first and foremost an \textbf{optimization problem under evidence constraints}.
-
-\section{Formal derivation: signal fraction and optimal learning rate}
-
-This section derives, without gaps, the quantity that determines how large a learning rate is safe at each step of training.
-The derivation proceeds in four stages: gradient estimation quality, per-step improvement bound, the signal fraction, and a practical estimator.
-
-\subsection{Mean squared error of the gradient estimator}
-
-Let $X_i := A_i \nabla_\theta \log \pi_{\theta_t}(\tau_i) \in \mathbb{R}^d$ be the $i$-th per-sample gradient contribution, where $\tau_i \overset{\text{i.i.d.}}{\sim} \pi_{\theta_t}$ and $A_i = R(\tau_i) - b_t$ is the advantage with baseline $b_t$.
-The batch estimator is
-\[
-    \hat{g}_t = \frac{1}{n}\sum_{i=1}^n X_i,
-    \qquad \mathbb{E}[\hat{g}_t] = g_t \quad \text{(unbiased)}.
-\]
-Since the $X_i$ are i.i.d.\ with mean $g_t$, the centered variables $X_i - g_t$ are independent and mean-zero.
-Expanding the squared norm and using independence to eliminate cross-terms ($i \neq j$):
-\[
-    \mathbb{E}\bigl[\|\hat{g}_t - g_t\|^2\bigr]
-    = \frac{1}{n^2}\sum_{i=1}^n \mathbb{E}\bigl[\|X_i - g_t\|^2\bigr]
-    = \frac{1}{n}\,\mathbb{E}\bigl[\|X - g_t\|^2\bigr]
-    = \frac{\sigma_t^2}{n},
-\]
-where $\sigma_t^2 := \operatorname{tr}(\Sigma_t)$ is the total per-sample variance and $\Sigma_t = \operatorname{Cov}_{\pi_{\theta_t}}[X]$.
-
-\paragraph{Effective sample size.}
-The derivation above assumes all $n$ draws are statistically independent.
-When the policy is concentrated, many rollouts are identical, contributing no additional information.
-The effective number of independent samples is
-\[
-    n_\mathrm{eff}(t) \;:=\; \mathbb{E}[K_n] \;\approx\; \min\bigl(n,\; e^{H(\pi_{\theta_t})}\bigr),
-\]
-where $K_n$ is the number of \emph{distinct} trajectories among the $n$ draws and $H(\pi_{\theta_t})$ is the response-level entropy.
-Replacing $n$ with $n_\mathrm{eff}$ gives the effective MSE:
-\begin{equation}
-    \mathbb{E}\bigl[\|\hat{g}_t - g_t\|^2\bigr] \;\approx\; \frac{\sigma_t^2}{n_\mathrm{eff}(t)}.
-    \label{eq:mse}
-\end{equation}
-
-\subsection{Per-step expected improvement bound}
-
-Assume $J(\theta)$ is $L$-smooth.
-The descent lemma states that for any $\theta, \theta'$:
-\[
-    J(\theta') \geq J(\theta) + \nabla J(\theta)^\top(\theta' - \theta) - \frac{L}{2}\|\theta'-\theta\|^2.
-\]
-Substituting $\theta' = \theta_t + \alpha \hat{g}_t$ and $\nabla J(\theta_t) = g_t$:
-\[
-    J(\theta_{t+1}) \geq J(\theta_t) + \alpha\, g_t^\top \hat{g}_t - \frac{\alpha^2 L}{2}\|\hat{g}_t\|^2.
-\]
-Taking expectation over $\hat{g}_t$ requires two quantities.
-The first uses unbiasedness:
-\[
-    \mathbb{E}[g_t^\top \hat{g}_t] = g_t^\top \mathbb{E}[\hat{g}_t] = \|g_t\|^2.
-\]
-The second decomposes $\hat{g}_t = g_t + (\hat{g}_t - g_t)$:
-\begin{align*}
-    \mathbb{E}[\|\hat{g}_t\|^2]
-    &= \mathbb{E}[\|g_t + (\hat{g}_t - g_t)\|^2] \\
-    &= \|g_t\|^2 + 2\,g_t^\top \underbrace{\mathbb{E}[\hat{g}_t - g_t]}_{=\,0} + \mathbb{E}[\|\hat{g}_t - g_t\|^2] \\
-    &= \|g_t\|^2 + \frac{\sigma_t^2}{n_\mathrm{eff}}.
-\end{align*}
-Assembling the two expectations:
-\begin{equation}
-    \mathbb{E}[J(\theta_{t+1})] - J(\theta_t)
-    \;\geq\;
-    \alpha\|g_t\|^2 - \frac{\alpha^2 L}{2}\!\left(\|g_t\|^2 + \frac{\sigma_t^2}{n_\mathrm{eff}}\right).
-    \label{eq:bound}
-\end{equation}
-The right-hand side is a downward-opening quadratic in $\alpha$.
-Differentiating and setting equal to zero gives the \textbf{optimal step size}:
-\begin{equation}
-    \alpha^*(t)
-    = \frac{\|g_t\|^2}{L\!\left(\|g_t\|^2 + \sigma_t^2/n_\mathrm{eff}(t)\right)}.
-    \label{eq:alphaopt}
-\end{equation}
-
-\subsection{The signal fraction $r_t$}
-
-Define the \textbf{signal fraction}:
-\begin{equation}
-    r_t \;:=\; \frac{\|g_t\|^2}{\|g_t\|^2 + \sigma_t^2/n_\mathrm{eff}(t)} \;\in\; (0,\,1].
-    \label{eq:rt}
-\end{equation}
-Then $\alpha^*(t) = r_t / L$.
-
-To see why $r_t$ is the central quantity, factor the bound~\eqref{eq:bound}.
-Let $D_t := \|g_t\|^2 + \sigma_t^2/n_\mathrm{eff} > 0$; then:
-\[
-    \mathbb{E}[J(\theta_{t+1})] - J(\theta_t)
-    \;\geq\;
-    D_t \cdot \alpha \!\left[r_t - \frac{\alpha L}{2}\right].
-\]
-Since $D_t > 0$ and $\alpha > 0$, the expected improvement is positive if and only if
-\[
-    \alpha \;<\; \frac{2r_t}{L} \;=\; 2\alpha^*(t).
-\]
-The absolute magnitudes of $\|g_t\|^2$ and $\sigma_t^2/n_\mathrm{eff}$ carry no additional information:
-only their ratio enters the safe-zone condition.
-As training progresses, $n_\mathrm{eff}(t)$ decreases, $r_t$ decreases, and $\alpha^*(t)$ decreases proportionally.
-A fixed learning rate therefore eventually exceeds $2\alpha^*(t)$, causing expected-negative updates.
-
-\paragraph{Connection to discriminability.}
-$r_t$ is a precise formalization of the discriminability notion introduced in Section~\ref{sec:eli}.
-When all rollouts are identical ($n_\mathrm{eff} = 1$, policy fully concentrated), $\sigma_t^2/n_\mathrm{eff}$ dominates and $r_t \to 0$: the gradient estimate is pure noise.
-When rollouts are diverse ($n_\mathrm{eff} \approx n$), $r_t \to 1$: the gradient estimate reliably points in the true direction.
-
-\subsection{Estimating $r_t$ in practice: the split-batch estimator}
-
-\paragraph{The challenge.}
-We observe $\hat{g}_t$ but not $g_t$.
-Since $\mathbb{E}[\|\hat{g}_t\|^2] = \|g_t\|^2 + \sigma_t^2/n_\mathrm{eff}$, the squared gradient norm confounds signal and noise and cannot identify $r_t$ on its own.
-
-\paragraph{Key tool: cross-term of independent estimators.}
-Suppose $\hat{g}_A$ and $\hat{g}_B$ are two \emph{independent} unbiased estimators of $g_t$.
-By independence:
-\[
-    \mathbb{E}[\hat{g}_A^\top \hat{g}_B]
-    = \mathbb{E}[\hat{g}_A]^\top \mathbb{E}[\hat{g}_B]
-    = \|g_t\|^2.
-\]
-The cross-product $\hat{g}_A^\top \hat{g}_B$ is therefore an \textbf{unbiased estimator of $\|g_t\|^2$}.
-The noise terms cancel by independence, while $\|\hat{g}_A\|^2$ and $\|\hat{g}_B\|^2$ each estimate $\|g_t\|^2 + \sigma_t^2/n_\mathrm{eff,half}$.
-
-\paragraph{Estimator.}
-Split the current batch into two non-overlapping halves A and B and compute:
-\begin{equation}
-    \hat{r}_t
-    = \frac{\hat{g}_A^\top \hat{g}_B}{\dfrac{\|\hat{g}_A\|^2 + \|\hat{g}_B\|^2}{2}}.
-    \label{eq:rt-est}
-\end{equation}
-The numerator is an unbiased estimate of $\|g_t\|^2$; the denominator estimates $\|g_t\|^2 + \sigma_t^2/n_\mathrm{eff,half}$.
-
-\paragraph{Key requirement.}
-The only condition for validity is that $\hat{g}_A$ and $\hat{g}_B$ are generated under the \emph{same} $\theta_t$.
-The two halves may contain entirely different prompts; shared prompts are not required.
-In particular, any two rollout batches generated from the same model checkpoint are valid inputs to~\eqref{eq:rt-est}, regardless of whether they share any prompts.
-Batches from \emph{different} training steps cannot be used, because updating $\theta$ changes $g_t$.
-
-\paragraph{Practical variants.}
-\begin{itemize}
-    \item \textbf{Prompt split}: assign half the prompts (and all their rollouts) to each group.
-          No additional rollout cost; each half gradient is computed from an independent subset of the existing batch.
-    \item \textbf{Two independent batches}: generate two separate batches at the same $\theta_t$.
-          Each half has full prompt diversity, yielding a more stable estimate, at the cost of roughly double the rollout generation.
-\end{itemize}
-
-\subsection{What $r_t$ solves and what it does not: shape vs.\ scale}
-\label{sec:shape-scale}
-
-The split-batch estimator gives us $\hat{r}_t$ at each step.
-Suppose we use it to set the learning rate as $\alpha(t) = \alpha(0) \cdot r_t / r_0$.
-Unrolling this:
-\[
-    \alpha(t) = \frac{\alpha(0)}{r_0} \cdot r_t =: C \cdot r_t.
-\]
-Comparing to the target $\alpha^*(t) = r_t / L$, the ratio is:
-\[
-    \frac{\alpha(t)}{\alpha^*(t)} = C \cdot L = \frac{\alpha(0) \cdot L}{r_0}.
-\]
-This ratio is \emph{constant}---it does not change over time.
-Tracking $r_t$ correctly reproduces the \textbf{shape} of $\alpha^*(t)$ (how much it decreases, and when), but the absolute \textbf{scale} is fixed by the initialization $\alpha(0)$ and the unknown $L$.
-If the initialization is wrong, the error is preserved indefinitely: pure $r_t$ tracking cannot self-correct.
-
-This gives a clean decomposition of what needs to be solved:
-\begin{enumerate}
-    \item \textbf{Shape}: how should $\alpha$ change relative to its current value as training progresses? --- answered by $\hat{r}_t$.
-    \item \textbf{Scale}: what is the correct absolute magnitude of $\alpha$? --- requires additional information about $1/L$.
+This decomposition gives two important messages:
+\begin{enumerate}[leftmargin=2em]
+    \item The optimal LR should decrease when the gradient signal fraction decreases.
+    \item Even if \(r_t\) were estimated well, the absolute scale \(1/L_t\) remains. Therefore, a first practical method should be positioned as LR modulation:
+    \[
+    \alpha_t=\alpha_{\mathrm{base}} q_t,
+    \]
+    where \(\alpha_{\mathrm{base}}\) captures the average curvature scale and \(q_t\) captures relative signal-quality changes.
 \end{enumerate}
 
-\section{The core object: effective learning information}
-\label{sec:eli}
+\subsection{Why Fixed-LR Sweeps Remain Strong Baselines}
 
-To replace the old, overly abstract support notion, we introduce a cleaner middle-layer object:
+If the goal is only to obtain the best performance in a single fixed setting, sweeping a fixed LR can be effective. A stable fixed LR can avoid high-LR late-stage degradation. However, a fixed-LR sweep does not explain:
+\begin{itemize}[leftmargin=2em]
+    \item why the same LR can help early training but hurt late training;
+    \item whether the selected LR transfers after changing \(N,K\), reward/verifier, model scale, or data distribution;
+    \item whether the effective policy-gradient signal changes structurally during training.
+\end{itemize}
+
+Thus, the goal of LR scheduling should not be stated as ``fully replacing fixed-LR sweeps.'' A more defensible goal is:
 \[
-\textbf{effective learning information}.
+\boxed{
+\text{reduce stage-wise LR mismatch, seed sensitivity, and cross-setting tuning cost.}
+}
 \]
 
-This is not the nominal batch size, nor simply the number of samples. Even with a fixed batch size, the amount of learning information that truly supports the update may differ dramatically across training stages.
+\section{Limitations of Earlier Routes: Batch Split, Momentum, and MARS}
 
-A useful conceptual decomposition is:
+\subsection{Failure of Batch-Split \(r_t\)}
+
+The earlier estimator splits the batch into two halves:
 \[
-\text{ELI}_t \approx \text{Relevance}_t \times \text{Discriminability}_t \times \text{Coverage}_t.
+\hat g_A=g_t+\epsilon_A,\qquad
+\hat g_B=g_t+\epsilon_B.
+\]
+It estimates the signal fraction as
+\[
+\hat r_t^{split}
+=
+\frac{\hat g_A^\top \hat g_B}
+{\frac{1}{2}(\|\hat g_A\|^2+\|\hat g_B\|^2)}.
+\]
+The numerator expands as
+\[
+\hat g_A^\top \hat g_B
+=
+\|g_t\|^2
++
+g_t^\top \epsilon_A
++
+g_t^\top \epsilon_B
++
+\epsilon_A^\top \epsilon_B.
+\]
+In late-stage RL, the true signal \(\|g_t\|^2\) can become small, so the estimator is dominated by the noise term \(\epsilon_A^\top\epsilon_B\).
+
+Empirically, we observed:
+\[
+r_t^{split}\approx 0.002\sim 0.004,\qquad
+\Pr(g_A^\top g_B>0)\approx 54\%.
+\]
+This indicates that split-batch alignment is only slightly better than a coin flip and is unsuitable as a step-level LR controller.
+
+\subsection{Why Momentum Should Not Be the Main \(r_t\) Estimator}
+
+Adam momentum
+\[
+m_t=\beta_1 m_{t-1}+(1-\beta_1)\hat g_t
+\]
+is useful as an optimizer-side update smoother. However, using \(\|m_t\|^2\) as an estimate of the current \(\|g_t\|^2\) requires a much stronger quasi-static assumption.
+
+Expanding the momentum gives
+\[
+m_t=(1-\beta_1)\sum_{j=0}^\infty \beta_1^j \hat g_{t-j}.
+\]
+It tracks the historical average gradient
+\[
+\bar g_t=(1-\beta_1)\sum_{j=0}^\infty \beta_1^j g_{t-j},
+\]
+not the current \(g_t\). In RL, the policy distribution, reward structure, and advantage informativeness all change during training. In signal-decay regimes,
+\[
+\|\bar g_t\|^2>\|g_t\|^2,
+\]
+so the momentum norm can overestimate current signal power.
+
+Therefore:
+\[
+\boxed{
+\text{momentum is useful as an optimizer or diagnostic, but not as the main } r_t \text{ estimator.}
+}
 \]
 
-\subsection{Relevance}
+\subsection{Positioning MARS}
 
-Is the current batch still relevant to the current policy update?
+MARS is an optimizer-side variance-reduction method that combines scaled stochastic recursive momentum with optimizers such as AdamW, Lion, or Shampoo. It answers:
+\[
+\boxed{
+\text{given a stochastic gradient, how can we obtain a less noisy update direction?}
+}
+\]
+Our current question is:
+\[
+\boxed{
+\text{given the current RL signal quality, how should we modulate the base LR?}
+}
+\]
+These are related but not the same. MARS can serve as an optimizer baseline, but it cannot replace RL noise-source decomposition or LR scheduling.
 
-If the data are stale, off-policy, generated by an older model version, or if the rollout policy and the training policy have drifted apart, then the batch may no longer answer the question ``what should the current policy learn next?''
 
-This is exactly where the following phenomena belong:
-\begin{itemize}
-    \item the difference between sync and async;
-    \item stale data;
-    \item sample-policy mismatch;
-    \item train--inference mismatch.
-\end{itemize}
+\section{Bridging the Gap: From Gradient Noise to \(A^2\), \(Q\), and \(H=A^2Q\)}
 
-Hence, sync and async are not different diseases. They differ in degree:
-\begin{quote}
-\textbf{both affect the relevance of current evidence, but async typically degrades it more severely.}
-\end{quote}
+A key conceptual point is that the abstract gradient-noise term
+\[
+N_t=\mathbb{E}\|\hat g_t-g_t\|^2
+\]
+is not directly equal to \(A^2\), \(Q\), or \(A^2Q\). These quantities appear only after expanding the response-level policy-gradient contribution whose finite-sample average forms \(\hat g_t\). The purpose of this section is to make this bridge explicit.
 
-\subsection{Discriminability}
+\subsection{Gradient Noise as Finite-Sample Error of Policy-Gradient Contributions}
 
-Does the current batch still contain enough contrastive information to distinguish which directions are worth updating?
+At the abstract level, the stochastic gradient can be written as
+\[
+\hat g_t=g_t+\epsilon_t,
+\]
+where \(g_t=\nabla J(\theta_t)\) is the true policy gradient and \(\epsilon_t\) is the finite-sample estimation error. The noise power in the learning-rate derivation is
+\[
+N_t
+=
+\mathbb{E}\|\hat g_t-g_t\|^2
+=
+\mathbb{E}\|\epsilon_t\|^2.
+\]
 
-As the policy sharpens, samples become more homogeneous, alternative branches appear less often, and gradient contributions concentrate on fewer samples or tokens. As a result, the nominal batch size may stay fixed while the amount of information that can actually change the policy direction decreases.
+In policy-gradient training, the batch gradient is an average of response-level contributions. For prompt \(i\) and response \(k\), define
+\[
+z_{i,k}
+=
+A_{i,k}\nabla_\theta \log \pi_\theta(y_{i,k}\mid x_i).
+\]
+Then the batch gradient can be written as
+\[
+\hat g_t
+=
+\frac{1}{N}
+\sum_{i=1}^{N}
+\frac{1}{K}
+\sum_{k=1}^{K}
+z_{i,k}.
+\]
+The true policy gradient is
+\[
+g_t=\mathbb{E}[z].
+\]
+Therefore, the gradient noise is the finite-sample error of estimating \(\mathbb{E}[z]\) with a finite batch:
+\[
+\epsilon_t=\hat g_t-g_t.
+\]
 
-This is more precise than simply saying ``advantage becomes less informative.'' What we really mean is:
+For a random contribution \(z\), its variance satisfies
+\[
+\operatorname{Var}(z)
+=
+\mathbb{E}\|z\|^2
+-
+\|\mathbb{E}[z]\|^2
+=
+\mathbb{E}\|z\|^2
+-
+\|g_t\|^2.
+\]
+For a batch mean with effective sample size \(n_{\mathrm{eff},t}\), the gradient-noise power roughly scales as
+\[
+N_t
+\approx
+\frac{1}{n_{\mathrm{eff},t}}
+\left(
+\mathbb{E}\|z\|^2-\|g_t\|^2
+\right).
+\]
+When the true signal \(\|g_t\|^2\) is small relative to the second moment, a useful approximation is
+\[
+N_t
+\approx
+\frac{1}{n_{\mathrm{eff},t}}
+\mathbb{E}\|z\|^2.
+\]
+Thus, to understand gradient noise, it is natural to inspect the second moment of the response-level policy-gradient contribution.
 
-\begin{quote}
-\textbf{the fraction of contrastive, policy-shaping information in the batch decreases over training, so the effective batch size shrinks.}
-\end{quote}
+\subsection{Expanding \(z\) Introduces the Advantage-Energy Term \(A^2\)}
 
-\subsection{Coverage}
+Because
+\[
+z=A\nabla_\theta\log\pi_\theta(y\mid x),
+\]
+we have
+\[
+\|z\|^2
+=
+A^2
+\left\|
+\nabla_\theta\log\pi_\theta(y\mid x)
+\right\|^2.
+\]
+Therefore,
+\[
+\mathbb{E}\|z\|^2
+=
+\mathbb{E}
+\left[
+A^2
+\left\|
+\nabla_\theta\log\pi_\theta(y\mid x)
+\right\|^2
+\right].
+\]
 
-Does the current batch still cover directions that are potentially important but not yet fully developed?
+This is the first bridge from abstract gradient noise to RL-specific quantities. The factor \(A^2\) measures the strength of the advantage signal.
 
-Some branches are not ``already clearly better but underweighted.'' Instead, their value only becomes visible after repeated visitation and further training of downstream continuations. If policy sharpening cuts off those branches too early, the system loses not only current evidence, but also the ability to continue developing their latent potential.
-
-This is the deeper meaning of exploration contraction: it is not merely ``less exploration,'' but rather \textbf{a shrinking coverage of learnable directions in future data.}
-
-\section{The real problem: fixed update rules assume stationary information}
-
-The problem can now be compressed into one sentence:
-
-\begin{quote}
-\textbf{Fixed update rules implicitly assume that the quality of learning evidence available at each step is roughly constant, but in RL this assumption is often false.}
-\end{quote}
-
-Because training is policy-coupled, the effective learning information contained in future batches changes as the policy changes:
-\begin{itemize}
-    \item relevance may degrade because of staleness or mismatch;
-    \item discriminability may decrease as sampled behavior contracts;
-    \item coverage may shrink as alternative branches disappear.
-\end{itemize}
-
-Therefore, the core problem with a fixed learning rate is not merely that it may sometimes be too large. It is that:
-
-\begin{quote}
-\textbf{a fixed learning rate is phase-mismatched.}
-\end{quote}
-
-The same step size may be too small early in training and too large later in training.
-
-\section{Why this is a performance problem, not only a stability problem}
-
-If the issue were only that a large step size may cause collapse, then the work would be mostly a stability patch. But the deeper issue is that practitioners often use a globally conservative learning rate precisely to avoid late-stage collapse.
-
-This creates a structural cost:
-\begin{itemize}
-    \item to remain safe later, the system moves too slowly in early phases where it could have optimized more aggressively;
-    \item if the global LR is increased to exploit the information-rich early phase, later optimization becomes too aggressive.
-\end{itemize}
-
-Thus a fixed learning rate hurts in two symmetric ways:
-\begin{enumerate}
-    \item it may be too large late in training, causing instability;
-    \item it may be too small early in training, suppressing achievable performance.
+In GRPO, if all responses under a prompt receive the same reward, the group-normalized advantages are approximately zero:
+\[
+A_{i,k}\approx 0.
+\]
+Such prompt groups provide little or no relative preference signal for the actor update. Therefore, \(A^2\) captures both signal availability and signal concentration:
+\begin{enumerate}[leftmargin=2em]
+    \item If many responses have \(A^2\approx 0\), the effective policy-gradient signal is sparse.
+    \item If only a few responses have very large \(A^2\), the gradient energy becomes heavy-tailed and concentrated.
 \end{enumerate}
 
-Therefore, the work should not only claim improved stability. It should claim:
+\subsection{Approximating the Score Norm with a Logit-Space Proxy \(Q\)}
 
-\begin{quote}
-\textbf{an improved stability--performance frontier through phase-aware update control.}
-\end{quote}
-
-\section{Where clipping enters the story}
-
-Clipping should not be the primary method object, but it cannot be ignored. The cleanest positioning is:
-
-\begin{quote}
-\textbf{clipping is the detection point of update-rule mismatch and the mechanism window through which information truncation becomes visible.}
-\end{quote}
-
-\subsection{Why clipping matters}
-
-In PPO- or GRPO-style objectives, ratio clipping decides which sample-level updates are still trusted and which are forcibly truncated. Therefore, clipping statistics are not merely measures of policy movement. They directly measure:
-
-\begin{quote}
-\textbf{how much of the proposed update has already moved outside the region that the algorithm itself still considers trustworthy.}
-\end{quote}
-
-By contrast, KL is more of a geometric distance measure. Clipping is closer to what this project actually cares about:
-\begin{quote}
-\textbf{whether effective gradient information is being systematically truncated.}
-\end{quote}
-
-\subsection{How clipping makes the failure of fixed LR visible}
-
-When a fixed LR is too large for the current phase, the following chain becomes more likely:
+The true parameter-space score norm
 \[
-\text{LR too large}
-\Rightarrow
-\text{ratio spread increases}
-\Rightarrow
-\text{more tokens are clipped}
-\Rightarrow
-\text{effective gradient information is truncated}
-\Rightarrow
-\text{performance saturates or degrades}.
+\left\|
+\nabla_\theta\log\pi_\theta(y\mid x)
+\right\|^2
+\]
+is expensive to compute per response for large language models. We therefore use a logit-space proxy.
+
+For a token with logits \(\ell\), probability vector
+\[
+p=\operatorname{softmax}(\ell),
+\]
+and sampled token \(a\), the logit-space score is
+\[
+\nabla_\ell \log p(a)=e_a-p.
+\]
+Its squared norm is
+\[
+q_\tau
+=
+\|e_a-p\|^2
+=
+1-2p(a)+\sum_v p(v)^2.
+\]
+For a full response, define
+\[
+Q_{i,k}
+=
+\sum_{\tau=1}^{T_{i,k}}
+q_{i,k,\tau}.
 \]
 
-Therefore clipping is best viewed as:
-\begin{itemize}
-    \item a symptom of phase mismatch;
-    \item a mechanism of information loss;
-    \item a feedback signal for learning-rate control.
+Thus, \(Q_{i,k}\) is a score-function / response-length energy proxy. It does not measure whether a response is good or bad; it measures how large the score-side gradient energy is for that response.
+
+Since the true parameter-space score norm is not directly available, \(Q_{i,k}\) is used as a cheap proxy for its relative variation.
+
+\subsection{The Combined Proxy \(H=A^2Q\)}
+
+Combining the advantage-energy factor and the score-energy proxy gives
+\[
+\|z_{i,k}\|^2
+\approx
+A_{i,k}^2Q_{i,k}.
+\]
+We define
+\[
+\boxed{
+H_{i,k}=A_{i,k}^2Q_{i,k}
+}
+\]
+and interpret it as a response-level policy-gradient energy proxy.
+
+Therefore,
+\[
+\boxed{
+A^2 \text{ measures advantage-signal strength,}
+}
+\]
+\[
+\boxed{
+Q \text{ measures score/length energy,}
+}
+\]
+and
+\[
+\boxed{
+H=A^2Q \text{ approximates response-level policy-gradient energy.}
+}
+\]
+
+The full bridge can be summarized as
+\[
+\text{gradient noise}
+\rightarrow
+\text{finite-sample variance of } z
+\rightarrow
+\mathbb{E}\|z\|^2
+\rightarrow
+A^2\|\nabla\log\pi\|^2
+\rightarrow
+A^2Q.
+\]
+
+Thus, \(A^2\), \(Q\), and \(H\) are not themselves the abstract gradient-noise term \(N_t\). They are observable factors that control the second moment of policy-gradient contributions, and therefore help explain finite-sample gradient noise.
+
+\subsection{Connecting \(H\) to Prompt-Level and Rollout-Level Noise}
+
+Once each response has a scalar policy-gradient energy proxy \(H_{i,k}\), we can analyze where its variability comes from. For each prompt, define
+\[
+\mu_i^H
+=
+\frac{1}{K}
+\sum_{k=1}^{K}
+H_{i,k}.
+\]
+The across-prompt component is
+\[
+V_{\mathrm{between}}^H
+=
+\operatorname{Var}_i(\mu_i^H).
+\]
+This measures how different prompts vary in their average policy-gradient energy proxy.
+
+The within-prompt rollout component is
+\[
+V_{\mathrm{within,raw}}^H
+=
+\mathbb{E}_i
+\left[
+\operatorname{Var}_k(H_{i,k})
+\right].
+\]
+Since the prompt-level estimator averages over \(K\) responses, the batch-level within contribution should be compared after the \(1/K\) correction:
+\[
+V_{\mathrm{within,corr}}^H
+=
+\frac{V_{\mathrm{within,raw}}^H}{K}.
+\]
+The corrected between fraction is
+\[
+f_{\mathrm{between}}^H
+=
+\frac{
+V_{\mathrm{between}}^H
+}{
+V_{\mathrm{between}}^H+V_{\mathrm{within,raw}}^H/K+\epsilon
+}.
+\]
+
+This decomposition does not claim to exactly equal the full parameter-space gradient covariance. Instead, it is a scalar policy-gradient energy proxy decomposition. It is useful for diagnosing whether the effective gradient energy is dominated by:
+\begin{enumerate}[leftmargin=2em]
+    \item prompt-to-prompt heterogeneity;
+    \item within-prompt rollout variability;
+    \item advantage-signal sparsity or heavy tails;
+    \item score/length amplification.
+\end{enumerate}
+
+In later empirical sections, we analyze \(A^2\), \(Q\), and \(H=A^2Q\) separately to determine which factor drives the observed policy-gradient energy concentration.
+
+
+\section{Noise Decomposition in RL: Two Levels}
+
+\subsection{Level 1: Sampling Axis}
+
+In GRPO, a prompt \(x_i\) has \(K\) responses:
+\[
+y_{i,1},\ldots,y_{i,K}.
+\]
+The response-level policy-gradient contribution is
+\[
+z_{i,k}=A_{i,k}\nabla_\theta \log \pi_\theta(y_{i,k}|x_i).
+\]
+The prompt-level contribution is
+\[
+U_i=\frac{1}{K}\sum_{k=1}^K z_{i,k}.
+\]
+The batch gradient is
+\[
+\hat g=\frac{1}{N}\sum_{i=1}^N U_i.
+\]
+Define
+\[
+\mu(x)=\E[U|x].
+\]
+By the law of total variance,
+\[
+\Var(U)
+=
+\underbrace{\Var_x(\mu(x))}_{\text{between-prompt noise}}
++
+\underbrace{\E_x[\Var(U|x)]}_{\text{within-prompt rollout noise}}.
+\]
+Under an approximate independence assumption across responses,
+\[
+N_t
+\approx
+\frac{1}{N}\sigma^2_{\mathrm{prompt},t}
++
+\frac{1}{NK}\sigma^2_{\mathrm{rollout},t}.
+\]
+
+Thus the two top-level sampling noise sources are:
+\[
+\boxed{\text{between-prompt sampling noise}}
+\]
+and
+\[
+\boxed{\text{within-prompt rollout sampling noise}}.
+\]
+
+\subsection{Level 2: Factor Axis}
+
+The true response-level gradient energy is
+\[
+\|z_{i,k}\|^2
+=
+A_{i,k}^2
+\left\|
+\nabla_\theta\log\pi_\theta(y_{i,k}|x_i)
+\right\|^2.
+\]
+The parameter-space score norm is expensive, so we use a logit-space score/length proxy \(Q_{i,k}\).
+
+For a token \(\tau\), let the probability vector be \(p\) and the sampled token be \(a\). The logit-space score is
+\[
+\nabla_\ell \log p(a)=e_a-p,
+\]
+with squared norm
+\[
+q_\tau
+=
+\|e_a-p\|^2
+=
+1-2p(a)+\sum_v p(v)^2.
+\]
+The response-level score energy is
+\[
+Q_{i,k}=\sum_{\tau=1}^{T_{i,k}} q_{i,k,\tau}.
+\]
+We define
+\[
+\boxed{
+H_{i,k}=A_{i,k}^2Q_{i,k}.
+}
+\]
+Here:
+\begin{itemize}[leftmargin=2em]
+    \item \(A_{i,k}\): GRPO advantage;
+    \item \(A_{i,k}^2\): advantage energy, or reward/advantage signal strength;
+    \item \(Q_{i,k}\): score-function / response-length energy proxy;
+    \item \(H_{i,k}=A_{i,k}^2Q_{i,k}\): policy-gradient energy proxy.
 \end{itemize}
 
-\section{The proposed framework: feedforward shape + feedback scale}
-
-Section~\ref{sec:shape-scale} established that $\hat{r}_t$ solves the shape problem but not the scale problem.
-Directly estimating $L$ to recover the scale is rejected for three reasons.
-First, $L$ is a global Lipschitz constant, but what training actually needs is the local effective curvature, which changes as the policy, sampling distribution, and advantage distribution all evolve.
-Second, the finite-difference estimator $\hat{L}_t \approx \|\hat{g}_t - \hat{g}_{t-1}\| / (\alpha_{t-1}\|\hat{g}_{t-1}\|)$ amplifies gradient noise directly: the numerator conflates true gradient change with the difference of two noisy estimates, and the bias is worst exactly when $n_\mathrm{eff}$ is small and accurate estimation is most needed.
-Third, Lipschitz upper bounds are inherently conservative, which would systematically suppress $\alpha_t$ below what is actually safe.
-
-The alternative is a \textbf{closed-loop} approach: use $\hat{r}_t$ as a feedforward signal for the shape, and let a feedback controller correct the absolute scale.
-
-\subsection{Feedforward + feedback decomposition}
-
-Write the learning rate as:
-\begin{equation}
-    \alpha_t = c_t \cdot \hat{r}_t,
-    \label{eq:framework}
-\end{equation}
-where:
-\begin{itemize}
-    \item $\hat{r}_t \in (0,1]$ is the split-batch signal fraction from~\eqref{eq:rt-est}, handling time-varying shape.
-    \item $c_t > 0$ is a scale factor updated by a feedback controller, targeting $c_t \to 1/L$.
-\end{itemize}
-
-Since $r_t$ handles all the systematic time variation in $\alpha^*(t)$, the scale $c_t$ should be a \textbf{slow-moving} quantity: if the controller is working correctly, $c_t$ drifts toward $1/L$ and then stays there.
-Persistent large oscillations in $c_t$ indicate either that $\hat{r}_t$ is too noisy, or that the feedback signal is not isolating the scale error.
-
-\subsection{Why clipping cannot be the feedback signal for $c_t$}
-
-Clipping fraction reflects the total magnitude of $\alpha_t\|\hat{g}_t\|$, which already incorporates $\hat{r}_t$.
-When the policy concentrates and $\hat{r}_t$ falls, $\alpha_t$ automatically shrinks and clipping pressure drops---even if $c_t$ is miscalibrated.
-Clipping therefore cannot distinguish a correctly-scaled $\alpha_t$ from one where $c_t$ is wrong but $\hat{r}_t$ is compensating.
-The feedback signal for $c_t$ must isolate the scale error from the shape variation that $\hat{r}_t$ already handles.
-
-\subsection{The held-out surrogate realization ratio $\phi_t$}
-
-The improvement bound~\eqref{eq:bound} already decomposes each step into a first-order gain and a second-order penalty.
-This decomposition can be measured directly from the existing split-batch structure, without additional rollouts.
-
-\paragraph{Setup.}
-Use half-batch $A$ to define the update direction and half-batch $B$ as a held-out evaluator:
+The second-level question is:
 \[
-    \theta_{t+1} = \theta_t + \alpha_t \hat{g}_A, \qquad \alpha_t = c_t\hat{r}_t.
+\boxed{
+\text{is the noise driven by advantage signal, score/length energy, or their interaction?}
+}
 \]
 
-\paragraph{Predicted gain.}
-The first-order Taylor expansion of $\mathcal{L}_B$ at $\theta_t$ gives:
+\section{Stage-2 Setup and Overall Performance}
+
+\subsection{Experimental Setup}
+
+The total number of responses per batch is fixed:
 \[
-    \mathcal{L}_B(\theta_{t+1}) \approx \mathcal{L}_B(\theta_t) + \nabla\mathcal{L}_B(\theta_t)^\top(\theta_{t+1}-\theta_t)
-    = \mathcal{L}_B(\theta_t) + \alpha_t\,\hat{g}_B^\top\hat{g}_A.
+N\times K=1024.
 \]
-Define the \textbf{predicted gain}:
-\begin{equation}
-    p_t := \alpha_t\,\hat{g}_B^\top\hat{g}_A.
-    \label{eq:pred-gain}
-\end{equation}
-Since $\mathbb{E}[\hat{g}_B^\top\hat{g}_A] = \|g_t\|^2$ (by independence of $A$ and $B$), we have $\mathbb{E}[p_t] = \alpha_t\|g_t\|^2$, which is exactly the first-order signal term in~\eqref{eq:bound}.
+We compare three configurations:
 
-\paragraph{Actual gain.}
-Define the \textbf{held-out surrogate gain}:
-\begin{equation}
-    a_t := \mathcal{L}_B(\theta_{t+1}) - \mathcal{L}_B(\theta_t).
-    \label{eq:actual-gain}
-\end{equation}
-This requires one additional forward pass on batch $B$ after the update; no new rollouts are needed.
-
-\paragraph{Realization ratio.}
-Define the \textbf{realization ratio}:
-\begin{equation}
-    \phi_t := \frac{a_t}{p_t + \varepsilon},
-    \label{eq:phi}
-\end{equation}
-where $\varepsilon > 0$ is a small regularizer.
-$\phi_t$ measures what fraction of the first-order predicted gain was actually realized by the step.
-
-\subsection{Derivation of the target $\phi^* = 1/2$}
-
-We now show that $\phi^* = 1/2$ is not an empirical choice but a direct consequence of the improvement bound.
-
-\paragraph{Step 1: Rewrite the bound in terms of $r_t$.}
-Let $D_t := \|g_t\|^2 + \sigma_t^2/n_\mathrm{eff}$ and recall $r_t = \|g_t\|^2/D_t$, so $D_t = \|g_t\|^2/r_t$.
-Substituting into~\eqref{eq:bound}:
-\[
-    f(\alpha) := \alpha\|g_t\|^2 - \frac{\alpha^2 L}{2}\cdot\frac{\|g_t\|^2}{r_t}
-    = \alpha\|g_t\|^2\!\left(1 - \frac{\alpha L}{2r_t}\right).
-\]
-
-\paragraph{Step 2: Express $\phi_t$ from the bound.}
-Using $p_t \approx \alpha_t\|g_t\|^2$ and $a_t \approx f(\alpha_t)$:
-\[
-    \phi_t \approx \frac{f(\alpha_t)}{\alpha_t\|g_t\|^2} = 1 - \frac{\alpha_t L}{2r_t}.
-\]
-
-\paragraph{Step 3: Substitute $\alpha_t = c_t\hat{r}_t \approx c_t r_t$.}
-\[
-    \phi_t \approx 1 - \frac{c_t r_t L}{2r_t} = 1 - \frac{c_t L}{2}.
-\]
-\textbf{$r_t$ cancels exactly.}
-This is not an approximation artifact: $r_t$ appears in both the curvature penalty (numerator) and the step size (via $\alpha_t = c_t r_t$) at the same order, and cancels upon division.
-The realization ratio $\phi_t$ reflects only the scale mismatch $c_t L$, not the time-varying shape $r_t$.
-
-\paragraph{Step 4: Fixed point.}
-Setting $c_t = 1/L$ (the target scale):
-\begin{equation}
-    \phi^* = 1 - \frac{(1/L) \cdot L}{2} = 1 - \frac{1}{2} = \frac{1}{2}.
-    \label{eq:phi-star}
-\end{equation}
-The target $\phi^* = 1/2$ is determined entirely by the improvement bound structure.
-
-\subsection{$\phi_t$ as a position encoding of step quality}
-
-More generally, if $\alpha_t = \beta \cdot \alpha^*(t)$ for some $\beta > 0$, then:
-\[
-    \phi_t \approx 1 - \frac{\beta}{2}.
-\]
-
-\begin{center}
-\begin{tabular}{cll}
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabular}{@{}lccc>{\raggedright\arraybackslash}p{0.42\linewidth}@{}}
 \toprule
-$\beta = \alpha_t/\alpha^*(t)$ & $\phi_t$ & Interpretation \\
+Config & \(N\) & \(K\) & MB & Purpose \\
 \midrule
-$< 1$ & $> 1/2$ & Step too conservative \\
-$= 1$ & $= 1/2$ & Optimal step \\
-$> 1$ & $< 1/2$ & Step too aggressive \\
-$= 2$ & $= 0$ & Boundary of positive expected improvement \\
-$> 2$ & $< 0$ & Overshoot: expected improvement negative \\
+n256k4 & 256 & 4  & 64 & High prompt diversity; low within-prompt averaging.\\
+n128k8 & 128 & 8  & 32 & Baseline configuration.\\
+n64k16 & 64  & 16 & 16 & Low prompt diversity; high within-prompt averaging.\\
 \bottomrule
 \end{tabular}
+\caption{Stage-2 \(N\times K\) rerun setup. Here MB denotes the mini-batch size.}
+\end{table}
+
+Key setup:
+\begin{itemize}[leftmargin=2em]
+    \item Model: DeepSeek-R1-Distill-Qwen-1.5B;
+    \item LR: constant \(3.1\times10^{-6}\), a stable LR regime;
+    \item usable runs: 9 runs, 3 seeds per config;
+    \item target length: roughly 300 updates;
+    \item validation: core avg5 = mean(AIME, AIME2025, GPQA, MINERVA, OLYMPIAD\_BENCH) acc/mean@16.
+\end{itemize}
+
+\subsection{Validation Performance}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Config & Seeds & Mean Best Avg5 & Mean Final Avg5 & Mean Drop & Std Final\\
+\midrule
+n256k4 & 3 & 0.3290 & 0.3282 & -0.0008 & 0.0021\\
+n128k8 & 3 & \textbf{0.3341} & \textbf{0.3315} & -0.0026 & \textbf{0.0016}\\
+n64k16 & 3 & 0.3312 & 0.3279 & -0.0033 & 0.0091\\
+\bottomrule
+\end{tabular}
+\caption{Validation performance across \(N,K\) configurations.}
+\end{table}
+
+The mean final differences across the three configurations are small, around \(0.003\). The n64k16 configuration has the largest seed-level standard deviation. Thus, one should not claim a statistically strong winner. Numerically, n128k8 is slightly better and appears to be a reasonable tradeoff under the current budget.
+
+\section{Sampling Axis: Between/Within Prompt Decomposition}
+
+\subsection{Corrected Decomposition for \(H=A^2Q\)}
+
+For any \(X\in\{A^2,Q,H\}\), define the prompt-level mean:
+\[
+\mu_i^X=\frac{1}{K}\sum_{k=1}^K X_{i,k}.
+\]
+The between component is
+\[
+V_{\mathrm{between}}^X=\Var_i(\mu_i^X).
+\]
+The raw within component is
+\[
+V_{\mathrm{within,raw}}^X=\E_i[\Var_k(X_{i,k})].
+\]
+For batch-level comparison, the within term should be corrected as
+\[
+V_{\mathrm{within,corr}}^X=\frac{V_{\mathrm{within,raw}}^X}{K}.
+\]
+Thus,
+\[
+f_{\mathrm{between}}^X
+=
+\frac{V_{\mathrm{between}}^X}
+{V_{\mathrm{between}}^X+V_{\mathrm{within,raw}}^X/K+\epsilon}.
+\]
+
+For \(H=A^2Q\), the empirical results are:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Config & \(K\) & Early & Mid & Late & Overall\\
+\midrule
+n256k4 & 4 & 0.642 & 0.673 & 0.681 & \textbf{0.664}\\
+n128k8 & 8 & 0.527 & 0.556 & 0.572 & 0.550\\
+n64k16 & 16 & 0.487 & 0.496 & 0.514 & \textbf{0.499}\\
+\bottomrule
+\end{tabular}
+\caption{Batch-corrected between-prompt fraction for \(H=A^2Q\).}
+\end{table}
+
+The key conclusion is:
+\[
+\boxed{
+K=4 \text{ is prompt-noise dominated, while } K=8/16 \text{ are roughly balanced.}
+}
+\]
+Therefore, the issue is not that within-prompt rollout noise always dominates. Instead, \(N/K\) controls the tradeoff between prompt diversity and within-prompt comparison quality.
+
+\subsection{Between Fraction by Factor}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrl}
+\toprule
+Factor & n256k4 & n128k8 & n64k16 & Interpretation\\
+\midrule
+\(A^2\) & 0.677 & 0.528 & 0.430 & most sensitive to \(K\)\\
+\(Q\) & 0.914 & 0.947 & 0.968 & mostly a prompt-level property\\
+\(H=A^2Q\) & 0.664 & 0.550 & 0.499 & combined result\\
+\bottomrule
+\end{tabular}
+\caption{Between-prompt fractions for \(A^2,Q,H\).}
+\end{table}
+
+This suggests:
+\[
+\boxed{
+Q \text{ is strongly prompt-structured, but its independent variation is not the main driver of } H.
+}
+\]
+
+\section{Factor Axis: Independent Analysis of \(A^2\), \(Q\), and \(H\)}
+
+\subsection{CV\(^2\): Relative Variation}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Metric & n256k4 & n128k8 & n64k16\\
+\midrule
+\(\CV^2(A^2)\) & 3.17 & 4.59 & \textbf{6.84}\\
+\(\CV^2(Q)\) & 0.34 & 0.36 & 0.36\\
+\(\CV^2(H)\) & 4.72 & 7.08 & \textbf{10.76}\\
+\bottomrule
+\end{tabular}
+\caption{Relative variation of \(A^2,Q,H\).}
+\end{table}
+
+The relative variation of \(A^2\) is much larger than that of \(Q\):
+\[
+\CV^2(A^2)\gg \CV^2(Q).
+\]
+Thus, differences in response-level gradient energy are mainly driven by the advantage side rather than the score/length side.
+
+\subsection{Counterfactual Attribution}
+
+We decompose the variance of
+\[
+H=A^2Q
+\]
+into three diagnostic components:
+\begin{itemize}[leftmargin=2em]
+    \item \(A^2\)-only: fix \(Q\) to its mean and allow \(A^2\) to vary;
+    \item \(Q\)-only: fix \(A^2\) to its mean and allow \(Q\) to vary;
+    \item interaction: the remaining multiplicative coupling.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Attribution & n256k4 & n128k8 & n64k16\\
+\midrule
+\(A^2\)-only frac & 0.531 & 0.499 & 0.488\\
+\(Q\)-only frac & 0.062 & 0.041 & 0.028\\
+Interaction frac & 0.407 & 0.460 & 0.484\\
+\bottomrule
+\end{tabular}
+\caption{Counterfactual attribution of \(H=A^2Q\) variance.}
+\end{table}
+
+The conclusion is:
+\[
+\boxed{
+\text{about half of }H\text{ variance comes from } A^2,\quad
+Q\text{-only explains only }3\%\sim6\%,\quad
+\text{and interaction explains }40\%\sim48\%.
+}
+\]
+Therefore, \(Q\) mainly acts as an amplifier through multiplication with \(A^2\), rather than as an independent primary driver.
+
+\subsection{Training-Time Decay}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrrr}
+\toprule
+Component & Metric & n256k4 & n128k8 & n64k16\\
+\midrule
+\(A^2\) & \(\E[A^2]\) decay & -25.7\% & -23.0\% & -17.2\%\\
+\(Q\) & score energy decay & -21.3\% & -27.0\% & -13.5\%\\
+\(H\) & \(\E[H]\) decay & -49.8\% & -48.7\% & -35.0\%\\
+\bottomrule
+\end{tabular}
+\caption{Early-to-late decay of \(A^2,Q,H\).}
+\end{table}
+
+There is no simple pattern of ``score energy stays high while signal weakens.'' Instead, both \(A^2\) and \(Q\) decay, and their product \(H\) decays even more. However, the distribution of \(A^2\) becomes more heavy-tailed, causing the remaining effective signal to become increasingly concentrated.
+
+\section{Reward Informativeness: Signal Sparsity}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Metric & n256k4 & n128k8 & n64k16\\
+\midrule
+frac\_informative & 0.401 & 0.536 & \textbf{0.648}\\
+frac\_all\_wrong & 0.349 & 0.279 & 0.229\\
+frac\_all\_correct & 0.249 & 0.186 & 0.123\\
+reward\_n\_unique/mean & 1.50 & 1.86 & 2.29\\
+reward\_std/median & 0.054 & 0.533 & \textbf{0.597}\\
+\bottomrule
+\end{tabular}
+\caption{Reward informativeness statistics.}
+\end{table}
+
+The key finding is:
+\[
+\boxed{
+K \uparrow \Rightarrow \text{more prompt groups have mixed rewards and richer effective advantage signal.}
+}
+\]
+However, higher reward informativeness does not necessarily imply better validation performance, because larger \(K\) reduces the number of prompts \(N\) and increases the heavy-tailed concentration of \(A^2/H\).
+
+\subsection{Training-Time Degradation}
+
+The fraction of informative prompt groups decreases during training in all configurations:
+\[
+\text{n256k4: } -8.5\%,\qquad
+\text{n128k8: } -9.7\%,\qquad
+\text{n64k16: } -4.7\%.
+\]
+This suggests that as the model improves, more prompt groups become all-correct or all-wrong, reducing effective group-level relative signal.
+
+\section{Gradient-Energy Concentration: Effective Batch Size Is Much Smaller Than Nominal Batch Size}
+
+\subsection{Response-Level Concentration}
+
+The top-10\% responses contribute most of \(|H|\):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+Config & step 10 & 50 & 100 & 150 & 200 & 250\\
+\midrule
+n256k4 & 0.485 & 0.637 & 0.659 & 0.617 & 0.664 & 0.658\\
+n128k8 & 0.583 & 0.695 & 0.654 & 0.680 & 0.715 & 0.699\\
+n64k16 & \textbf{0.640} & \textbf{0.741} & \textbf{0.771} & \textbf{0.724} & \textbf{0.724} & \textbf{0.714}\\
+\bottomrule
+\end{tabular}
+\caption{Top-10\% response share of total \(|H|\).}
+\end{table}
+
+For \(K=16\), only 10\% of responses contribute around \(71\%-77\%\) of \(|H|\).
+
+\subsection{Prompt-Level Concentration}
+
+At step 150:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+Config & prompts for 50\% within-H-var & prompts for 80\% & informative/total\\
+\midrule
+n256k4 & 21/256 (8.2\%) & 48/256 (18.8\%) & 115/256 (44.9\%)\\
+n128k8 & 9/128 (7.0\%) & 21/128 (16.4\%) & 66/128 (51.6\%)\\
+n64k16 & 5/64 (7.8\%) & 13/64 (20.3\%) & 40/64 (62.5\%)\\
+\bottomrule
+\end{tabular}
+\caption{Prompt concentration of within-H variance at step 150.}
+\end{table}
+
+Only around \(7\%-8\%\) of prompts contribute 50\% of within-H variance. This implies:
+\[
+\boxed{
+\text{the nominal batch size is large, but the effective gradient-contributing sample size is much smaller.}
+}
+\]
+
+\section{Summary of the Identified Problem}
+
+The problem we have identified has three layers.
+
+\subsection{Layer 1: Sampling Tradeoff}
+
+Under a fixed rollout budget:
+\[
+N\times K=1024.
+\]
+Increasing \(K\) has two opposite effects:
+\begin{itemize}[leftmargin=2em]
+    \item it improves within-prompt comparison quality and increases frac\_informative;
+    \item it reduces prompt diversity and increases \(A^2/H\) heavy-tail concentration risk.
+\end{itemize}
+Therefore, larger \(K\) is not always better. Under the current stable-LR setting, \(N=128,K=8\) appears to be a reasonable empirical tradeoff.
+
+\subsection{Layer 2: Advantage Signal Is the Main Driver}
+
+The relative variation of \(A^2\) is much larger than that of \(Q\), and \(A^2\)-only explains about half of the variance of \(H\). The main issue is therefore on the reward/advantage side:
+\[
+\boxed{
+\text{effective advantage signal is sparse and heavy-tailed.}
+}
+\]
+
+\subsection{Layer 3: Gradient-Energy Concentration}
+
+A small number of prompts/responses dominate most of \(H\), causing the effective sample size to be much smaller than the nominal batch size. A fixed LR can become overly sensitive to such heavy-tailed batches.
+
+\section{Sampling vs LR: How Should We Position the Intervention?}
+
+\subsection{Sampling Is the Root-Cause Intervention}
+
+The experimental evidence points strongly toward sampling structure:
+\[
+\boxed{
+\text{sampling changes the effective signal and noise themselves.}
+}
+\]
+Potential sampling-side methods include:
+\begin{itemize}[leftmargin=2em]
+    \item dynamic \(K\);
+    \item prompt difficulty balancing;
+    \item historical success-rate sampling;
+    \item informative prompt sampling;
+    \item heavy-tail prompt downweighting;
+    \item response-level clipping or rejection.
+\end{itemize}
+
+\subsection{LR Is a Risk-Control Intervention}
+
+LR does not change the signal quality of the current batch. It only reduces the step size when the current batch is unreliable:
+\[
+\boxed{
+\text{LR is a low-intrusion risk controller, not a root-cause solution.}
+}
+\]
+Therefore, an LR method is valuable only if it can reduce high-LR degradation, peak-to-final drop, or seed variance without changing the rollout pipeline.
+
+\subsection{Recommended Experiment: Orthogonal Comparison}
+
+To decide whether sampling or LR is the stronger intervention, we should run:
+
+\[
+\begin{array}{c|c}
+\text{Sampling} & \text{LR}\\
+\hline
+\text{baseline sampling} & \text{fixed LR}\\
+\text{improved sampling} & \text{fixed LR}\\
+\text{baseline sampling} & \text{adaptive LR}\\
+\text{improved sampling} & \text{adaptive LR}
+\end{array}
+\]
+
+This answers:
+\begin{enumerate}[leftmargin=2em]
+    \item whether sampling alone is sufficient;
+    \item whether LR has independent benefit;
+    \item whether sampling and LR are complementary;
+    \item whether the main algorithmic contribution should focus on sampling or LR.
+\end{enumerate}
+
+\section{A New LR Direction: Signal-Quality-Aware LR Scaling}
+
+\subsection{Basic Form}
+
+We no longer attempt to estimate an exact \(r_t\). Instead, we use:
+\[
+\boxed{
+\alpha_t=\alpha_{\mathrm{base}} q_t.
+}
+\]
+Here \(\alpha_{\mathrm{base}}\) absorbs the average \(1/L_t\) scale, while \(q_t\) is a signal-quality gate.
+
+\subsection{Signal Availability Gate}
+
+Define signal availability:
+\[
+I_t\in\left\{
+\mathrm{reward\_std/median},\ 
+\mathrm{frac\_informative},\ 
+\E[A^2]
+\right\}.
+\]
+Then:
+\[
+q_t^{info}
+=
+\clip\left(
+\frac{\mathrm{EMA}(I_t)}
+{I_{\mathrm{ref}}},
+q_{\min}^{info},
+1
+\right).
+\]
+
+\subsection{Concentration Penalty}
+
+Define concentration risk:
+\[
+C_t\in\left\{
+\CV^2(A^2),\ 
+\CV^2(H),\ 
+\text{top-10\% }H\text{ share}
+\right\}.
+\]
+Then:
+\[
+q_t^{conc}
+=
+\clip\left[
+\left(
+\frac{C_{\mathrm{ref}}}{\mathrm{EMA}(C_t)+\epsilon}
+\right)^\gamma,
+q_{\min}^{conc},
+1
+\right].
+\]
+
+The combined LR is:
+\[
+\boxed{
+\alpha_t
+=
+\alpha_{\mathrm{base}}\,
+q_t^{info}\,
+q_t^{conc}.
+}
+\]
+
+Intuition:
+\begin{itemize}[leftmargin=2em]
+    \item reduce LR when effective signal is insufficient;
+    \item reduce LR when gradient energy is overly concentrated.
+\end{itemize}
+
+\section{Minimal Algorithmic Experiment Plan}
+
+\subsection{Stage A: Logging-Only}
+
+On existing fixed-LR runs, compute offline:
+\[
+q_t^{info},\qquad q_t^{conc},\qquad q_t=q_t^{info}q_t^{conc}.
+\]
+Check whether \(q_t\) decreases before validation drop, entropy collapse, or ratio-tail expansion.
+
+\subsection{Stage B: Info-Only LR Gate}
+
+Use an aggressive base LR:
+\[
+\alpha_{\mathrm{base}}=10^{-5},
+\]
+and set
+\[
+\alpha_t=\alpha_{\mathrm{base}}q_t^{info}.
+\]
+Test whether it preserves early fast learning while reducing late-stage regression.
+
+\subsection{Stage C: Info + Concentration LR Gate}
+
+Use
+\[
+\alpha_t=\alpha_{\mathrm{base}}q_t^{info}q_t^{conc}.
+\]
+Compare peak-to-final drop, seed variance, KL/ratio tail, and final validation.
+
+\subsection{Stage D: Comparison Against Fixed-LR Sweep}
+
+Compare:
+\begin{enumerate}[leftmargin=2em]
+    \item stable fixed LR;
+    \item aggressive fixed LR;
+    \item oracle fixed LR sweep;
+    \item aggressive LR + info gate;
+    \item aggressive LR + info + concentration gate.
+\end{enumerate}
+
+Evaluation should include:
+\[
+\text{peak-to-final drop},\quad
+\text{seed variance},\quad
+\text{late-stage degradation},\quad
+\text{cross-setting transfer}.
+\]
+
+\section{Related Work Positioning}
+
+\subsection{Gradient Noise Scale}
+
+Gradient-noise-scale and critical-batch-size work connects batch size, noise scale, and training efficiency. However, it mostly concerns general stochastic optimization and does not explicitly model GRPO prompt/rollout/advantage structure.
+
+\subsection{Policy-Gradient SNR and Adaptive Step Size}
+
+Prior work on policy-gradient SNR and adaptive step size shows that policy-gradient step size should depend on performance bounds and gradient uncertainty. This supports our \(L\)-smoothness and signal-fraction motivation.
+
+\subsection{TRPO/PPO}
+
+TRPO and PPO control policy-space update size using KL trust regions or clipping. Our work is different: we modulate the optimizer LR using RL-specific signal-quality diagnostics.
+
+\subsection{MARS and Optimizer-Side Variance Reduction}
+
+MARS is an optimizer-side variance-reduction method. It can serve as an AdamW baseline, but it is not an LR scheduler and cannot replace RL noise-source decomposition.
+
+\subsection{GRPO/DAPO and Dynamic Sampling}
+
+GRPO constructs advantages using group-relative rewards. DAPO and related LLM RL recipes emphasize dynamic sampling, clipping strategies, entropy, and diversity. This is consistent with our finding that sampling structure and advantage informativeness are central to stable LLM RL.
+
+\section{Conclusion}
+
+We have reframed the problem from:
+\[
+\text{``How do we estimate a generic } r_t \text{?''}
+\]
+
+to the following question:
+
+\begin{center}
+\fbox{%
+\begin{minipage}{0.88\linewidth}
+\centering
+How do we detect sparsity and concentration in the effective GRPO
+policy-gradient signal, and decide whether to intervene through
+sampling or learning-rate control?
+\end{minipage}
+}
 \end{center}
 
-$\phi_t$ is a monotone function of $\alpha_t/\alpha^*(t)$: it encodes where the current step sits relative to the optimal step, independent of training phase.
-
-\subsection{The scale controller}
-
-The complete update rule for $c_t$ is:
-\begin{equation}
-    c_{t+1} = c_t \cdot \exp\!\bigl(\eta_c\,(\bar\phi_t - \phi^*)\bigr),
-    \label{eq:ct-update}
-\end{equation}
-where $\phi^* = 1/2$, $\eta_c > 0$ is small, and $\bar\phi_t$ is a smoothed version of $\phi_t$.
-
-\paragraph{Why multiplicative.}
-$c_t$ is a scale factor and must remain positive.
-A multiplicative update ensures $c_t > 0$ always, and is the natural analogue of gradient descent on $\log c_t$.
-Additive updates would make the correction magnitude independent of the current scale, which is undesirable.
-
-\paragraph{Why $c_t$ must be slow.}
-Since $L$ is approximately constant, $c_t$ should converge once and remain stable.
-The time scale of $c_t$ should be much slower than $\hat{r}_t$ (which refreshes every step).
-A small $\eta_c$ naturally enforces this; $\bar\phi_t$ should additionally be smoothed with an EMA to suppress batch noise.
-
-\paragraph{Fixed point verification.}
-At the fixed point $\bar\phi_t = \phi^* = 1/2$, equation~\eqref{eq:ct-update} gives $c_{t+1} = c_t$.
-From $\phi_t \approx 1 - c_t L/2 = 1/2$, we obtain $c_t = 1/L$, confirming that the controller's fixed point is exactly the target scale.
-
-\subsection{Practical protections}
-\label{sec:protections}
-
-Three safeguards are necessary for stable operation.
-
-\textbf{Protection 1: Skip updates when $p_t$ is unreliable.}
-When $p_t = \alpha_t\hat{g}_B^\top\hat{g}_A \leq p_\mathrm{min}$ (near zero or negative), the ratio $\phi_t$ is dominated by noise.
-This occurs when $n_\mathrm{eff}$ is small and the two half-batch gradient estimates are poorly aligned.
-In such cases, skip the $c_t$ update for that step.
-
-\textbf{Protection 2: Clip and smooth $\phi_t$ before use.}
-\[
-    \tilde\phi_t = \mathrm{clip}(\phi_t,\,\phi_\mathrm{min},\,\phi_\mathrm{max}),
-    \qquad
-    \bar\phi_t = (1-\beta)\bar\phi_{t-1} + \beta\tilde\phi_t.
-\]
-The EMA $\bar\phi_t$ prevents $c_t$ from chasing step-level noise.
-
-\textbf{Protection 3: Bound $c_t$ away from zero.}
-Enforce $c_t \in [c_\mathrm{min}, c_\mathrm{max}]$ to prevent collapse or explosion of the scale factor.
-
-\subsection{Why $\phi^*$ should not depend on $r_t$}
-
-Step 3 above shows that $r_t$ cancels in $\phi_t$ precisely because $\hat{r}_t$ is already absorbing the shape variation.
-If $\phi^*$ were made to depend on $r_t$, it would re-introduce shape information into the scale controller, breaking the clean separation between feedforward and feedback.
-$r_t$ handles shape; $\phi_t$ handles scale; keeping them separate is the design principle.
-
-If $\phi_t$ is observed to drift in experiments, the correct interpretation is not that $\phi^*$ should vary with $r_t$, but that the effective local curvature $L_\mathrm{eff,t}$ is itself drifting slowly.
-In that case, $c_t$ is correctly tracking $1/L_\mathrm{eff,t}$, which is exactly the intended behavior.
-
-\subsection{What entropy can still do}
-
-Entropy does not need to disappear completely, but it should no longer directly determine the learning rate.
-A more appropriate role is as a \textbf{phase signal} that modulates the controller's tolerance bands ($c_\mathrm{min}$, $c_\mathrm{max}$, or the EMA decay $\beta$): in a high-entropy early phase a wider band may be acceptable; in a low-entropy late phase the band can be tightened.
-Entropy is demoted from primary controller to auxiliary phase signal.
-
-\section{The unified causal chain}
-
-After reconstruction, the complete logic should read as a continuous chain:
-
-\begin{enumerate}
-    \item RL optimizes a fixed trajectory-expectation objective.
-    \item Because this objective cannot be computed exactly, every update must rely on policy-induced samples.
-    \item Therefore, update quality depends on how much effective learning information the current batch contains.
-    \item This information is not constant; it changes through relevance degradation and discriminability/coverage contraction.
-    \item A fixed learning rate ignores this phase change, and may therefore be too small in some phases and too large in others.
-    \item When the fixed LR is too large for the current phase, PPO-style optimization enters a high-clipping regime.
-    \item In that regime, informative gradients are increasingly truncated, so training may still appear active while useful policy improvement saturates.
-    \item Therefore, the correct intervention is not one-way learning-rate decay as entropy falls, but bidirectional adaptation of update aggressiveness based on online evidence.
+The main empirical findings are:
+\begin{enumerate}[leftmargin=2em]
+    \item batch-split \(r_t\) is too noisy to serve as the main LR controller;
+    \item \(N/K\) controls the tradeoff between prompt diversity and within-prompt comparison quality;
+    \item the relative variation of \(A^2\) is much larger than that of \(Q\), so the advantage side is the main driver;
+    \item \(H=A^2Q\) is highly concentrated on a small subset of responses and prompts;
+    \item effective batch size is much smaller than nominal batch size;
+    \item sampling-side correction is the root-cause intervention, while LR-side correction is a low-intrusion risk-control mechanism.
 \end{enumerate}
 
-\section{How the contributions should now be stated}
-
-Under this reconstruction, the contributions can be written in three parts.
-
-\subsection*{Contribution 1: Problem reformulation}
-
-We reformulate RL training instability and optimization inefficiency as:
-\begin{quote}
-\textbf{a mismatch problem between fixed update rules and changing batch information quality}
-\end{quote}
-rather than as a support-shrinkage problem.
-
-\subsection*{Contribution 2: Mechanistic explanation}
-
-We identify two contraction channels in the effective learning information of RL batches:
-\begin{itemize}
-    \item relevance degradation;
-    \item discriminability/coverage contraction.
-\end{itemize}
-This makes a fixed learning rate phase-mismatched. At the same time, clipping becomes a key observable symptom that optimization has entered a gradient-truncation regime.
-
-\subsection*{Contribution 3: Control principle}
-
-We propose:
-\begin{quote}
-\textbf{phase-aware, bidirectional learning-rate control}
-\end{quote}
-The controller should be able to both increase and decrease update aggressiveness based on online evidence. Clipping provides the main feedback, while entropy is at most an auxiliary phase-modulation signal.
-
-\section{Falsifiable predictions and experimental directions}
-
-This framework should lead to at least the following falsifiable predictions.
-
-\begin{enumerate}
-    \item Even with fixed nominal batch size, effective learning information should contract over training.
-    \item Increasing the learning rate should not improve performance monotonically: it may first alleviate under-updating, but beyond a point it should significantly increase clipping statistics and harm final performance.
-    \item A monotone entropy-decay scheduler may reduce some instability, but it should fail to correct under-updating caused by an initially too-small LR, and thus should not outperform a truly bidirectional controller.
-    \item Clipping statistics should reveal harmful update regimes earlier and more directly than entropy.
-\end{enumerate}
-
-The most important experimental reorganization should follow the chain:
+Thus, the earlier PG-Moment/\(\lambda_M\) calibration route should not be the main algorithmic direction. The next step should be an orthogonal comparison between:
 \[
-\text{LR} \uparrow
-\Rightarrow
-\text{clip fraction / clipped mass} \uparrow
-\Rightarrow
-\text{effective gradient info} \downarrow
-\Rightarrow
-\text{final performance saturates}.
+\boxed{
+\text{sampling improvement}
+}
+\quad \text{and}\quad
+\boxed{
+\text{signal-quality-aware LR scaling}.
+}
 \]
 
-At the same time, four baseline types should be compared:
-\begin{itemize}
-    \item a small but stable fixed LR;
-    \item a large and aggressive fixed LR;
-    \item a monotone entropy-decay scheduler;
-    \item a bidirectional adaptive LR controller.
-\end{itemize}
+If we continue with LR, the recommended first method is:
+\[
+\boxed{
+\alpha_t
+=
+\alpha_{\mathrm{base}}\,
+q_t^{info}\,
+q_t^{conc},
+}
+\]
+where \(q_t^{info}\) responds to effective advantage-signal availability and \(q_t^{conc}\) penalizes gradient-energy concentration risk.
 
-\section{Final abstract-style paragraph}
+\newpage
+\begin{thebibliography}{9}
 
-The project can finally be compressed into the following paragraph.
+\bibitem{mccandlish2018}
+S. McCandlish et al.
+\newblock An Empirical Model of Large-Batch Training.
+\newblock arXiv:1812.06162, 2018.
 
-RL always optimizes the same trajectory-expectation objective, but every parameter update can only be approximated from policy-induced samples. Therefore, training quality depends on how much effective learning information the current batch contains. This quantity is not constant: it may lose relevance because of stale or mismatched samples, and it may lose discriminability and coverage because of policy sharpening. A fixed learning rate ignores this phase change, and therefore underestimates the update budget in some phases while overestimating it in others. In PPO-style optimization, the latter frequently becomes visible through rising clipping, indicating that informative gradients are being systematically truncated rather than productively used. As a result, fixed update rules harm both stability and performance, because they try to serve early information-rich and late information-poor regimes with one globally fixed update budget. The correct intervention is therefore not a one-way entropy scheduler, but a phase-aware, bidirectional learning-rate controller, with clipping used as a detection and feedback signal and entropy used, at most, as an auxiliary phase signal.
+\bibitem{trpo}
+J. Schulman et al.
+\newblock Trust Region Policy Optimization.
+\newblock arXiv:1502.05477, 2015.
+
+\bibitem{ppo}
+J. Schulman et al.
+\newblock Proximal Policy Optimization Algorithms.
+\newblock arXiv:1707.06347, 2017.
+
+\bibitem{svrpg}
+C. Papini et al.
+\newblock Stochastic Variance-Reduced Policy Gradient.
+\newblock arXiv:1806.05618, 2018.
+
+\bibitem{deepseekmath}
+Z. Shao et al.
+\newblock DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.
+\newblock arXiv:2402.03300, 2024.
+
+\bibitem{mars}
+H. Yuan et al.
+\newblock MARS: Unleashing the Power of Variance Reduction for Training Large Models.
+\newblock arXiv:2411.10438, 2024.
+
+\bibitem{dapo}
+Q. Yu et al.
+\newblock DAPO: An Open-Source LLM Reinforcement Learning System at Scale.
+\newblock arXiv:2503.14476, 2025.
+
+\end{thebibliography}
 
 \end{document}

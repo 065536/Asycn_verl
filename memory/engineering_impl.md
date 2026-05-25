@@ -1,7 +1,213 @@
 ---
 name: Engineering Implementation — Signal-Fraction Adaptive LR
-description: Concrete implementation of α_t = c_t·r̂_t; code status as of 2026-05-14; Bug 17 ratio_of_sums num/den swap fixed
+description: 2026-05-20 Signal-Quality-Aware LR Scaling + distributed consistency fix + sensitivity analysis; 5.19 full noise decomposition overhaul
 type: project
+---
+
+## Signal-Quality-Aware LR Scaling (2026-05-20)
+
+New LR scheduler: `lr_scheduler_type = "signal_quality"`.
+
+### Config fields (optimizer.py)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `signal_quality_info_source` | str | `"reward_std_median"` | Info indicator: reward_std_median / frac_informative / bernoulli_var / mean_a2 |
+| `signal_quality_info_ema_beta` | float | 0.9 | EMA beta for info signal |
+| `signal_quality_info_q_min` | float | 0.3 | Floor for q_info. Design: q_min ≈ α_safe / α_base |
+| `signal_quality_warmup_steps` | int | 20 | Steps to compute I_ref |
+| `signal_quality_use_concentration` | bool | False | Enable q_conc penalty |
+| `signal_quality_conc_source` | str | `"cv2_h"` | Conc indicator: cv2_h / cv2_a2 / top10_h_share |
+| `signal_quality_conc_ema_beta` | float | 0.9 | EMA beta for conc signal |
+| `signal_quality_conc_q_min` | float | 0.5 | Floor for q_conc |
+| `signal_quality_conc_gamma` | float | 0.5 | Exponent for conc penalty |
+
+### SignalQualityLRScheduler (transformer_impl.py)
+
+- Placed between EntropyAdaptiveLRScheduler and SignalFractionLRScheduler
+- `update_signal_quality(info_value, conc_value)` — called every step
+- `get_signal_quality_metrics()` — returns 12 metrics (sq_q_info, sq_q_conc, sq_warmup_done, sq_step, etc.)
+- Full state_dict / load_state_dict for checkpoint resume
+
+### Distributed consistency (critical fix)
+
+`_compute_signal_quality_indicators()` uses `all_reduce(SUM)` so all DP ranks get identical q_t:
+
+1. Each rank computes local sums: reward_var_sum, bernoulli_var_sum, informative_count, n_prompts
+2. `torch.distributed.all_reduce(buf, op=SUM)` on CPU tensor
+3. Global means computed from global sums
+4. **No median** (can't all_reduce). `reward_std_median` config actually computes `mean_i[sqrt(Var_k(R_i))]`
+
+Prompt group aggregation always uses uid, never assumes batch ordering.
+
+### Scheduler timing
+
+q_t from step t's batch applies to step t+1's LR.
+Flow: `update_policy()` → metrics → `update_signal_quality(I_t)` → `scheduler.step()`
+
+### Logged metrics per step
+
+| Metric | Description |
+|---|---|
+| `actor/sq_q_info` | Current info gate value |
+| `actor/sq_q_conc` | Current concentration gate value (1.0 if disabled) |
+| `actor/sq_q_total` | Combined q = q_info × q_conc |
+| `actor/sq_info_ref` | Reference I_ref from warmup |
+| `actor/sq_info_ema` | Current EMA of info signal |
+| `actor/sq_info_raw` | Raw I_t this step (before EMA) |
+| `actor/sq_conc_ref` | Reference C_ref from warmup |
+| `actor/sq_conc_ema` | Current EMA of conc signal |
+| `actor/sq_conc_raw` | Raw C_t this step (if concentration enabled) |
+| `actor/sq_alpha_t` | Actual LR applied |
+| `actor/sq_warmup_done` | 1.0 after warmup complete |
+| `actor/sq_step` | Scheduler step count |
+| `actor/sq_alt_reward_var_mean` | Alternative: mean Var(R) (logged, not used for control) |
+| `actor/sq_alt_reward_std_mean` | Alternative: mean sqrt(Var(R)) |
+| `actor/sq_alt_bernoulli_var` | Alternative: mean p_i(1-p_i) |
+| `actor/sq_alt_frac_informative` | Alternative: fraction informative prompts |
+
+### Experiment script
+
+`new_experiments/signal_fraction_lr/sync_signal_quality_lr.sh`
+
+Env vars: SQ_BASE_LR, SQ_TAG, SQ_INFO_SRC, SQ_USE_CONC, SQ_CONC_SRC, SEED, etc.
+
+### Analysis scripts
+
+- `exp_data/signal_quality_lr_offline_replay.py` — offline validation on existing logs
+- `exp_data/signal_quality_lr_sensitivity.py` — 4 sources × 4 betas sensitivity analysis
+
+### Verification
+
+`python3 -m py_compile` passed for all 4 modified Python files.
+`bash -n` passed for experiment script.
+
+---
+
+## Full noise decomposition overhaul (2026-05-19)
+
+Complete rewrite of `compute_variance_decomposition_metrics()` in
+`verl/trainer/ppo/metric_utils.py` plus new `save_noise_decomp_tables()`.
+Called from `verl/trainer/ppo/ray_trainer.py`.
+
+### Motivation
+
+Previous a2q_between_frac / a2q_within_frac had a normalization mismatch:
+between_var was computed on prompt-level means (already ÷K), but within_var
+was response-level raw (not ÷K). This made within-prompt fraction appear
+~87% when the corrected batch-gradient-level fraction is ~56/44.
+
+Also: need per-response/per-prompt raw arrays saved to disk so any future
+decomposition / normalization / downsampling can be done offline without retraining.
+
+### New scalar metrics (113 total, logged every step)
+
+**Reward informativeness (extended):**
+- `noise_decomp/reward_std/{mean,median,p25,p75}`
+- `noise_decomp/frac_informative`, `frac_all_correct`, `frac_all_wrong`
+- `noise_decomp/success_rate/{mean,std}`
+- `noise_decomp/success_rate_bin_{0,0_25,25_75,75_1,1}` — success rate histogram
+
+**Three-way between/within for A², Q, H=A²Q:**
+
+For each X ∈ {a2, q, h, h_cfact_a, h_cfact_q}:
+- `noise_decomp/factor_{X}/between_var` — Var_i(μ_i)
+- `noise_decomp/factor_{X}/within_var_raw` — E_i[Var_k(X)]
+- `noise_decomp/factor_{X}/within_var_corrected` — within_raw / K
+- `noise_decomp/factor_{X}/batch_between` — between_var / N
+- `noise_decomp/factor_{X}/batch_within` — within_raw / (NK)
+- `noise_decomp/factor_{X}/batch_total` — sum of above
+- `noise_decomp/factor_{X}/batch_between_frac` — corrected fraction
+- `noise_decomp/factor_{X}/batch_within_frac` — corrected fraction
+- `noise_decomp/factor_{X}/raw_between_frac` — legacy-style uncorrected
+- `noise_decomp/factor_{X}/raw_within_frac` — legacy-style uncorrected
+
+**Factor attribution:**
+- `noise_decomp/{mean,std,cv2}_{a2,q,h}` — per-factor statistics
+- `noise_decomp/corr_a2_q` — Corr(A², Q)
+- `noise_decomp/interaction_ratio_a2q` — E[A²Q] / (E[A²]·E[Q])
+- `noise_decomp/corr_{a2,q}_t` — correlation with response length
+
+**Counterfactual variance attribution:**
+- `noise_decomp/cfact_var_{h,a_only,q_only,interaction}`
+- `noise_decomp/cfact_frac_{a_only,q_only,interaction}`
+
+**Response length:**
+- `noise_decomp/resp_length/{mean,std}`
+- `noise_decomp/q_over_t/{mean,std}`
+
+**Legacy metrics preserved:** all existing `a2q_between_frac`, `a2q_within_frac`,
+`adv_between_frac`, `prompt_h/*`, etc. remain for backward compatibility.
+
+### Per-response/per-prompt npz tables
+
+New function `save_noise_decomp_tables(batch, global_step, save_dir)` saves
+compressed npz every 5 steps to `{checkpoint_dir}/noise_tables/`.
+
+Per-response arrays (shape [bsz]):
+- `resp_prompt_idx`, `resp_reward`, `resp_advantage`, `resp_advantage_sq`
+- `resp_score_energy_Q`, `resp_Q_per_token`, `resp_response_length`, `resp_H_a2q`
+
+Per-prompt arrays (shape [N]):
+- `prompt_id`, `prompt_reward_{mean,std}`, `prompt_success_rate`
+- `prompt_num_unique_rewards`, `prompt_is_informative`
+- `prompt_{a2,q,h}_{mean,var}`
+
+Metadata: `global_step`, `N`, `K`.
+
+### ray_trainer.py changes
+
+- Import `save_noise_decomp_tables`
+- After `compute_variance_decomposition_metrics()`, call
+  `save_noise_decomp_tables()` every 5 steps (try/except wrapped)
+- Save directory: `{trainer.default_local_dir}/noise_tables/`
+
+### Verification
+
+- `python3 -m py_compile` passed for metric_utils.py and ray_trainer.py
+- Smoke test in verl2 env: 113 metrics, batch fractions sum to 1,
+  counterfactual reconstruction exact, npz arrays correct shape, legacy metrics present
+
+---
+
+## Variance decomposition diagnostics (2026-05-16)
+
+Added `compute_variance_decomposition_metrics()` to `verl/trainer/ppo/metric_utils.py`.
+Called every step from `verl/trainer/ppo/ray_trainer.py` after existing `compute_variance_proxy_metrics()`.
+
+Requires: `token_level_scores`, `advantages`, `response_mask` in batch, `uid` in non_tensor_batch.
+Optional: `sum_pi_squared`, `old_log_probs` for score-energy metrics.
+
+New metrics (all prefixed `noise_decomp/`):
+
+- `n_prompts`, `n_responses_per_prompt`
+- `reward_std/mean`, `reward_std/median`, `reward_n_unique/mean`
+- `success_rate/mean`, `frac_informative`
+- `adv_energy/mean`, `adv_energy/std`, `adv_scalar/abs_mean`
+- `score_energy_q/mean`, `q_response/mean`, `q_response/std`
+- `a2q/mean`, `a2q/std`
+- `a2q_between_prompt_var`, `a2q_within_prompt_var`, `a2q_between_frac`, `a2q_within_frac`
+- `prompt_h/mean`, `prompt_h/std`, `prompt_h/max`, `prompt_h/p90`
+
+Verification: `python3 -m py_compile` passed for both files.
+
+### Diagnostic run script
+
+New: `new_experiments/signal_fraction_lr/sync_constant_lr_diagnostic.sh`
+
+Parameterized constant-LR diagnostic script. Key env vars:
+
+- `DIAG_LR` — constant learning rate (required)
+- `DIAG_TAG` — short tag for filenames (required)
+- `SEED` — random seed (default 42)
+- `NCPUS` — Ray CPU count (default: `$(nproc)`)
+- `RESUME_MODE` — auto/disable (default disable)
+
+Uses `signal_fraction + sign_gate_gamma=1.0` path so split-batch metrics are
+logged as diagnostics but LR is constant.
+
+`bash -n` passed.
+
 ---
 
 ## Bug 17 (2026-05-14): ratio_of_sums r_window_num/r_window_den swapped

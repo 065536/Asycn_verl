@@ -48,8 +48,10 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_variance_decomposition_metrics,
     compute_variance_proxy_metrics,
     process_validation_metrics,
+    save_noise_decomp_tables,
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -1691,6 +1693,28 @@ class RayPPOTrainer:
                 # compute variance proxy metrics
                 gradient_norm = metrics.get("actor/grad_norm", None)
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+                metrics.update(compute_variance_decomposition_metrics(batch=batch))
+                # Save per-response / per-prompt raw tables every 5 steps
+                noise_table_freq = getattr(
+                    getattr(self.config.trainer, "noise_table_save_freq", None),
+                    "__int__", lambda: 5,
+                )() if hasattr(self.config.trainer, "noise_table_save_freq") else 5
+                if self.global_steps % noise_table_freq == 0:
+                    try:
+                        table_dir = os.path.join(
+                            self.config.trainer.default_local_dir, "noise_tables"
+                        )
+                        save_noise_decomp_tables(
+                            batch=batch,
+                            global_step=self.global_steps,
+                            save_dir=table_dir,
+                        )
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "save_noise_decomp_tables failed at step %d: %s",
+                            self.global_steps, e,
+                        )
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
                 # Fallback: compute ratio/ppo_kl percentile metrics from batch when not already
