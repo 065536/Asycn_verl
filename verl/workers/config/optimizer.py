@@ -197,7 +197,9 @@ class FSDPOptimizerConfig(OptimizerConfig):
     # Signal-Quality-Aware LR Scaling: α_t = α_base * q_t
     # lr_scheduler_type = "signal_quality"
     # ------------------------------------------------------------------ #
-    # Info gate: I_t source — "reward_std_median" or "frac_informative" or "bernoulli_var" or "mean_a2"
+    # Info gate: I_t source — "reward_std_mean"(preferred, accurate name) or
+    # "reward_std_median"(legacy alias) or "frac_informative" or
+    # "bernoulli_var" or "mean_a2"
     signal_quality_info_source: str = "reward_std_median"
     # EMA beta for info signal
     signal_quality_info_ema_beta: float = 0.9
@@ -230,7 +232,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
         assert self.entropy_adaptive_reference_mode in ["ema", "initial"]
         assert self.signal_fraction_r_window_mode in ["off", "replace_ema", "ratio_of_sums"]
         assert self.signal_quality_info_source in [
-            "reward_std_median", "frac_informative", "bernoulli_var", "mean_a2",
+            "reward_std_mean", "reward_std_median", "frac_informative", "bernoulli_var", "mean_a2",
         ]
         assert self.signal_quality_conc_source in ["cv2_h", "cv2_a2", "top10_h_share"]
         return super().__post_init__()

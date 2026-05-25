@@ -221,7 +221,10 @@ def _compute_signal_quality_indicators(data: "DataProto", info_source: str, conc
     global_frac_informative = global_informative_count / N
 
     info_value = None
-    if info_source == "reward_std_median":
+    # NOTE: historical name is `reward_std_median`, but the implementation
+    # computes sqrt(mean(var_i)) across prompt groups after distributed reduce.
+    # Keep the legacy key for backward compatibility and add the accurate alias.
+    if info_source in ("reward_std_median", "reward_std_mean"):
         info_value = global_reward_std_mean
     elif info_source == "frac_informative":
         info_value = global_frac_informative
