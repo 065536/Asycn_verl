@@ -4,7 +4,7 @@ set -xeuo pipefail
 # LR decay schedule test:
 #   LR: 5e-6 -> 3.1e-6
 #   Scheduler: linear / cosine
-#   Validation: AIME2024 only, evaluate once at step 300
+#   Validation: 5 core benchmarks, evaluate every 10 steps
 #
 # Required env:
 #   DECAY_TYPE=linear|cosine
@@ -89,7 +89,7 @@ if [ ! -f "${CUSTOM_REWARD_PATH}" ]; then
 fi
 
 export TRAIN_FILE=${DATA_ROOT}/dapo-math-17k-sampled.parquet
-export TEST_FILES="[${DEEPSCALER_DIR}/aime24.parquet]"
+export TEST_FILES="[${DEEPSCALER_DIR}/aime24.parquet,${DEEPSCALER_DIR}/aime25.parquet,${DEEPSCALER_DIR}/gpqa_diamond_100.parquet,${DEEPSCALER_DIR}/minerva_fixed_100.parquet,${DEEPSCALER_DIR}/olympiad_bench_fixed_100.parquet]"
 export MODEL_PATH="${MODEL_PATH}"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_USE_V1=1
@@ -488,7 +488,7 @@ if [ "${IS_HEAD}" = "1" ]; then
     ++actor_rollout_ref.model.path="${MODEL_PATH}" \
     ++actor_rollout_ref.model.enable_gradient_checkpointing=True \
     ++actor_rollout_ref.actor.optim.lr="${BASE_LR}" \
-    ++actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
+    ++actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     ++actor_rollout_ref.actor.optim.weight_decay=0.1 \
     ++actor_rollout_ref.actor.optim.lr_scheduler_type="${DECAY_TYPE}" \
     ++actor_rollout_ref.actor.optim.min_lr_ratio="${MIN_LR_RATIO}" \
@@ -531,8 +531,8 @@ if [ "${IS_HEAD}" = "1" ]; then
     trainer.experiment_name="${EXP_NAME}" \
     trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \
     trainer.nnodes="${NNODES}" \
-    trainer.val_before_train=False \
-    trainer.test_freq=300 \
+    trainer.val_before_train=True \
+    trainer.test_freq=10 \
     trainer.save_freq=50 \
     trainer.total_epochs=10 \
     trainer.total_training_steps=300 \
@@ -540,7 +540,7 @@ if [ "${IS_HEAD}" = "1" ]; then
     trainer.resume_mode="${RESUME_MODE}" \
     trainer.max_actor_ckpt_to_keep=2 \
     trainer.max_critic_ckpt_to_keep=2 \
-    trainer.log_val_generations=0 \
+    trainer.log_val_generations=10 \
     2>&1 | tee -a "${LOG_FILE}"
 
   echo "Training completed successfully" | tee -a "${LOG_FILE}"
