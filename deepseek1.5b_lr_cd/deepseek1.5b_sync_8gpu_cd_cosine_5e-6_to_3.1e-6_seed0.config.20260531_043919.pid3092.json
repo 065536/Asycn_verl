@@ -1,8 +1,8 @@
 {
   "project_name": "deepseek1.5b_lr_cd",
   "experiment_name": "deepseek1.5b_sync_8gpu_cd_cosine_5e-6_to_3.1e-6_seed0",
-  "created_at": "2026-06-01 00:08:06 +0000",
-  "pid": 3093,
+  "created_at": "2026-05-31 04:39:19 +0000",
+  "pid": 3092,
   "config": {
     "model_engine": "dp",
     "actor_rollout_ref": {
@@ -776,7 +776,7 @@
       "critic_warmup": 0,
       "default_hdfs_dir": null,
       "del_local_ckpt_after_load": false,
-      "default_local_dir": "/data/250010176/codes/verl/verl/ckpts/DeepSeek1.5B/DeepSeek1.5B-Sync-8gpu-cd-cosine-5e-6-to-3.1e-6-seed0-20260601_000057",
+      "default_local_dir": "/data/250010176/codes/verl/verl/ckpts/DeepSeek1.5B/DeepSeek1.5B-Sync-8gpu-cd-cosine-5e-6-to-3.1e-6-seed0-20260531_043231",
       "max_actor_ckpt_to_keep": 2,
       "max_critic_ckpt_to_keep": 2,
       "max_global_ckpt_to_keep": null,

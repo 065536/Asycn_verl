@@ -492,6 +492,7 @@ if [ "${IS_HEAD}" = "1" ]; then
     ++actor_rollout_ref.actor.optim.weight_decay=0.1 \
     ++actor_rollout_ref.actor.optim.lr_scheduler_type="${DECAY_TYPE}" \
     ++actor_rollout_ref.actor.optim.min_lr_ratio="${MIN_LR_RATIO}" \
+    ++actor_rollout_ref.actor.calculate_sum_pi_squared=True \
     ++actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     ++actor_rollout_ref.actor.ppo_micro_batch_size=null \
     ++actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null \
