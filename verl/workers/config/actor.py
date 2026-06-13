@@ -302,6 +302,12 @@ class FSDPActorConfig(ActorConfig):
     use_rollout_log_probs: bool = False
     calculate_sum_pi_squared: bool = False
     sum_pi_squared_checkpointing: bool = False
+    calculate_lm_head_grad_norm: bool = False
+    lm_head_grad_norm_freq: int = 5
+    lm_head_grad_norm_max_responses: int = 64
+    calculate_pos_neg_grad_decomp: bool = False
+    pos_neg_grad_decomp_freq: int = 5
+    pos_neg_grad_decomp_max_responses: int = 64
     qat: QATConfig = field(default_factory=QATConfig)
 
     def __post_init__(self):

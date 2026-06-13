@@ -1688,6 +1688,47 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
 
+        # ----- Adam v-scale / beta2 override for continuation experiments -----
+        optim_config = getattr(self, "_optimizer_config", None)
+        if optim_config is None and hasattr(self, "config"):
+            optim_config = getattr(self.config, "optimizer", None)
+        if optim_config is not None:
+            v_scale = getattr(optim_config, "adam_v_scale", None)
+            new_beta2 = getattr(optim_config, "adam_override_beta2", None)
+            if v_scale is not None and v_scale != 1.0:
+                import math
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                if rank == 0:
+                    print(f"[Adam v-scale] Scaling exp_avg_sq by {v_scale}")
+                for pg in self.actor_optimizer.param_groups:
+                    for p in pg["params"]:
+                        if p in self.actor_optimizer.state:
+                            state = self.actor_optimizer.state[p]
+                            if "exp_avg_sq" in state:
+                                state["exp_avg_sq"].mul_(v_scale)
+            if new_beta2 is not None:
+                import math
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                old_beta2 = self.actor_optimizer.param_groups[0].get("betas", (0.9, 0.999))[1]
+                for pg in self.actor_optimizer.param_groups:
+                    for p in pg["params"]:
+                        if p in self.actor_optimizer.state:
+                            state = self.actor_optimizer.state[p]
+                            step_val = state.get("step", 0)
+                            if isinstance(step_val, torch.Tensor):
+                                step_val = step_val.item()
+                            step_val = int(step_val)
+                            if step_val > 0 and "exp_avg_sq" in state:
+                                bc_old = 1.0 - old_beta2 ** step_val
+                                bc_new = 1.0 - new_beta2 ** step_val
+                                rescale = bc_new / (bc_old + 1e-30)
+                                state["exp_avg_sq"].mul_(rescale)
+                    betas = list(pg["betas"])
+                    betas[1] = new_beta2
+                    pg["betas"] = tuple(betas)
+                if rank == 0:
+                    print(f"[Adam beta2 override] {old_beta2} -> {new_beta2} (state rescaled)")
+
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 

@@ -218,6 +218,24 @@ class FSDPOptimizerConfig(OptimizerConfig):
     signal_quality_conc_q_min: float = 0.5
     # Exponent γ for concentration penalty
     signal_quality_conc_gamma: float = 0.5
+    # ---- Entropy gate (Type-II policy-space collapse detector) ----
+    # Enable entropy-ratio gate: q_entropy = clip(EMA(entropy)/entropy_ref, q_min, 1)
+    # Combined: q_total = min(q_info * q_conc, q_entropy)
+    signal_quality_use_entropy_gate: bool = False
+    # EMA beta for entropy signal
+    signal_quality_entropy_ema_beta: float = 0.9
+    # Minimum q_entropy value (floor). With α_base=1e-5, 0.31 → min LR ≈ 3.1e-6.
+    signal_quality_entropy_q_min: float = 0.31
+
+    # ------------------------------------------------------------------ #
+    # Adam v-scale continuation experiment
+    # After loading checkpoint, scale exp_avg_sq by this factor.
+    # Use with LR compensation: set lr *= sqrt(v_scale) to keep initial
+    # update magnitude unchanged. v_scale < 1 releases stale denominator.
+    # ------------------------------------------------------------------ #
+    adam_v_scale: Optional[float] = None
+    # If set, override beta2 after checkpoint load (with bias-correction rescale)
+    adam_override_beta2: Optional[float] = None
 
     def __post_init__(self):
         if self.warmup_style is not None:

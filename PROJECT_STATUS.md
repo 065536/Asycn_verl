@@ -1,12 +1,357 @@
 # Project Status
 
-**Last updated**: 2026-05-20 (Signal-Quality-Aware LR Scaling: implementation + sensitivity analysis + distributed fix)
+**Last updated**: 2026-06-12 (Direction pivot: from adaptive LR to RL-aware optimizer design; pos/neg gradient decomposition diagnostic)
+
+## 2026-06-12 Direction Pivot — From Adaptive LR to RL-Aware Optimizer
+
+### 核心认知转变
+
+LR 不是本质问题。所有 adaptive LR 方案（signal-fraction, signal-quality gate, entropy gate）都在调标量 α，但 RL gradient 的结构性问题发生在**方向**层面，而非步长层面。Adam 作为通用优化器，没有利用 RL gradient 的特有结构：
+
+1. Gradient 是 positive-advantage（巩固好 response）和 negative-advantage（惩罚差 response）的向量和
+2. 不同 prompt 的 success rate 不同，gradient composition 随 prompt 类型变化
+3. Adam 的 coordinate-wise preconditioning 可能系统性地改变这个 composition
+
+### |A⁻| 大 ≠ negative update 占主导
+
+之前"negative advantage 占主导"的说法过粗。三件事必须分开：
+
+| 层面 | 说的是什么 | 结论 |
+|---|---|---|
+| 标量 advantage 分布 | 一阶 ΣA+ vs Σ|A⁻| | **平衡**（GRPO group norm 结构保证） |
+| 二阶 advantage energy | ΣA²+ vs ΣA²⁻ | 高成功率 prompt 中**负侧更大** |
+| 真实梯度向量和 | ‖g+‖ vs ‖g⁻‖, cos(g+,g⁻) | **未知 — 需要实验** |
+
+关键推导（p = success rate, K responses per prompt）：
+- 正样本总 advantage: pK·A⁺ = K√(p(1-p))
+- 负样本总 advantage 绝对值: (1-p)K·|A⁻| = K√(p(1-p))
+- **一阶总量平衡**
+
+- 正样本总平方量: pK·(A⁺)² = K(1-p)
+- 负样本总平方量: (1-p)K·(A⁻)² = Kp
+- p>0.5 时**负侧二阶 energy 更大**
+
+但二阶 energy 大不等于梯度向量和大：正样本数量多可能方向更一致，负样本方向分散可能互相抵消。
+
+### 新的实验方向
+
+不再追求 adaptive LR。转向诊断 RL gradient 结构，为设计 RL-aware optimizer 提供依据。
+
+| Priority | 内容 | 状态 |
+|---|---|---|
+| **P0** | Pos/neg lm_head gradient decomposition | **已实现，实验启动中** |
+| **P1** | Adam preconditioning direction diagnostic | 已设计，待 P0 数据 |
+| P2 | RL-aware optimizer 设计（基于 P0/P1 结论） | blocked on P0/P1 |
+
+### P0: Pos/Neg Gradient Decomposition（本次实现）
+
+将 batch gradient 分解为 g⁺（正 advantage 样本贡献）和 g⁻（负 advantage 样本贡献），在 lm_head 层精确计算。
+
+**方法**：对子采样 response，forward pass with `output_hidden_states=True`，解析计算 per-response gradient G_b = Σ_t (e_{y_t} - π_t) h_tᵀ，按 advantage 符号累加到 g⁺/g⁻。
+
+**按 prompt success rate 分桶**（p<0.5 vs p≥0.5）分别计算，回答：
+- 高成功率 mixed prompt 中，负样本是否真的主导真实更新？
+- 低成功率 mixed prompt 中，正样本方向是否更集中？
+- g⁺ 和 g⁻ 是否近似反向（cos ≈ -1）还是有大角度偏差？
+
+### 实现
+
+| File | Change |
+|---|---|
+| `verl/trainer/ppo/lm_head_grad_norm.py` | +`compute_single_response_lm_head_grad()` — 解析计算 (V,d) gradient vector |
+| `verl/workers/actor/dp_actor.py` | +`compute_pos_neg_grad_decomposition()` — 子采样 + 累加 + metrics |
+| `verl/workers/actor/dp_actor.py` | `update_policy()` 集成：在训练前运行诊断 |
+| `verl/workers/config/actor.py` | +`calculate_pos_neg_grad_decomp`, `pos_neg_grad_decomp_freq/max_responses` |
+| `new_experiments/.../sync_constant_lr_diagnostic.sh` | lm_head_grad_norm + pos_neg_grad_decomp 直接写入脚本 |
+
+### 新 metrics
+
+| Metric | 含义 |
+|---|---|
+| `grad_decomp/g_pos_norm` | ‖g⁺‖ |
+| `grad_decomp/g_neg_norm` | ‖g⁻‖ |
+| `grad_decomp/g_total_norm` | ‖g⁺ + g⁻‖ |
+| `grad_decomp/cos_pos_neg` | cos(g⁺, g⁻) |
+| `grad_decomp/pos_neg_norm_ratio` | ‖g⁺‖ / ‖g⁻‖ |
+| `grad_decomp/high_p/*` | 高成功率 prompt (p≥0.5) 的同组 metrics |
+| `grad_decomp/low_p/*` | 低成功率 prompt (p<0.5) 的同组 metrics |
+| `grad_decomp/frac_uninformative` | 无信息 prompt (p=0 or p=1) 比例 |
+
+### 首要分析目标
+
+1. ‖g⁺‖ vs ‖g⁻‖ → 谁主导 update magnitude？
+2. cos(g⁺, g⁻) → 正负方向关系（反向 ≈ -1？正交 ≈ 0？）
+3. high_p vs low_p 分桶的 norm ratio 差异 → 二阶 energy 不对称是否传导到真实梯度？
+4. 以上指标随训练的演变趋势
+
+### Bug fixes
+
+1. `dp_actor.py:compute_log_prob` 中 `select_keys` 遗漏 `response_mask`（lm_head_grad_norm 需要）→ 已修复
+2. `sync_constant_lr_diagnostic.sh` 中 `IS_HEAD` 判断在单节点（无 rank 环境变量）时错误走 worker 分支 → 已修复
+
+---
+
+## 2026-06-10 Exact lm_head Gradient Norm — A²Q Proxy Replacement
+
+### 核心问题
+
+A²Q 分解假设不同 token 的 score function 梯度在参数空间正交：
+
+```
+||Σ_t J_t||² = Σ_t ||J_t||²  (A²Q 假设)
+```
+
+实际上所有 token 共享参数，cross terms `Σ_{t≠s} ⟨J_t, J_s⟩` 可以很大。A²Q 的 H = A²·Q 只保留了对角项，等价于 `A² · trace(K_h ⊙ diag(K_δ))`。
+
+### 解决方案：lm_head 层精确梯度范数
+
+对 lm_head 层（最大参数矩阵，V×d），per-response gradient 有解析公式：
+
+```
+∂S_b/∂W = Σ_t (e_{y_t} - π_t) h_tᵀ
+||∂S_b/∂W||²_F = Σ_{t,s} K_δ[t,s] · K_h[t,s]
+```
+
+其中：
+- `K_h[t,s] = h_t · h_s`（hidden-space Gram matrix）
+- `K_δ[t,s] = 1_{y_t=y_s} - π_s[y_t] - π_t[y_s] + π_t·π_s`（vocab-space error vector Gram matrix）
+
+**精度**：对 lm_head 层精确，无任何近似。autograd 验证误差 < 1e-6。
+
+**不需要 FSDP unsharding**：只用 hidden states 和 logits（forward 产物），不需要访问权重。
+
+### 实现
+
+| File | Change |
+|---|---|
+| `verl/trainer/ppo/lm_head_grad_norm.py` | 新文件：Gram 矩阵公式 + chunked 版本 |
+| `verl/workers/actor/dp_actor.py` | +`compute_lm_head_grad_norms()` + 集成到 `compute_log_prob` |
+| `verl/workers/config/actor.py` | +`calculate_lm_head_grad_norm`, `lm_head_grad_norm_freq`, `lm_head_grad_norm_max_responses` |
+| `verl/trainer/ppo/metric_utils.py` | +exact_grad metrics（between/within, cross_term_ratio, corr） |
+| `verl/trainer/ppo/ray_trainer.py` | +`global_step` in meta_info |
+
+### 新 metrics
+
+| Metric | 含义 |
+|---|---|
+| `noise_decomp/exact_grad/cross_term_ratio_mean` | E[||∂S/∂W||²/Q]，>1 = cross terms 正贡献，<1 = 互相抵消 |
+| `noise_decomp/exact_grad/corr_gnorm_q` | exact norm 与 Q 的相关性（A²Q 作为 proxy 有多好） |
+| `noise_decomp/exact_grad/mean_h_exact` | E[A²·||∂S/∂W||²]（exact gradient energy） |
+| `noise_decomp/exact_grad/gnorm/between_frac` | ||∂S/∂W||² 的 prompt 间方差占比 |
+| `noise_decomp/exact_grad/h_exact/between_frac` | A²·||∂S/∂W||² 的 prompt 间方差占比 |
+
+### 实验已启动
+
+3 seed baseline，LR=1e-6，每 5 步采样 64 个 response 计算 exact gradient norm：
+
+```bash
+DIAG_LR=1e-6 DIAG_TAG=lr1e-6_exactgrad SEED={42,1,0} NCPUS=32 \
+EXTRA_HYDRA="++actor_rollout_ref.actor.calculate_lm_head_grad_norm=true \
+  ++actor_rollout_ref.actor.lm_head_grad_norm_freq=5 \
+  ++actor_rollout_ref.actor.lm_head_grad_norm_max_responses=64" \
+bash sync_constant_lr_diagnostic.sh
+```
+
+SwanLab: `deepseek1.5b_sync_8gpu_diag_constant_lr1e-6_exactgrad_seed{42,1,0}`
+
+### 首要分析目标
+
+1. `cross_term_ratio_mean` 偏离 1 多少 → cross terms 有多大
+2. `corr_gnorm_q` → A²Q 和 exact norm 相关性如何
+3. exact grad 的 between/within 分解 vs A²Q 的分解是否一致
+4. cross_term_ratio 随训练的演变趋势
+
+### Checkpoint 清理
+
+清理了 10 个老实验 ckpt（diag_aqh, sq_info/ent, cosine decay），释放 ~320G：
+
+- 1.2T → 776G（21 个目录保留）
+- 保留所有 a2q lr1e-6 和 lr3.1e-6 实验 ckpt
+
+---
+
+## 2026-06-08b Pivot: Gradient Direction Diagnostic
+
+### 核心修正
+
+从 "Adam denominator 压步长 → 调 LR" 转向 "Adam D_t 是否改变 gradient 方向，削弱 positive consolidation"。
+
+**之前的错误框架**：v*=0.1 释放 denominator → 看分数变不变 → 本质是 LR 实验。
+**修正后的框架**：先诊断 cos(m, g⁺) vs cos(Dm, g⁺) → 确认方向扭转再设计干预。
+
+### 为什么 uniform v*=0.1 不是好证据
+
+v_t ← 0.1·v_t 后：m/(√(0.1v)+ε) = m/(√0.1·√v+ε) ≈ √10 · m/(√v+ε)。
+
+方向不变，只是全局放大 √10 ≈ 3.16×。等价于 LR×3.16。不能区分 "denominator 改变方向" vs "步长变大"。
+
+### 新的实验优先级
+
+| Priority | 内容 | 性质 | 状态 |
+|---|---|---|---|
+| **P0** | Gradient preconditioning diagnostic | 纯诊断，1 checkpoint + 几个 batch | **next** |
+| P1 | Counterfactual D analysis (flatten/cap/normalize) | 纯计算 | pending |
+| P2 | Non-uniform continuation (仅当 P0 确认路径 B) | 训练 | blocked on P0 |
+| ~~旧 P0~~ | ~~v*=0.1 continuation~~ | ~~等价 LR change~~ | ~~降级~~ |
+
+### P0 Diagnostic 指标
+
+```
+cos(m, g⁺_boundary)     — numerator 是否对齐 positive consolidation
+cos(Dm, g⁺_boundary)    — preconditioned update 是否对齐
+Δ_dir⁺ = cos(Dm,g⁺) - cos(m,g⁺)  — 方向扭转量
+κ(g⁺) / κ(g⁻)          — positive vs negative 的 preconditioning strength ratio
+d̄(g⁺) vs d̄(g⁻)        — positive 方向遭遇的平均 denominator
+```
+
+### 判断标准
+
+- **路径 A (numerator 问题)**：cos(m, g⁺) ≤ 0 → 正样本不足或被冲掉 → 转向 positive auxiliary
+- **路径 B (denominator 方向扭转)**：cos(m, g⁺) > 0 且 Δ_dir⁺ < 0 且 κ(g⁺) < κ(g⁻) → D 削弱 positive → 非 uniform D 干预有价值
+
+### Per-problem 分桶（来自 6.8 per-problem eval）
+
+| 分桶 | 用途 |
+|---|---|
+| Boundary (p∈[0.4,0.7]) | 核心检测对象 |
+| Consolidated (p>0.8) | 对照：positive 应已巩固 |
+| Problem 20 (退化) | 区分 cos(m,g⁺)<0 vs cos(Dm,g⁺)<0 |
+
+### Implementation (completed, from 6.8)
+
+| File | Change |
+|---|---|
+| `verl/workers/actor/dp_actor.py` | +`_compute_adam_diagnostics()` 方法 (9 metrics), 集成到两条 update 路径 |
+| `verl/workers/config/optimizer.py` | +`adam_v_scale`, `adam_override_beta2` 配置字段 |
+| `verl/workers/fsdp_workers.py` | `load_checkpoint` 后自动执行 v-scale / beta2 override |
+| `new_experiments/signal_fraction_lr/sync_constant_lr_diagnostic.sh` | +`${EXTRA_HYDRA:-}` 支持 |
+| `exp_data/per_problem_eval.py` | Per-problem AIME 评测脚本 (vLLM + FSDP merge) |
+| `exp_data/run_per_problem_eval.sh` | 便捷启动封装 |
+| `exp_data/per_problem_structure_inference.md` | 完整分析报告 |
+
+### Per-Problem Structure Inference (retained from 6.8, still valid)
+
+从 76 个 run 的聚合 AIME 指标推断 per-problem 结构。用于确定 gradient diagnostic 的 problem bucket 分组。
+
+**高置信度结论**：
+1. 增益集中在 ~5 道边界题 (p: 0.1-0.3 → 0.5-0.7)
+2. ~11/30 题始终不动 (p≈0)，RL 完全无效
+3. 一致性提升 > 能力提升：Δmaj@16 = 2.0× Δmean@16 (SNR=4.24)
+4. 行为变化先于能力变化：overlong 84%→51%，先于 acc 提升 ~10 steps
+5. AIME2025 提升仅为 AIME2024 的 60%，存在题型偏向
+
+**结论**：GRPO 主要把 near-boundary 问题稳定化，而非学会全新解法。Per-problem 分桶直接服务于 P0 gradient diagnostic。
+
+---
+
+---
+
+## 2026-06-01 AQH Closed-Loop Experiment Results
+
+### Executive summary
+
+A4 signal-quality LR (reward_std gate, base 1e-5) **failed to achieve its goal**. The reward-space gate only reduced LR by 10–15% (effective 8.6–9.0e-6), allowing entropy collapse (0.45→0.08) and per-token score energy collapse (77%). The A²/Q/H variance decomposition is structurally stable across runs — the failure is not a new H-concentration pathology but a self-masking feedback loop where the reward-only gate cannot detect policy-space collapse. Offline replay confirms an entropy-ratio gate would have triggered at step 58–66 and hit the 3.1e-6 safe floor by step 92–108.
+
+### What we discovered
+
+**1e-5 is an unsafe high-variance regime**: A2 seed0 runs successfully to 300 steps (best 0.348), but A2 seed42 catastrophically collapses (0.30→0.10 by step 140). Not "always fails" — but unacceptable seed variance.
+
+**A4 prevents catastrophic collapse but introduces slow policy collapse**: both A4 seeds complete 300 steps, peak early (step 90–120), then continuously degrade (final 0.27–0.28). Safer than A2-seed42, worse than A2-seed0.
+
+**The true failure mode is entropy collapse, not reward signal degradation**: A4 late entropy 0.08–0.09 (vs A2-seed0: 0.35, A1: 0.42). The causal chain:
+```
+high LR + weak gate → policy sharpening → entropy ↓
+→ p(a) → 1 → per-token q = 1-2p+Σp² → 0
+→ score-gradient energy vanishes → recovery barrier
+→ validation continuously drops
+```
+
+### Self-masking feedback loop (key mechanism finding)
+
+The gate's control action (slight LR reduction) prevents the reward-std indicator from declining, so the gate never triggers strong reduction. Meanwhile, the actual failure (entropy collapse → Q collapse) proceeds through a channel the gate does not monitor.
+
+> Controller optimizes the observability of its own failure signal.
+
+### Two failure channels identified
+
+| Type | Name | Indicators | A4 status |
+|---|---|---|---|
+| I | Reward-side signal degradation | reward_std, frac_informative, A², CV²(A²) | Stable (gate protected) |
+| II | Policy-side score-energy collapse | entropy, per-token q, Q_response | **Collapsed** (gate blind) |
+
+Conclusion: a gate using only Type I indicators will miss Type II collapse.
+
+### A²/Q/H structural findings (stable across all runs)
+
+- CV²(A²) >> CV²(Q): advantage side is the primary noise driver
+- Counterfactual: A²-only ~50% of H variance, Q-only ~3–5%, interaction ~40–45%
+- Q between-prompt fraction >92%: Q is strongly prompt-level
+- Per-token q / entropy are policy-health sensors, distinct from H variance drivers
+- These findings are consistent across A1/A2/A4, confirming Stage 2 results
+
+### Offline replay validation
+
+| Gate | seed0 first<5e-6 | seed0 first≤3.1e-6 | seed42 first<5e-6 | seed42 first≤3.1e-6 |
+|---|---|---|---|---|
+| Entropy | step 58 | step 92 | step 66 | step 108 |
+| Per-token Q | step 68 | step 102 | step 77 | step 132 |
+
+Entropy gate triggers earlier and is computationally cheaper (no `sum_pi_squared`).
+
+### Corrections applied in analysis
+
+1. **Terminology**: "E[Q]" → "per-token score energy q" (0.2 scale is per-token, not response-level)
+2. **Phrasing**: "categorically too high" → "unsafe high-variance regime" (A2-seed0 succeeds)
+3. **Causality**: "Q collapse is root cause" → "Q collapse is irreversible lock-in mechanism"
+4. **Implementation**: `reward_std_median` config name actually computes distributed `sqrt(mean_i[Var_k(R_i)])` — failure is in the entire reward-space indicator class
+
+### Next method: dual-channel gate
+
+```
+q_entropy = clip(EMA(entropy) / entropy_ref, 0.31, 1.0)
+q_total = min(q_info, q_entropy)     # min, not product
+lr = base_lr * q_total
+```
+
+Parameters: entropy_ref = warmup steps 10–20 mean, EMA β=0.9, q_entropy_min=0.31.
+
+### Next experiments (priority order)
+
+| Config | Base LR | Gate | Priority | Purpose |
+|---|---|---|---|---|
+| **A4c** | **5e-6** | **reward + entropy** | **Highest** | Lower max LR + policy collapse detection |
+| A4d | 1e-5 | reward + entropy | High | Test if policy gate saves aggressive LR |
+| A4b | 5e-6 | reward only | Medium | Isolate base LR effect |
+| A1 relaunch | 3.1e-6 | none | Needed | Safe baseline (both seeds failed) |
+| A3 relaunch | 5e-6→3.1e-6 cosine | none | Needed | Decay baseline (both seeds failed) |
+
+If two configs: A4c + A4d (separates "lower base LR" vs "policy gate" contributions).
+
+### Data availability
+
+| Run | Steps | AQH data | Status |
+|---|---|---|---|
+| A1 lr3.1e-6 seed0 | 46 | ✓ | ❌ partial |
+| A1 lr3.1e-6 seed42 | 164 | ✓ | ⚠️ partial |
+| A2 lr1e-5 seed0 | 300 | ✓ | ✅ complete |
+| A2 lr1e-5 seed42 | 145 | ✓ | ⚠️ catastrophic collapse |
+| A4 sq_info seed0 | 300 | ✓ | ✅ complete |
+| A4 sq_info seed42 | 300 | ✓ | ✅ complete |
+| A3 cosine seed0/42 | 8/0 | — | ❌ failed |
+
+### Files
+
+| File | Contents |
+|---|---|
+| `exp_data/aqh_closedloop_report.md` | Full analysis report with all tables and decomposition |
+| `exp_data/aqh_closedloop_analysis.py` | Analysis script (6 runs, 9 sections) |
+| `exp_data/aqh_gate_offline_replay.py` | Offline entropy/Q gate replay on A4 data |
+| `exp_data/aqh_gate_replay_results.txt` | Raw replay output |
+| `exp_data/aqh_closedloop_report_raw.txt` | Raw analysis output |
+
+---
 
 ## 2026-05-20 Signal-Quality-Aware LR Scaling
-
-### Method positioning
-
-**Not** an optimal LR estimator. Instead: **Signal-Quality-Aware LR Scaling**.
 
 ```
 α_t = α_base · q_t,    q_t ∈ [q_min, 1.0]

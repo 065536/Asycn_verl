@@ -226,6 +226,9 @@ class SignalQualityLRScheduler:
         conc_ema_beta: float = 0.9,
         conc_q_min: float = 0.5,
         conc_gamma: float = 0.5,
+        use_entropy_gate: bool = False,
+        entropy_ema_beta: float = 0.9,
+        entropy_q_min: float = 0.31,
     ):
         self.optimizer = optimizer
         self.num_warmup_steps = num_warmup_steps
@@ -249,6 +252,15 @@ class SignalQualityLRScheduler:
         self._conc_ref: float = None
         self._conc_ema: float = None
         self._q_conc: float = 1.0
+
+        self.use_entropy_gate = use_entropy_gate
+        self.entropy_ema_beta = entropy_ema_beta
+        self.entropy_q_min = entropy_q_min
+
+        self._entropy_warmup_vals: list[float] = []
+        self._entropy_ref: float = None
+        self._entropy_ema: float = None
+        self._q_entropy: float = 1.0
 
         self._q_total: float = 1.0
 
@@ -285,7 +297,30 @@ class SignalQualityLRScheduler:
                 ratio = self._conc_ref / (self._conc_ema + 1e-12)
                 self._q_conc = max(min(ratio ** self.conc_gamma, 1.0), self.conc_q_min)
 
-        self._q_total = self._q_info * self._q_conc
+        q_reward = self._q_info * self._q_conc
+        self._q_total = min(q_reward, self._q_entropy)
+
+    def update_entropy(self, entropy_value: float):
+        """Update entropy gate (Type-II policy-space collapse detector).
+
+        q_entropy = clip(EMA(entropy) / entropy_ref, entropy_q_min, 1.0)
+        Called once per training step with actor/entropy value.
+        """
+        if not self.use_entropy_gate:
+            return
+        if self._entropy_ref is None:
+            self._entropy_warmup_vals.append(entropy_value)
+            if len(self._entropy_warmup_vals) >= self.sq_warmup_steps:
+                self._entropy_ref = float(sum(self._entropy_warmup_vals) / len(self._entropy_warmup_vals))
+                self._entropy_ema = entropy_value
+        else:
+            self._entropy_ema = self.entropy_ema_beta * self._entropy_ema + (1.0 - self.entropy_ema_beta) * entropy_value
+            if self._entropy_ref > 1e-12:
+                self._q_entropy = max(min(self._entropy_ema / self._entropy_ref, 1.0), self.entropy_q_min)
+            else:
+                self._q_entropy = 1.0
+        q_reward = self._q_info * self._q_conc
+        self._q_total = min(q_reward, self._q_entropy)
 
     def step(self):
         self.step_count += 1
@@ -308,11 +343,14 @@ class SignalQualityLRScheduler:
         return {
             "actor/sq_q_info": self._q_info,
             "actor/sq_q_conc": self._q_conc,
+            "actor/sq_q_entropy": self._q_entropy,
             "actor/sq_q_total": self._q_total,
             "actor/sq_info_ref": self._info_ref if self._info_ref is not None else 0.0,
             "actor/sq_info_ema": self._info_ema if self._info_ema is not None else 0.0,
             "actor/sq_conc_ref": self._conc_ref if self._conc_ref is not None else 0.0,
             "actor/sq_conc_ema": self._conc_ema if self._conc_ema is not None else 0.0,
+            "actor/sq_entropy_ref": self._entropy_ref if self._entropy_ref is not None else 0.0,
+            "actor/sq_entropy_ema": self._entropy_ema if self._entropy_ema is not None else 0.0,
             "actor/sq_alpha_t": self._last_lr[0] if self._last_lr else 0.0,
             "actor/sq_warmup_done": warmup_done,
             "actor/sq_step": float(self.step_count),
@@ -331,6 +369,10 @@ class SignalQualityLRScheduler:
             "_conc_ref": self._conc_ref,
             "_conc_ema": self._conc_ema,
             "_q_conc": self._q_conc,
+            "_entropy_warmup_vals": self._entropy_warmup_vals,
+            "_entropy_ref": self._entropy_ref,
+            "_entropy_ema": self._entropy_ema,
+            "_q_entropy": self._q_entropy,
             "_q_total": self._q_total,
         }
 
@@ -346,6 +388,10 @@ class SignalQualityLRScheduler:
         self._conc_ref = state_dict.get("_conc_ref", None)
         self._conc_ema = state_dict.get("_conc_ema", None)
         self._q_conc = state_dict.get("_q_conc", 1.0)
+        self._entropy_warmup_vals = state_dict.get("_entropy_warmup_vals", [])
+        self._entropy_ref = state_dict.get("_entropy_ref", None)
+        self._entropy_ema = state_dict.get("_entropy_ema", None)
+        self._q_entropy = state_dict.get("_q_entropy", 1.0)
         self._q_total = state_dict.get("_q_total", 1.0)
 
 
@@ -1408,6 +1454,9 @@ class FSDPEngine(BaseEngine):
                 conc_ema_beta=optim_config.signal_quality_conc_ema_beta,
                 conc_q_min=optim_config.signal_quality_conc_q_min,
                 conc_gamma=optim_config.signal_quality_conc_gamma,
+                use_entropy_gate=optim_config.signal_quality_use_entropy_gate,
+                entropy_ema_beta=optim_config.signal_quality_entropy_ema_beta,
+                entropy_q_min=optim_config.signal_quality_entropy_q_min,
             )
         else:
             raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
@@ -1826,11 +1875,10 @@ class FSDPEngine(BaseEngine):
         return lr
 
     def update_entropy_for_lr(self, entropy: float):
-        """Update current entropy for entropy-adaptive LR scheduler.
-
-        No-op if the scheduler is not an EntropyAdaptiveLRScheduler.
-        """
+        """Update current entropy for entropy-adaptive or signal-quality LR scheduler."""
         if isinstance(self.lr_scheduler, EntropyAdaptiveLRScheduler):
+            self.lr_scheduler.update_entropy(entropy)
+        elif isinstance(self.lr_scheduler, SignalQualityLRScheduler):
             self.lr_scheduler.update_entropy(entropy)
 
     def update_signal_quality_for_lr(self, info_value: float, conc_value: float = None):

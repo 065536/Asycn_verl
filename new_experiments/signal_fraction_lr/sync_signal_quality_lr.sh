@@ -27,6 +27,9 @@ SQ_WARMUP=${SQ_WARMUP:-"20"}
 SQ_CONC_BETA=${SQ_CONC_BETA:-"0.9"}
 SQ_CONC_QMIN=${SQ_CONC_QMIN:-"0.5"}
 SQ_CONC_GAMMA=${SQ_CONC_GAMMA:-"0.5"}
+SQ_USE_ENTROPY=${SQ_USE_ENTROPY:-"false"}
+SQ_ENTROPY_BETA=${SQ_ENTROPY_BETA:-"0.9"}
+SQ_ENTROPY_QMIN=${SQ_ENTROPY_QMIN:-"0.31"}
 
 VERL_ROOT=/data/250010176/codes/verl/verl
 DATA_ROOT=/data/250010176/data
@@ -40,15 +43,33 @@ if [ "$SQ_USE_CONC" = "true" ] || [ "$SQ_USE_CONC" = "True" ]; then
 else
   USE_CONC_PY="False"
 fi
+if [ "$SQ_USE_ENTROPY" = "true" ] || [ "$SQ_USE_ENTROPY" = "True" ]; then
+  USE_ENTROPY_PY="True"
+else
+  USE_ENTROPY_PY="False"
+fi
 
 EXP_NAME_BASE="deepseek1.5b_sync_8gpu_${SQ_TAG}"
 EXP_NAME=${EXP_NAME:-"${EXP_NAME_BASE}_seed${SEED}"}
 CKPT_PREFIX="DeepSeek1.5B-Sync-8gpu-${SQ_TAG}-seed${SEED}"
 
-RESUME_MODE=${RESUME_MODE:-"disable"}
+RESUME_MODE=${RESUME_MODE:-"auto"}
 RESUME_FROM_PATH=${RESUME_FROM_PATH:-""}
 
-CKPTS_DIR=${VERL_ROOT}/ckpts/DeepSeek1.5B/${CKPT_PREFIX}-${TIMESTAMP}
+if [ "$RESUME_MODE" = "auto" ]; then
+  EXISTING_CKPT=$(find ${VERL_ROOT}/ckpts/DeepSeek1.5B -maxdepth 1 -type d -name "${CKPT_PREFIX}-*" 2>/dev/null | sort | tail -1)
+  if [ -n "$EXISTING_CKPT" ]; then
+    CKPTS_DIR="$EXISTING_CKPT"
+    echo "RESUME auto: found existing ckpt dir $CKPTS_DIR"
+  else
+    CKPTS_DIR=${VERL_ROOT}/ckpts/DeepSeek1.5B/${CKPT_PREFIX}-${TIMESTAMP}
+    echo "RESUME auto: no existing ckpt, creating $CKPTS_DIR"
+  fi
+elif [ "$RESUME_MODE" = "resume_path" ]; then
+  CKPTS_DIR=$(dirname "$RESUME_FROM_PATH")
+else
+  CKPTS_DIR=${VERL_ROOT}/ckpts/DeepSeek1.5B/${CKPT_PREFIX}-${TIMESTAMP}
+fi
 
 LOG_DIR=${VERL_ROOT}/logs
 LOG_FILE="${LOG_DIR}/sync_${SQ_TAG}_seed${SEED}_${TIMESTAMP}.log"
@@ -138,6 +159,9 @@ if [ "$IS_HEAD" = "1" ]; then
     ++actor_rollout_ref.actor.optim.signal_quality_conc_ema_beta=${SQ_CONC_BETA} \
     ++actor_rollout_ref.actor.optim.signal_quality_conc_q_min=${SQ_CONC_QMIN} \
     ++actor_rollout_ref.actor.optim.signal_quality_conc_gamma=${SQ_CONC_GAMMA} \
+    ++actor_rollout_ref.actor.optim.signal_quality_use_entropy_gate=${USE_ENTROPY_PY} \
+    ++actor_rollout_ref.actor.optim.signal_quality_entropy_ema_beta=${SQ_ENTROPY_BETA} \
+    ++actor_rollout_ref.actor.optim.signal_quality_entropy_q_min=${SQ_ENTROPY_QMIN} \
     ++actor_rollout_ref.actor.calculate_sum_pi_squared=True \
     ++actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     ++actor_rollout_ref.actor.ppo_micro_batch_size=null \

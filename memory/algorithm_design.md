@@ -1,8 +1,532 @@
 ---
 name: Algorithm Design — Current Framework and Open Questions
-description: 5.20 Signal-Quality-Aware LR Scaling 完成：离线验证 + sensitivity 分析 + 分布式一致性修复 + Group C 实验就绪
+description: 6.12 Direction pivot — from adaptive LR to RL-aware optimizer; pos/neg gradient decomposition; Adam preconditioning analysis
 type: project
 ---
+
+## 2026-06-12 Direction Pivot — RL-Aware Optimizer Design
+
+### 为什么不再做 adaptive LR
+
+从 signal-fraction (α_t = c_t · r̂_t) 到 signal-quality gate 到 entropy gate，我们一直在调**标量** LR。但 RL 的核心问题在**方向**：
+
+1. **r̂_t 本身噪声太大**：single-step g_dot_positive ≈ 55%（接近 coin flip），temporal aggregation (W10) 最终也不稳定
+2. **adaptive LR 的上限是"自动发现 schedule"**：D3 piecewise decay 恢复了 B 大部分收益，说明 state-dependent allocation 的剩余价值有限
+3. **LR 不改变 gradient 方向**：Adam update = α · m/(√v + ε)，α 只缩放 magnitude，不改变 D·m 的方向
+
+真正的问题是：**Adam 的 coordinate-wise preconditioning 是否扭转了 gradient 中的 positive consolidation 信号**。
+
+### 当前研究问题
+
+> 在 RLVR 中，standard Adam 的 per-coordinate preconditioning 是否系统性地削弱 positive-advantage gradient 相对于 negative-advantage gradient？如果是，能否设计一个利用 RL gradient 结构的优化器来改善学习效率？
+
+### |A⁻| 大 ≠ negative gradient update 占主导
+
+之前过粗地说"negative advantage 占主导"。严格区分三个层面：
+
+**1. 标量 advantage 一阶总量平衡（GRPO 结构保证）**
+
+p = 正确率，K responses/prompt：
+- Σ A⁺ = pK · √((1-p)/p) = K√(p(1-p))
+- Σ |A⁻| = (1-p)K · √(p/(1-p)) = K√(p(1-p))
+- **平衡**
+
+**2. 二阶 advantage energy 偏向少数类**
+
+- Σ(A⁺)² = pK · (1-p)/p = K(1-p)
+- Σ(A⁻)² = (1-p)K · p/(1-p) = Kp
+- p>0.5 时：Σ(A⁻)² > Σ(A⁺)²
+
+但这只说明 per-sample squared energy 偏向 negative，不说明**净梯度方向**一定偏 negative。
+
+**3. 真正的 update 看向量和**
+
+u⁺ = Σ_{A>0} A·s,  u⁻ = Σ_{A<0} A·s
+
+决定 update 的是 ‖u⁺‖, ‖u⁻‖, cos(u⁺, u⁻)，不是 ΣA²。
+
+即使 ΣA²⁻ > ΣA²⁺，也可能：
+- 正样本方向更一致 → ‖u⁺‖ 更大
+- 负样本方向分散、互相抵消 → ‖u⁻‖ 不大
+- 正负方向不一定相反
+
+**→ 必须实验测量。这就是 P0 pos/neg gradient decomposition 的目的。**
+
+### P0 → P1 → P2 路线图
+
+| Phase | 问题 | 方法 | 所需数据 |
+|---|---|---|---|
+| **P0** | g⁺ vs g⁻ 谁主导？方向关系？ | lm_head exact gradient decomposition | 每 5 步采样 64 responses |
+| **P1** | Adam D_t 是否扭转 g⁺ 方向？ | cos(m, g⁺) vs cos(Dm, g⁺) | P0 数据 + Adam state |
+| **P2** | 设计 RL-aware optimizer | 基于 P0/P1 诊断结论 | — |
+
+### P0 判断矩阵
+
+| ‖g⁺‖ vs ‖g⁻‖ | cos(g⁺,g⁻) | 解读 | 下一步 |
+|---|---|---|---|
+| ‖g⁺‖ >> ‖g⁻‖ | ≈ -1 | 正负近似反向，正占主导 | 检查 Adam D 是否压 g⁺ (P1) |
+| ‖g⁺‖ ≈ ‖g⁻‖ | ≈ -1 | 正负平衡、近似反向，净 update 很小 | 检查 ‖g_total‖ 是否过小 |
+| ‖g⁺‖ ≈ ‖g⁻‖ | ≈ 0 | 正负近似正交 | 可独立调节两方向 |
+| ‖g⁻‖ >> ‖g⁺‖ | any | negative 确实主导 | 需要 positive auxiliary |
+
+### 与之前 Adam direction hypothesis (6.8b) 的关系
+
+6.8b 提出的 cos(m, g⁺) vs cos(Dm, g⁺) 诊断框架**保留**，但现在是 P1 而非 P0。理由：要先知道 g⁺ 和 g⁻ 的 baseline 关系（P0），才能有意义地检查 Adam 对它们的差异化影响（P1）。
+
+### 降级的旧方向
+
+| 方向 | 状态 | 理由 |
+|---|---|---|
+| Signal-fraction LR (α_t = c_t · r̂_t) | **已关闭** | r̂_t 噪声根本性问题；LR 不改变方向 |
+| Signal-quality gate (reward_std / entropy) | **已关闭** | 只防 collapse，不改善学习 |
+| A²Q reweighting | **已关闭** | high-H 是有效信号不是 outlier |
+| Variance decomposition (N×K) | **保留为参考** | 结论（prompt/rollout noise 对半）仍有效 |
+
+## 2026-06-10 Exact lm_head Gradient Norm — A²Q Proxy 替代
+
+### A²Q 的问题
+
+A²Q 用 H = A²·Q 作为 per-response gradient energy proxy，其中 Q = Σ_t ||∇log π(y_t)||²。这假设：
+
+```
+||Σ_t J_t||² = Σ_t ||J_t||²
+```
+
+即不同 token 位置的 score function 在参数空间正交。但所有 token 共享参数、相邻 token hidden state 高度相关，cross terms Σ_{t≠s}⟨J_t, J_s⟩ 可以很大甚至主导。
+
+### 精确公式
+
+对 lm_head 层 W (V×d)，per-response 梯度 ∂S_b/∂W = Σ_t δ_t h_tᵀ（其中 δ_t = e_{y_t} - π_t）。
+
+```
+||∂S_b/∂W||²_F = Σ_{t,s} K_δ[t,s] · K_h[t,s]
+               = trace(K_δ ⊙ K_h) 的完整版（A²Q 只用了 trace of diag）
+```
+
+K_δ 的对角线恢复 q_per_token，off-diagonal 就是 A²Q 丢掉的 cross terms。
+
+### cross_term_ratio 的含义
+
+定义 cross_term_ratio = ||∂S/∂W||² / Q：
+- = 1 → cross terms 精确为零，A²Q 是完美 proxy
+- > 1 → cross terms 正贡献（token 间梯度正相关，信号叠加）
+- < 1 → cross terms 负贡献（token 间梯度反相关，部分抵消）
+
+这个量直接回答 "A²Q 有多离谱"。
+
+### 对后续方向的影响
+
+| cross_term_ratio 结果 | 含义 | 下一步 |
+|---|---|---|
+| ≈ 1（stable across training） | A²Q 其实还行，正交近似在 lm_head 层成立 | A²Q 可继续用；问题在别处 |
+| >> 1 或 << 1 | cross terms 重要，A²Q 系统性偏估 | 用 exact norm 替代 A²Q 做所有分解 |
+| 随训练从 ≈1 漂移 | 训练改变了 token 间相关结构 | 动态 A²Q 校正 or 全面切换 exact |
+
+### 为什么只算 lm_head 层
+
+- lm_head 是最大的单层参数矩阵 (hidden_dim × vocab_size)
+- 唯一直接看到 token-level loss signal 的层
+- 有解析公式，不需要 per-sample backward
+- 如果 lm_head 层 cross terms 不重要，其他层更不可能重要（因为梯度被 chain rule 进一步混合）
+- 如果 lm_head 层 cross terms 很大，可以后续用 random projection 验证全模型
+
+## 2026-06-08 Per-Problem Learning Analysis + Adam Preconditioning Direction Hypothesis
+
+### Per-Problem Structure Inference (from 76 runs aggregate data)
+
+**方法**：从 (mean@16, std@16, best@N, worst@N, maj@N, overlong) 统计推断 30 题的 per-problem 正确率分布。
+
+**核心发现**（高置信度）：
+
+1. **增益高度集中**：std@16 在 96.6% 的提升 run 中增大；best@16 提升是 worst@16 的 5.5×
+2. **一致性是最大信号**：Δmaj@16 = 2.0× Δmean@16 (SNR=4.24, 最稳定指标)；~3 道题跨过 p=0.5 门槛
+3. **约 11/30 题始终不动** (p≈0)，RL 对它们完全无效
+4. **行为变化先于能力变化**：overlong 84%→51%，先于 accuracy 提升约 10-12 steps
+5. **存在题型偏向**：AIME2025 提升仅为 AIME2024 的 60% (corr=0.46)
+
+**定量分布推断** (Beta 拟合, 采样噪声修正后)：
+
+| p_j 区间 | Base (30题) | Final (30题) | Δ |
+|---|---|---|---|
+| p < 0.05 | ~9 题 | ~2 题 | -6 |
+| 0.05-0.30 | ~10 题 | ~8 题 | -2 |
+| 0.30-0.50 | ~5 题 | ~8 题 | +3 |
+| 0.50-0.80 | ~3 题 | ~6 题 | +3 |
+| p > 0.80 | ~0 题 | ~1 题 | +0 |
+
+**4 类模型估计** (mean@16 + best@16 联合约束)：
+- ~4 道题从 "完全不会" 进入可探测范围
+- ~5 道题从 "边界" 进入 "基本掌握" (p≈0.65)
+- 仍有 ~11 道题完全未突破
+- **没有** p=0→p=0.8 的突破性学习
+
+**与 mixed-prompt/high-H 机制的一致性**：
+- 提升集中在 0.1<p<0.5 = 训练时的 mixed prompts (0<success_rate<1)
+- 完全不会的题 = all-wrong prompts, advantage≡0, 无梯度贡献
+- 一致性提升 > 能力提升 ↔ hard-negative signal 主要压低错误模式
+
+### Adam Preconditioning Direction Hypothesis (revised 6.8b)
+
+**核心问题**（不是 LR 问题）：
+
+Adam 的 update 是 Δθ = -α · m_t / (√v_t + ε)。我们研究的不是 α（LR），而是：
+
+```
+u_t = D_t · m_t,    D_t = diag(1 / (√v_t + ε))
+```
+
+u_t 是 preconditioned gradient — 模型真正执行的 update **方向**。
+
+**命题**：Adam 的坐标级 preconditioning 将 update 方向从 positive consolidation 方向旋转开，使 boundary problems 停在 p≈0.5-0.7。
+
+**关键区分**：两个竞争解释（必须先诊断 numerator 再看 denominator）
+
+| 路径 | 含义 | 表征 |
+|---|---|---|
+| A: numerator 问题 | m_t 本身不对齐 positive consolidation | cos(m, g⁺_boundary) ≤ 0 |
+| B: denominator 方向扭转 | m_t 有正向信号，但 D_t 把 u_t 拉离 g⁺ | cos(Dm, g⁺) < cos(m, g⁺) |
+
+如果路径 A 成立 → Adam 改法无意义，应转向 positive auxiliary / sampling。
+只有路径 B 成立 → denominator 干预有价值。
+
+**注意**：uniform v*=0.1 不能区分方向 vs 步长 — 若所有坐标统一缩放 v，u 方向不变，等价于 LR ×√10。只有 coordinate-wise 非均匀 v 结构才能改变方向。
+
+### Gradient Preconditioning Diagnostic Framework
+
+**定义**：
+- g⁺_boundary = Σ_{A>0, boundary prompts} A·s （positive consolidation gradient）
+- g⁻_boundary = Σ_{A<0, boundary prompts} A·s （negative correction gradient）
+- m_t = Adam first moment（EMA of gradients）
+- D_t = diag(1/(√v_t + ε))
+- u_t = D_t · m_t （preconditioned update direction）
+
+**核心诊断指标**（全部归一化，不涉及 LR）：
+
+| 指标 | 公式 | 含义 |
+|---|---|---|
+| cos(m, g⁺) | ⟨m, g⁺⟩ / (‖m‖‖g⁺‖) | Numerator 是否对齐 positive consolidation |
+| cos(Dm, g⁺) | ⟨Dm, g⁺⟩ / (‖Dm‖‖g⁺‖) | Preconditioned update 是否对齐 |
+| Δ_dir⁺ | cos(Dm, g⁺) - cos(m, g⁺) | **方向扭转量**：<0 说明 D 削弱 positive |
+| cos(m, g⁻) | 同理 | Numerator 对 negative 的对齐 |
+| cos(Dm, g⁻) | 同理 | Preconditioned 对 negative 的对齐 |
+| κ(g⁺) | ‖D·g⁺‖ / ‖g⁺‖ | Positive 方向的 preconditioning strength |
+| κ(g⁻) | ‖D·g⁻‖ / ‖g⁻‖ | Negative 方向的 preconditioning strength |
+| d̄(g⁺) | Σ_ℓ(c_ℓ² · √v_ℓ) / Σ_ℓ(c_ℓ²) | Positive 方向遭遇的平均 denominator |
+| d̄(g⁻) | 同理 | Negative 方向遭遇的平均 denominator |
+
+**判断矩阵**：
+
+| cos(m, g⁺) | Δ_dir⁺ | κ(g⁺) vs κ(g⁻) | 结论 |
+|---|---|---|---|
+| ≤ 0 | — | — | 路径 A：numerator 本身无 positive signal |
+| > 0 | < 0 | κ(g⁺) < κ(g⁻) | **路径 B confirmed**：D 削弱 positive，保留 negative |
+| > 0 | ≈ 0 | κ(g⁺) ≈ κ(g⁻) | D 对方向无差异影响 → 问题在别处 |
+| > 0 | > 0 | κ(g⁺) > κ(g⁻) | D 实际帮助 positive → 假设否定 |
+
+**Per-problem 分桶**（用 per-problem eval 结果选取）：
+
+| 分桶 | 条件 | 用途 |
+|---|---|---|
+| Boundary (核心) | p ∈ [0.4, 0.7] | 检测 g⁺ 是否被 D 压弱 |
+| Consolidated (对照) | p > 0.8 | 对照组 — positive 应已巩固 |
+| Regressed (单题) | Problem 20 (退化) | 区分 numerator 反向 vs D 扭转 |
+| Dead (负样本) | p ≈ 0 | g⁺ 应为 ~0，验证 sanity |
+
+### Counterfactual Analysis (same m, modified D)
+
+不做 uniform v-scale（等价于 LR 变化）。做结构性 counterfactual：
+
+| Counterfactual | 操作 | 测试 |
+|---|---|---|
+| Flatten D | D_flat = (1/mean(√v)) · I | 方向退化为 m 方向 — 消除所有坐标差异 |
+| Normalize D | D̃ = D / mean(D) | 去除全局 scale，只看方向改变 |
+| Cap D | √v_ℓ ← min(√v_ℓ, q95(√v)) | 测试 "少数极大坐标压制 positive" |
+| Channel-split | D⁺ = D restricted to g⁺-dominant coords | 看 positive 方向坐标的 v 是否系统性偏大 |
+
+比较每个 counterfactual 下 cos(D'·m, g⁺) 是否恢复。
+
+### Revised Experiment Priorities
+
+| Priority | 内容 | 性质 |
+|---|---|---|
+| **P0 (最高)** | Gradient preconditioning diagnostic | 纯诊断，不跑训练；同一 checkpoint + 同一 batch |
+| P1 | Counterfactual D analysis | 纯计算，对比 flatten/cap/normalize |
+| P2 | Continuation (仅当 P0 确认路径 B) | 训练实验：cap-D 或 channel Adam |
+| ~~P0 旧~~ | ~~v*=0.1 continuation~~ | ~~降级：等价于 LR change，不能区分方向~~ |
+
+**P0 诊断实验步骤**：
+1. 加载 step 200 或 250 checkpoint (含 Adam state m_t, v_t)
+2. 固定一个训练 batch（含 boundary prompts）
+3. Forward + backward 得到 per-response token-level gradients
+4. 按 advantage sign × problem bucket 聚合得到 g⁺_boundary, g⁻_boundary
+5. 读取 m_t, v_t → 计算 D_t → 计算所有指标
+6. 对多个 batch 取 mean±std 确认稳定性
+
+**成功标准**：
+- 路径 B 确认：cos(m, g⁺) > 0.05 且 Δ_dir⁺ < -0.02 且 κ(g⁺)/κ(g⁻) < 0.85
+- 路径 A 确认：cos(m, g⁺) ≤ 0 across multiple batches → 转向 positive auxiliary
+
+### 不同算法组的学习模式差异
+
+| Group | Δmaj/Δmean | Δbest/Δworst | 解读 |
+|---|---|---|---|
+| a2q | 1.75x | 13.8x | Reweighting 让提升极度集中在 top 题 |
+| lr1e-5 | 2.84x | 3.0x | 高 LR 少数题跨门槛但整体退化 |
+| lr3.1e-6 | 1.86x | 5.3x | 标准稳定训练 |
+| lr_decay | 2.31x | 2.5x | 衰减让提升相对均匀 |
+| signal_quality | 2.10x | 5.3x | SQ gate 无特殊影响 |
+| stage2_NK | 1.75x | 4.8x | N/K 配置不改变学习模式 |
+
+所有组都展现 Δmaj/Δmean > 1.7× → "边界题稳定化"是普遍现象。
+
+---
+
+## 2026-06-07 Top-H Attribution Analysis — Key Finding
+
+**结论：high-H rollout 是有效学习信号，不是应该被压的 outlier。这直接解释了为什么 A²Q clipping 没有提升性能。**
+
+### 三个核心发现（6 runs 一致，step 50-300 稳定）
+
+1. **High-H 主要由 A² 驱动，不是 Q/length artifact**
+   - Top-5% H 的 A² 是 global 的 5-9x，Q 只有 1.5-2.1x
+   - Top-5% response 平均长度 4500-5000 vs global 2600-2800（仅 1.7x），不是极端长文
+   - 结论：high-H ≈ high reward contrast，是 GRPO 学习信号的核心
+
+2. **High-H 绝大部分来自 mixed (informative) prompts**
+   - Step 100+ 后，top-5% H 中 mixed prompt 占 67-92%（远超 global 的 53-65%）
+   - H_share_mixed 从 step 10 的 30-40% 升至 step 100+ 的 70-96%
+   - All-correct prompts 的 H_share ≡ 0（A² ≡ 0 because all rewards equal → advantage = 0）
+   - 结论：high-H 恰好集中在最有学习价值的 prompt 上
+
+3. **High-H 以负 advantage 为主（~65-75% negative）**
+   - 含义：GRPO 通过 top-H rollout 主要在**惩罚错误 response**（降低概率）
+   - 这不是 noise — 这是 reward contrast 的自然结构：mixed prompt 中错误 response 的 advantage magnitude 通常更大
+   - 压掉这些 rollout = 削弱对错误 response 的惩罚力度
+
+### Vanilla vs Rollout-norm 的关键差异
+
+| 指标 | Vanilla | Rollout-norm |
+|---|---|---|
+| top5 A²/global | 7.8-8.9x | 4.9-5.2x |
+| top5 H share | 0.53-0.57 | 0.31-0.34 |
+| neff_h_ratio | 0.11-0.12 | 0.23-0.27 |
+
+Rollout-norm 确实降低了 concentration（neff 翻倍），但也降低了 A² ratio — 把最有区分力的 rollout 压平了。
+
+### 方向修正
+
+**不应继续做 A²Q clipping / reweighting**。High-H 不是 outlier，而是：
+- 来自 mixed (informative) prompts
+- 由 reward contrast (A²) 驱动
+- 主要方向是惩罚错误 response
+
+**更有价值的方向**：
+- 增加 mixed prompt 比例（prompt selection / difficulty-aware sampling）
+- Q-only normalization（如果要处理 score-energy artifact，不应连带压 A²）
+- 条件 reweighting：只在 H high ∧ Q high（Q 主导的 outlier）时压
+
+### 分析产物
+
+- `exp_data/a2q_topH_attribution_analysis.py` — 离线分析脚本
+- `exp_data/a2q_topH_attribution_results.txt` — 完整结果
+- `verl/trainer/ppo/a2q_reweighting.py` — 新增 15 个在线 attribution metrics
+
+---
+
+## 2026-06-03 Day Summary
+
+**完成**: 综合报告修订 + 认知修正 + 文档全面更新 + 实验脚本确认就绪
+
+**关键决策**: 主实验从 LR=3.1e-6 stability story 转向 LR=1e-6 gradient composition story。
+
+**实验状态**: 15 个 LR=1e-6 脚本已就绪（`new_experiments/a2q_reweighting/sync_a2q_lr1e-6_*.sh`），分三批优先级启动。核心对比 = vanilla vs rollout-only normalized (6 runs)。
+
+**待办**: 启动第一批实验 → 等结果 → 分析 final avg5 / AUC / concentration metrics。
+
+---
+
+## 2026-06-03 综合报告修正与方向确认
+
+### 研究问题重新定义
+
+**旧问题**（已降级）：How to prevent collapse at high LR (1e-5, 5e-6)?
+
+**新问题**（当前主线）：
+> In a stable low-learning-rate RLVR regime, can we improve final performance by improving the composition of the policy-gradient estimator, rather than by changing the learning-rate schedule?
+
+标准 GRPO: `ĝ_i = (1/K) Σ_k A_{i,k} s_{i,k}`
+Rollout-robust normalized: `g̃_i = (1/K) Σ_k (w̃_{i,k}/w̄) A_{i,k} s_{i,k}`
+
+### 5 条认知修正
+
+1. **主问题不是稳定性，是低 LR 下的有效学习** — 实验应在 LR=1e-6
+2. **A²Q 收益不是"防 collapse"，是"改 gradient composition"** — normalized 版本关键
+3. **Prompt-level 不能简单按 E_i clip** — 核心是 informativeness (I_i = 4r̄(1-r̄))，不是 high-energy
+4. **Rollout-level correction 最干净** — H_{i,k} 直接对应 per-rollout gradient leverage
+5. **Entropy 是 diagnostic，不是主指标** — 低 LR 下 entropy 低不等于 failure
+
+### 当前证据状态
+
+- A²Q hierarchical @ 3.1e-6: final mean 0.3309 vs A1 0.3271 (Δ=+0.0038) — **弱正信号，未证明**
+- "hierarchical > rollout-only > vanilla" 排序：**未被严格证明**（incomplete seeds + code-path confounds）
+- "A²Q causes entropy collapse"：**因果未确认**（A2Q vanilla 不是 clean run）
+
+### 实验 A：LR=1e-6 主性能实验
+
+| 方法 | 说明 | 优先级 |
+|---|---|---|
+| Vanilla | baseline | 核心 |
+| Rollout-only normalized | 主方法（mean(w)=1, 只改 composition） | 核心 |
+| Rollout-only unnormalized | effective LR 下降对照 | 核心 |
+| Hierarchical normalized | prompt-level 帮忙还是伤害 | 次要 |
+| Prompt-only normalized | E_i clip 是否有害 | 次要 |
+
+**核心对比**: vanilla vs rollout-only normalized
+
+**解释力分析表**:
+
+| 结果 | 解释 |
+|---|---|
+| rollout-only normalized > vanilla | A²Q 改善 gradient composition ✓ |
+| rollout-only unnormalized > vanilla | 可能是 filtering 也可能是 effective LR 变化 |
+| unnormalized < normalized | 低 LR 不能再降 update scale |
+| hierarchical < rollout-only | prompt-level weighting 压掉有用 signal |
+| prompt-only < vanilla | prompt E_i clipping 目标不对 |
+
+分析指标：final avg5, AUC, last-5 eval mean, H concentration before/after, n_eff, update norm
+
+---
+
+## 2026-06-03 Stage 1 中期结论（保留，context-adjusted）
+
+### 核心发现
+
+1. **Rollout-only > Hierarchical > Vanilla @ step 200**
+   - rollout_only 3-seed mean: 0.3366 (vs vanilla 0.3263, +0.0103, 三 seed 全正)
+   - hierarchical 3-seed mean: 0.3286 (仅 +0.0023, 不显著)
+   - ⚠️ 注意：最终 300-step 结果中 hierarchical 更好（vanilla 未完成），这些排序尚不确定
+
+2. **Prompt-level control 可能有害**
+   - High E_i prompts 不一定是 noise，可能是 informative prompts
+   - ⚠️ 修正：问题不是 "high-energy = outlier"，而是 informativeness vs all-correct/all-wrong
+
+3. **当前 clip 力度太弱（weight_mean=0.988）**
+   - 在 3.1e-6 下几乎无实质影响
+   - 在 1e-6 下可能需要更强 clip 才能看到 composition 差异
+
+4. **Gini 实现符号 bug（已修复）**
+
+### 理论支撑（保留）
+
+- Rollout-level high H 更像 estimator noise
+- Prompt-level high E_i 可能是 useful task signal
+- Downweight prompt 引入 bias 风险更大
+
+### Bug fixes (2026-06-03)
+
+- Gini sign fix: `(n+1-2*ranks)` for descending sorted data
+- 新增 `normalize` 参数：`w_apply = w / mean(w)` 保持 update magnitude
+- 新增 energy-weighted 诊断指标
+
+---
+
+## 2026-06-02 方向转折：A²Q-Guided Hierarchical Gradient Reweighting
+
+### 核心变化
+
+从 adaptive LR scheduling (α_t = c_t · r̂_t) 转向 gradient estimator 改进 (ĝ → g̃)。
+干预点从 Adam 之后移到 Adam 之前。
+
+### 方法
+
+标准 GRPO 梯度：ĝ = (1/NK) Σ A_{i,k} s_{i,k}
+重加权后：g̃ = (1/NK) Σ w_i w_{i,k} A_{i,k} s_{i,k}
+
+其中：
+- H_{i,k} = A²_{i,k} Q_{i,k}（gradient energy proxy）
+- E_i = Σ_k H_{i,k}（prompt energy）
+- w_{i,k} = min(1, sqrt(τ_r / (H_{i,k} + ε)))（rollout-level soft clip）
+- w_i = min(1, sqrt(τ_p / (E_i + ε)))（prompt-level soft clip）
+- τ_r, τ_p 用 global percentile + EMA
+
+### 实现状态
+
+- `verl/trainer/ppo/a2q_reweighting.py`：核心模块
+- `verl/trainer/config/algorithm.py`：6 个新配置字段（a2q_reweight_*）
+- `verl/trainer/ppo/ray_trainer.py`：在 compute_advantage 之后、_update_actor 之前调用
+- 方案 A：从 batch 中的 sum_pi_squared + old_log_probs 计算 Q，不改 actor 代码
+- 前提：实验脚本须设 `actor.calculate_sum_pi_squared=True`
+
+### 与之前工作的关系
+
+- 之前的 A²Q noise decomposition 理论框架保留，成为新方法的基础
+- Signal-fraction LR 路线暂停（r̂_t 噪声、c_t 追移动靶等困难被绕过）
+- 5.19 normalization 校正（B vs W/K）直接成为理论基础
+
+### 实验计划
+
+- Stage 0: instrumentation validation（safe LR 3.1e-6，确认 metrics 正确）
+- Stage 1: fixed-LR 4-way ablation（vanilla / rollout-only / prompt-only / hierarchical）
+- Stage 2: mildly aggressive LR (5e-6) 测试
+- Stage 3: threshold sensitivity
+- Stage 4: N/K robustness
+
+详细设计：`exp_data/README_A2Q_Hierarchical_Reweighting.md`
+
+---
+
+## 2026-06-01 AQH Closed-Loop Results & Next Direction
+
+### 核心结论
+
+A4 signal-quality LR (reward_std gate, base 1e-5) **未达目标**：
+- 两个 seed 都完成 300 步，但 best@90-120 → final 0.27-0.28，持续下降
+- 比 A2 catastrophic seed42 (0.10) 安全，但比 A2 lucky seed0 (0.327) 差
+
+### 失败机制：self-masking feedback + entropy collapse
+
+1. Gate 只降 LR 10-15%（有效 LR 8.6-9.0e-6，远超安全区 3.1e-6）
+2. 轻微降 LR 保住了 reward diversity → reward_std 没大幅下降 → gate 不知道要更强刹车
+3. 真正的 failure 走 policy-space 通道：entropy 0.45→0.08 → per-token q 77% collapse → score-gradient 消失 → 锁死在窄模式
+
+### 两类 failure channel
+
+| Type | 名称 | 指标 | A4 状态 |
+|---|---|---|---|
+| I | Reward-side signal degradation | frac_informative, reward_std, A², CV²(A²) | 稳定（gate 有效保护） |
+| II | Policy-side score-energy collapse | entropy, per-token q, Q_response | **崩溃**（gate 完全未检测） |
+
+**结论**：只用 Type I 指标的 gate 会漏掉 Type II collapse。
+
+### A²/Q/H 结构稳定
+
+- CV²(A²) >> CV²(Q)，A²-only ~50% H variance，Q-only ~3-5%，interaction ~40-45%
+- Q between_frac > 92%（强 prompt-level 属性）
+- 以上在 A1/A2/A4 所有 run 间一致，不是新 pathology
+
+### Offline replay 确认 entropy gate 有效
+
+| Gate | seed0 first<5e-6 | seed0 first≤3.1e-6 | seed42 first<5e-6 | seed42 first≤3.1e-6 |
+|---|---|---|---|---|
+| Entropy | step 58 | step 92 | step 66 | step 108 |
+| Per-token Q | step 68 | step 102 | step 77 | step 132 |
+
+Entropy gate 更早触发（step 58-66），与 A4 validation peak (step 90-120) 对齐。
+
+### 下一步方法
+
+```
+q_entropy = clip(EMA(entropy) / entropy_ref, 0.31, 1.0)
+q_total = min(q_info, q_entropy)
+lr = base_lr * q_total
+```
+
+优先配置：
+- **A4c**（最高优先）：base_lr=5e-6, reward + entropy gate
+- A4d：base_lr=1e-5, reward + entropy gate
+- 同时重跑 A1 (constant 3.1e-6) 和 A3 (cosine decay) 作为 baseline
+
+详细报告：`exp_data/aqh_closedloop_report.md`
 
 ## 2026-05-20 Signal-Quality-Aware LR Scaling
 

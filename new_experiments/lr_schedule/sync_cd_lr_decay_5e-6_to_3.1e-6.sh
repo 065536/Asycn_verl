@@ -26,7 +26,7 @@ fi
 
 BASE_LR=${BASE_LR:-"5e-6"}
 MIN_LR=${MIN_LR:-"3.1e-6"}
-RESUME_MODE=${RESUME_MODE:-"disable"}
+RESUME_MODE=${RESUME_MODE:-"auto"}
 NCPUS=${NCPUS:-$(nproc)}
 
 RAY_PORT=${RAY_PORT:-6380}
@@ -58,7 +58,18 @@ EXP_NAME="deepseek1.5b_sync_8gpu_cd_${DECAY_TYPE}_5e-6_to_3.1e-6_seed${SEED}"
 CKPT_PREFIX="DeepSeek1.5B-Sync-8gpu-cd-${DECAY_TYPE}-5e-6-to-3.1e-6-seed${SEED}"
 
 # Keep logs/checkpoints under the original verl package directory style.
-CKPTS_DIR=${CKPTS_DIR:-${VERL_PKG}/ckpts/DeepSeek1.5B/${CKPT_PREFIX}-${TIMESTAMP}}
+if [ "$RESUME_MODE" = "auto" ]; then
+  EXISTING_CKPT=$(find ${VERL_PKG}/ckpts/DeepSeek1.5B -maxdepth 1 -type d -name "${CKPT_PREFIX}-*" 2>/dev/null | sort | tail -1)
+  if [ -n "$EXISTING_CKPT" ]; then
+    CKPTS_DIR="$EXISTING_CKPT"
+    echo "RESUME auto: found existing ckpt dir $CKPTS_DIR"
+  else
+    CKPTS_DIR=${CKPTS_DIR:-${VERL_PKG}/ckpts/DeepSeek1.5B/${CKPT_PREFIX}-${TIMESTAMP}}
+    echo "RESUME auto: no existing ckpt, creating $CKPTS_DIR"
+  fi
+else
+  CKPTS_DIR=${CKPTS_DIR:-${VERL_PKG}/ckpts/DeepSeek1.5B/${CKPT_PREFIX}-${TIMESTAMP}}
+fi
 LOG_DIR=${VERL_PKG}/logs
 LOG_FILE="${LOG_DIR}/${EXP_NAME}_${TIMESTAMP}.log"
 mkdir -p "${CKPTS_DIR}" "${LOG_DIR}"

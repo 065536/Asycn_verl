@@ -1,7 +1,339 @@
 ---
-name: Engineering Implementation — Signal-Fraction Adaptive LR
-description: 2026-05-20 Signal-Quality-Aware LR Scaling + distributed consistency fix + sensitivity analysis; 5.19 full noise decomposition overhaul
+name: Engineering Implementation — RL Gradient Diagnostics + Signal-Fraction History
+description: 6.12 Pos/neg gradient decomposition (g⁺ vs g⁻ at lm_head)；6.10 Exact lm_head gradient norm；6.8b Gradient preconditioning diagnostic；历史：A²Q reweighting, SQ-LR, noise decomposition
 type: project
+---
+
+## Pos/Neg Gradient Decomposition (2026-06-12)
+
+**目的**：将 batch gradient 按 advantage sign 分解为 g⁺ 和 g⁻，测量谁主导真实 update。在 lm_head 层精确计算。
+
+**核心公式**：对每个 response b，lm_head score function gradient:
+
+```
+G_b = Σ_t mask_t · (e_{y_t} - π_t) h_tᵀ,  π_t = softmax(logits_t / τ)
+```
+
+按 advantage sign 累加:
+```
+g⁺ = Σ_{A_b > 0} A_b · G_b    (positive consolidation)
+g⁻ = Σ_{A_b < 0} A_b · G_b    (negative correction)
+```
+
+**实现**：
+
+| File | Change |
+|---|---|
+| `verl/trainer/ppo/lm_head_grad_norm.py` | +`compute_single_response_lm_head_grad(h_b, logits_b, y_b, chunk)` → (V,d) float32 |
+| `verl/workers/actor/dp_actor.py` | +`compute_pos_neg_grad_decomposition(data, max_responses)` |
+| `verl/workers/actor/dp_actor.py` | `update_policy()` 集成：训练前 eval-mode 诊断 |
+| `verl/workers/config/actor.py` | +3 config fields |
+
+**`compute_single_response_lm_head_grad` 细节**：
+- 输入: (T_valid, d) hidden states, (T_valid, V) logits (已除 temperature), (T_valid,) token ids
+- 按 token_chunk_size=256 分块避免 (T, V) 全量 softmax
+- 每 chunk: π = softmax(logits_chunk) → scatter_add(-1 at y) → grad -= pi.T @ h
+- 输出: (V, d) float32 gradient matrix
+
+**`compute_pos_neg_grad_decomposition` 细节**：
+- 在 prompt-group 级别子采样（保证同 prompt 的 K 个 response 完整，便于按 success rate 分桶）
+- Micro-batch size = 2, forward with `output_hidden_states=True`
+- 4 个 (V, d) float32 accumulator: g⁺_low, g⁻_low, g⁺_high, g⁻_high (按 prompt success rate < 0.5 / ≥ 0.5 分桶)
+- Global g⁺/g⁻ = sum of bucket accumulators
+- Memory: 4 × V × d × 4 bytes ≈ 3.7GB (V=151936, d=1536 for Qwen-1.5B)
+
+**配置**：
+
+```yaml
+actor:
+  calculate_pos_neg_grad_decomp: true
+  pos_neg_grad_decomp_freq: 5
+  pos_neg_grad_decomp_max_responses: 64
+```
+
+**Metrics** (prefix `grad_decomp/`):
+- Global: `g_pos_norm`, `g_neg_norm`, `g_total_norm`, `cos_pos_neg`, `pos_neg_norm_ratio`, `n_pos`, `n_neg`, `n_zero`
+- Per bucket: `high_p/g_pos_norm`, `high_p/g_neg_norm`, `high_p/cos_pos_neg`, ... (同理 `low_p/`)
+- Summary: `n_prompts_sampled`, `n_prompts_mixed`, `frac_uninformative`
+
+**时序位置**：在 `update_policy()` 开头、训练循环之前运行。此时 advantages 已可用，模型参数尚未被本步 update。对 signal_fraction 和 standard 两条路径均有效。
+
+---
+
+## Exact lm_head Gradient Norm (2026-06-10 — replaces A²Q proxy)
+
+**问题**：A²Q 分解假设不同 token 的 score function 梯度在参数空间正交 (||Σ_t J_t||² = Σ_t ||J_t||²)，丢掉了 cross terms。实际上所有 token 共享参数，cross terms 可以很大。
+
+**方案**：精确计算 lm_head 层的 per-response gradient norm ||∂S_b/∂W||²_F，使用 Gram 矩阵公式：
+
+```
+||∂S_b/∂W||²_F = Σ_{t,s} K_δ[t,s] · K_h[t,s]
+K_h[t,s] = h_t · h_s          (hidden-space Gram)
+K_δ[t,s] = 1_{y_t=y_s} - π_s[y_t] - π_t[y_s] + π_t·π_s  (vocab-space Gram of error vectors)
+```
+
+K_δ 的对角线恢复 q_per_token = 1 - 2π_t[y_t] + Σ_v π_t[v]²，所以 A²Q 等于 A²·trace(K_h ⊙ diag(K_δ))。
+
+**不需要 lm_head 权重**：公式只用 hidden states 和 softmax distributions (from logits)，在 FSDP 下不需要 unsharding。
+
+**验证**：analytical 公式与 PyTorch autograd 精确一致 (diff < 1e-6)。chunked 和 non-chunked 版本一致。
+
+**文件变更**：
+
+| File | Change |
+|---|---|
+| `verl/trainer/ppo/lm_head_grad_norm.py` | 新文件：core computation (`compute_response_lm_head_grad_norms`) |
+| `verl/workers/actor/dp_actor.py` | +`compute_lm_head_grad_norms()` 方法 + 集成到 `compute_log_prob` |
+| `verl/workers/config/actor.py` | +`calculate_lm_head_grad_norm`, `lm_head_grad_norm_freq`, `lm_head_grad_norm_max_responses` |
+| `verl/trainer/ppo/metric_utils.py` | +exact_grad decomposition metrics (between/within, cross_term_ratio, corr) |
+| `verl/trainer/ppo/ray_trainer.py` | +`global_step` in meta_info before compute_log_prob |
+
+**配置**：
+
+```yaml
+actor:
+  calculate_lm_head_grad_norm: true
+  lm_head_grad_norm_freq: 5        # 每 5 步做一次
+  lm_head_grad_norm_max_responses: 64  # 子采样 64 个 response
+  calculate_sum_pi_squared: true   # 仍需 sum_pi_squared 用于 A²Q 对比
+```
+
+**新 metrics**（前缀 `noise_decomp/exact_grad/`）：
+
+| Metric | Description |
+|---|---|
+| `n_sampled` | 本步采样的 response 数 |
+| `mean_gnorm_sq` | E[||∂S/∂W||²] |
+| `std_gnorm_sq` | Std[||∂S/∂W||²] |
+| `mean_h_exact` | E[A² · ||∂S/∂W||²]（exact gradient energy） |
+| `cross_term_ratio_mean` | E[||∂S/∂W||² / Q]（>1 说明 cross terms 正贡献，<1 说明互相抵消） |
+| `corr_gnorm_q` | Corr(||∂S/∂W||², Q)（exact norm 与 A²Q proxy 的相关性） |
+| `gnorm/between_var`, `within_var`, `between_frac`, `within_frac` | ||∂S/∂W||² 的 prompt 间/内方差分解 |
+| `h_exact/between_var`, etc. | A²·||∂S/∂W||² 的方差分解 |
+
+**限制**：
+
+- 仅支持 `use_fused_kernels=False`（fused 路径不返回 logits）
+- Peak memory: (T, V) softmax matrix per response (~800MB for T=2000, V=100K in float32)。chunked 模式用 `token_chunk_size=512` 降至 ~200MB
+- 子采样引入采样噪声，需多步平均
+
+## Gradient Preconditioning Diagnostic (2026-06-08b — P0 新增)
+
+**目的**：诊断 Adam D_t 是否改变 gradient 有效方向，使其偏离 positive consolidation。
+纯诊断脚本，不改训练代码，不跑训练。
+
+### 实现方案
+
+新脚本 `exp_data/adam_direction_diagnostic.py`（待实现）：
+
+**输入**：
+- Step 200/250 FSDP checkpoint（含 optimizer state: exp_avg, exp_avg_sq）
+- 训练 batch（含 boundary prompts, 从 replay buffer 或在线采样）
+- Per-problem eval 结果（用于确定 boundary/consolidated/dead bucket）
+
+**计算流程**：
+1. 加载 checkpoint → 提取 m_t (exp_avg), v_t (exp_avg_sq) per param
+2. Forward + backward on batch → 得到 token-level gradients
+3. 按 advantage_sign × problem_bucket 聚合：
+   - g⁺_boundary = Σ_{A>0, boundary} A·∇logπ
+   - g⁻_boundary = Σ_{A<0, boundary} A·∇logπ
+   - （flatten 为全参数向量）
+4. 计算 D_t = 1/(√v_t + ε), u_t = D_t * m_t
+5. 计算所有诊断指标（见 algorithm_design.md diagnostic framework）
+
+**关键工程约束**：
+- FSDP: 需要 full gather 或 per-shard 计算 + all_reduce inner products
+- 内存: g⁺/g⁻ 各是完整参数维度，需 float32；1.5B 模型 ≈ 2×6GB
+- 方案 A: 用 FSDP `summon_full_params` + 逐层计算 inner product（内存友好）
+- 方案 B: 单 GPU 加载 merged checkpoint + 单卡 backward（简单但需大显存）
+
+**输出**：
+```
+cos(m, g⁺_boundary), cos(Dm, g⁺_boundary), Δ_dir⁺
+cos(m, g⁻_boundary), cos(Dm, g⁻_boundary), Δ_dir⁻
+κ(g⁺), κ(g⁻), κ_ratio = κ(g⁺)/κ(g⁻)
+d̄(g⁺), d̄(g⁻)
+‖g⁺‖, ‖g⁻‖, ‖m‖, ‖u‖
+```
+
+Per bucket × per batch → mean ± std 矩阵。
+
+### Counterfactual Variants (同一脚本内)
+
+| Variant | D' 构造 | cos(D'·m, g⁺) |
+|---|---|---|
+| Actual Adam | D_t = 1/(√v_t + ε) | baseline |
+| Flatten (= raw m direction) | D_flat = scalar · I | = cos(m, g⁺) |
+| Normalize | D̃ = D / mean(D) | 去全局 scale |
+| Cap q95 | √v_ℓ ← min(√v_ℓ, q95) | 测试极端坐标影响 |
+
+### 状态
+
+- [ ] 脚本框架
+- [ ] 单 GPU merged checkpoint 路径
+- [ ] Per-shard FSDP 路径
+- [ ] 在 step 200 checkpoint 上跑
+- [ ] 多 batch 稳定性验证
+
+---
+
+## Adam Diagnostics + v-scale Continuation (2026-06-08)
+
+**注意 (6.8b 修正)**：v*=0.1 continuation 从 P0 降级为 P2。原因：uniform v-scale 不改变 u_t 方向，等价于 LR × √10。只有 P0 gradient diagnostic 确认路径 B（cos(Dm,g⁺) < cos(m,g⁺)）后，才值得跑非 uniform continuation（如 cap-D）。
+
+### Adam State Diagnostic Logging (P0)
+
+`verl/workers/actor/dp_actor.py` — 新增 `_compute_adam_diagnostics()` 方法。
+
+在 `optimizer.step()` 后、`zero_grad()` 前调用，读取 optimizer state 计算：
+
+| Metric | 计算方式 | 用途 |
+|---|---|---|
+| `adam/v_rms` | RMS(√v) across all params | Denominator 整体大小 |
+| `adam/v_mean` | mean(v) | Denominator 均值 |
+| `adam/v_max` | max(v) | 极端 denominator |
+| `adam/m_rms` | RMS(m) | Numerator 整体大小 |
+| `adam/update_norm` | ‖m/(√v+ε)‖ | Preconditioned update 大小 |
+| `adam/raw_grad_norm` | ‖g‖ post-clip | 原始梯度大小 |
+| `adam/update_to_grad_ratio` | update_norm / grad_norm | 关键：下降说明 denominator 在压步长 |
+| `adam/eta_eff` | ⟨u, g⟩ / ‖g‖² | 在梯度方向的有效 LR |
+| `adam/cos_update_grad` | cos(u, g) | Update 与 gradient 对齐度 |
+
+零额外 forward/backward。所有统计量通过 all_reduce 跨 FSDP shard 汇总。
+已集成到标准 update_policy 路径 (line ~1206) 和 signal-fraction 路径 (line ~923)。
+
+### Adam v-scale / beta2 Override (P1)
+
+**Config** (`verl/workers/config/optimizer.py`):
+- `adam_v_scale: Optional[float] = None` — checkpoint load 后对 exp_avg_sq 乘以此因子
+- `adam_override_beta2: Optional[float] = None` — 切换 β₂ 并做 bias-correction rescale
+
+**执行点** (`verl/workers/fsdp_workers.py` → `load_checkpoint`):
+- 在 `checkpoint_manager.load_checkpoint()` 返回后立即执行
+- v_scale: 遍历所有 param state, `state["exp_avg_sq"].mul_(v_scale)`
+- beta2 override: 计算 `rescale = (1-β₂_new^t) / (1-β₂_old^t)`，先 rescale state，再修改 param_group betas
+
+### Continuation 实验脚本
+
+`exp_data/run_adam_continuation.sh` — 模板脚本
+`new_experiments/signal_fraction_lr/sync_constant_lr_diagnostic.sh` — 新增 `${EXTRA_HYDRA:-}` 支持
+
+Hydra override 方式：
+```
+++actor_rollout_ref.actor.optim.adam_v_scale=0.1
+++actor_rollout_ref.actor.optim.adam_override_beta2=0.99
+```
+
+### Per-Problem Eval 脚本
+
+`exp_data/per_problem_eval.py` — 独立评测脚本：
+- 输入：base model + FSDP checkpoints + AIME parquet
+- 自动 merge FSDP shards → HF 格式
+- 用 vLLM 生成 N samples/题
+- 输出：per-problem accuracy table, category classification, answer distribution, NPZ arrays
+
+`exp_data/run_per_problem_eval.sh` — 便捷启动封装
+
+---
+
+## A²Q Hierarchical Gradient Reweighting (2026-06-02)
+
+### Bug Fix: Gini Sign (2026-06-03)
+
+`_gini()` used `(2*ranks - n - 1)` which is the ascending-sort formula, but data is sorted descending.
+Fix: `(n + 1 - 2*ranks)`. Now Gini ∈ [0, 1] as expected.
+
+### New Energy-Weighted Metrics (2026-06-03)
+
+Added to `apply_a2q_reweighting()` return dict:
+
+| Metric | Formula | Purpose |
+|---|---|---|
+| `a2q_reweight/h_sum_ratio` | Σ(w²H) / ΣH | Overall energy reduction |
+| `a2q_reweight/energy_weighted_w2_mean` | same as above | Alias |
+| `a2q_reweight/energy_weighted_w_mean` | Σ(wH) / ΣH | Energy-weighted mean weight |
+| `a2q_reweight/h_top5_share_before` | Σ(H_top5) / ΣH | Top5 energy share, original |
+| `a2q_reweight/h_top5_share_after` | Σ(w²H_top5) / Σ(w²H) | Top5 energy share, after reweight |
+| `a2q_reweight/neff_before` | (ΣH)² / Σ(H²) | Effective sample count, original |
+| `a2q_reweight/neff_after` | (Σw²H)² / Σ(w²H)² | Effective sample count, after |
+| `a2q_reweight/prompt_top1_share_before` | E_max / ΣE | Top prompt energy share, original |
+| `a2q_reweight/prompt_top1_share_after` | E'_max / ΣE' | Top prompt energy share, after |
+| `a2q_reweight/neff_prompt_before` | (ΣE)² / Σ(E²) | Prompt neff, original |
+| `a2q_reweight/neff_prompt_after` | (ΣE')² / Σ(E'²) | Prompt neff, after |
+
+These are logged regardless of mode (even vanilla logs them for comparison).
+
+### 核心模块
+
+`verl/trainer/ppo/a2q_reweighting.py` — 新建文件，包含：
+
+| 函数 | 作用 |
+|---|---|
+| `compute_q_response()` | 从 sum_pi_squared + old_log_probs 算 per-response Q_{i,k} |
+| `compute_response_a2()` | 从 token-level advantages 算 per-response A²_{i,k} |
+| `compute_h_and_e()` | H_{i,k} = A² × Q, E_i = Σ_k H_{i,k} |
+| `compute_thresholds()` | global percentile τ_r, τ_p |
+| `compute_weights()` | w_{i,k} = min(1, √(τ_r/H)), w_i = min(1, √(τ_p/E)) |
+| `build_prompt_indices()` | uid → integer prompt index mapping |
+| `apply_a2q_reweighting()` | 主入口，修改 batch advantages in-place |
+| `A2QReweightState` | EMA state dataclass (tau_r_ema, tau_p_ema, step) |
+
+### 集成点
+
+`verl/trainer/ppo/ray_trainer.py`:
+- 在 `compute_advantage()` 返回后、`_update_actor(batch)` 之前调用
+- 此时 batch 是完整全局 batch，global percentile 直接算，不需要 distributed gather
+- `self._a2q_reweight_state` 持久化 EMA state
+
+### 配置字段
+
+`verl/trainer/config/algorithm.py` → `AlgoConfig` 新增 6 个字段：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `a2q_reweight_enabled` | bool | False | 主开关 |
+| `a2q_reweight_mode` | str | "hierarchical" | vanilla/rollout_only/prompt_only/hierarchical |
+| `a2q_reweight_percentile_r` | float | 95.0 | rollout-level threshold percentile |
+| `a2q_reweight_percentile_p` | float | 90.0 | prompt-level threshold percentile |
+| `a2q_reweight_ema_beta` | float | 0.9 | EMA smoothing for thresholds |
+| `a2q_reweight_warmup_steps` | int | 10 | warmup 期间不 reweight |
+
+### 前提条件
+
+实验脚本须设 `actor.calculate_sum_pi_squared=True`（默认 False）。
+该选项与 `use_fused_kernels` 互斥。
+
+### Logged metrics (32 个)
+
+**Concentration:**
+- `a2q_reweight/h_{mean,max}`, `e_{mean,max}`
+- `a2q_reweight/h_rollout_{top1,top5,top10}_share`, `neff`, `neff_ratio`, `gini`
+- `a2q_reweight/h_prompt_{top1,top5,top10}_share`, `neff`, `neff_ratio`, `gini`
+
+**Thresholds:**
+- `a2q_reweight/tau_{r,p}` (EMA), `tau_{r,p}_batch` (raw)
+
+**Weights:**
+- `a2q_reweight/{rollout,prompt}_weight_{mean,min}`, `{rollout,prompt}_clipped_frac`
+- `a2q_reweight/combined_weight_mean`
+
+**Control:**
+- `a2q_reweight/{skipped,active,effective_adv_scale}`
+
+### 实验脚本
+
+`new_experiments/a2q_reweighting/`:
+- `sync_a2q_stage1.sh` — 参数化主脚本
+- 12 个 wrapper: `sync_a2q_{vanilla,rollout_only,prompt_only,hierarchical}_seed{0,1,42}.sh`
+- LR = 3.1e-6 constant, N=128, K=8, 300 步
+- `RESUME_MODE=auto` 支持断点续训
+- `trainer.project_name="deepseek1.5b_a2q"`
+
+### Verification
+
+- `python3 -m py_compile` passed: a2q_reweighting.py, algorithm.py, ray_trainer.py
+- `bash -n` passed: main script + 12 wrappers
+
 ---
 
 ## Signal-Quality-Aware LR Scaling (2026-05-20)

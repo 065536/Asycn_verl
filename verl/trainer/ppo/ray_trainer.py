@@ -53,6 +53,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
     save_noise_decomp_tables,
 )
+from verl.trainer.ppo.a2q_reweighting import A2QReweightState, apply_a2q_reweighting
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
@@ -1346,6 +1347,7 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        self._a2q_reweight_state = A2QReweightState()
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
@@ -1501,6 +1503,7 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            batch.meta_info["global_step"] = self.global_steps
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
@@ -1592,6 +1595,19 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        a2q_reweight_metrics = apply_a2q_reweighting(
+                            batch,
+                            state=self._a2q_reweight_state,
+                            enabled=self.config.algorithm.get("a2q_reweight_enabled", False),
+                            mode=self.config.algorithm.get("a2q_reweight_mode", "hierarchical"),
+                            percentile_r=self.config.algorithm.get("a2q_reweight_percentile_r", 95.0),
+                            percentile_p=self.config.algorithm.get("a2q_reweight_percentile_p", 90.0),
+                            ema_beta=self.config.algorithm.get("a2q_reweight_ema_beta", 0.9),
+                            warmup_steps=self.config.algorithm.get("a2q_reweight_warmup_steps", 10),
+                            normalize=self.config.algorithm.get("a2q_reweight_normalize", True),
+                        )
+                        metrics.update(a2q_reweight_metrics)
 
                     # update critic
                     if self.use_critic:

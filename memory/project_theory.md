@@ -1,10 +1,39 @@
 ---
-name: Project Theory — n_eff Framework and r_t Signal Fraction
-description: Full theoretical framework as of 2026-04-20; formalized in paper/theory_derivation.tex and paper/main_modified.tex Section 4
+name: Project Theory — From Signal Fraction LR to RL-Aware Optimizer
+description: Theoretical framework evolution; original r_t/LR theory retained as historical context; current focus on RL gradient structure and optimizer design
 type: project
 ---
 
-The formal chain (all steps derived in paper/theory_derivation.tex and paper/main_modified.tex):
+## Current Research Question (2026-06-12)
+
+> Standard Adam treats all gradient coordinates uniformly. RL policy gradients have specific structure (positive/negative advantage decomposition, prompt-level heterogeneity) that Adam does not exploit. Can we improve RLVR training by designing an optimizer that leverages this structure?
+
+**Key shift**: the problem is not the learning rate scalar α, but the gradient **direction** after Adam's preconditioning D_t·m_t.
+
+### Why LR is not the answer
+
+1. α_t = c_t · r̂_t framework is theoretically sound but practically blocked: r̂_t estimation is fundamentally noisy in small-r_t regime (SNR ≈ 1/r_t - 1 ≈ 49× at r_t=0.02)
+2. Best adaptive LR variants (W10 windowed, signal-quality gate) provide marginal improvement over well-tuned constant LR or simple decay (D3)
+3. LR only scales magnitude; it cannot change the direction of D_t·m_t
+
+### What we know about RL gradient structure
+
+1. **GRPO advantage structure**: within a prompt group, Σ A⁺ = Σ|A⁻| (first moment balanced), but Σ(A⁻)² > Σ(A⁺)² for p>0.5 (second moment favors minority class)
+2. **Reward sparsity**: ~40-60% of prompt groups are uninformative (all-correct or all-wrong), contributing zero gradient. Learning concentrates on mixed prompts.
+3. **Learning pattern**: GRPO mainly stabilizes near-boundary problems (p: 0.1-0.3 → 0.5-0.7), not breakthrough learning. Consistency improvement > capability improvement.
+4. **Cross-term importance**: A²Q proxy (assuming orthogonal per-token gradients) likely misestimates per-response gradient energy; exact lm_head norms being measured
+
+### Open questions (ordered by priority)
+
+1. **P0**: Do g⁺ and g⁻ have similar magnitudes? What is their angular relationship? → pos/neg gradient decomposition (implemented)
+2. **P1**: Does Adam's D_t rotate the combined update away from g⁺ direction? → cos(m,g⁺) vs cos(Dm,g⁺) diagnostic
+3. **P2**: If D_t hurts, what coordinate-level structure causes it? → channel analysis of v_t vs g⁺/g⁻ alignment
+
+---
+
+## Historical: Signal Fraction Framework (2026-04-20, status: closed)
+
+The formal chain (retained as theoretical foundation, no longer actively pursued for LR control):
 
 1. **MSE**: E[||ĝ-g||²] = tr(Σ)/n — from i.i.d. vector sample mean; cross terms vanish by independence
 2. **n_eff**: n_eff(t) = E[K_n] ≈ min(n, exp(H(π_t))) — distinct trajectories = perplexity
@@ -16,17 +45,4 @@ The formal chain (all steps derived in paper/theory_derivation.tex and paper/mai
 
 **Key correction from Session 2**: earlier wrong derivation via SNR ≥ 1 gave α* ∝ √n_eff. Correct result via improvement bound is α* ∝ r_t ∝ n_eff (linear, in noise-dominated regime).
 
-**Key addition from Session 3 (2026-04-20)**:
-- r_t is estimable via split-batch estimator: r̂_t = (ĝ_A^T ĝ_B) / ((||ĝ_A||²+||ĝ_B||²)/2)
-- Only requirement: same θ_t for both halves (prompts can differ)
-- r_t solves the shape problem; scale 1/L requires separate feedback
-
-**Key addition (Session 3, later): c_t feedback signal RESOLVED**:
-- φ_t = a_t/(p_t+ε) where p_t = α_t ĝ_B^T ĝ_A (predicted gain), a_t = L_B(θ_{t+1})-L_B(θ_t) (actual gain on held-out B)
-- φ* = 1/2 derived from improvement bound: φ_t ≈ 1 - c_t·L/2 when α_t = c_t·r_t; at c_t=1/L → φ*=1/2
-- r_t cancels exactly in the φ_t expression — scale controller is decoupled from shape signal
-- Controller: c_{t+1} = c_t · exp(η_c(φ̄_t - 1/2))
-
-**Why**: The research question is why fixed LR causes collapse in on-policy RL and how to fix it principally.
-
-**How to apply**: Any new algorithm proposal must be evaluated against this chain. α_t = c_t · r̂_t is the finalized framework, with c_t driven by φ_t targeting φ* = 1/2.
+**Why closed**: r̂_t estimation too noisy; adaptive LR provides marginal gains over simple schedules; the real problem is gradient direction, not step size.

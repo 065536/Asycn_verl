@@ -452,6 +452,116 @@ class DataParallelPPOActor(BasePPOActor):
 
         return grad_norm_pre_clip, grad_norm_post_clip
 
+    def _compute_adam_diagnostics(self):
+        """Compute Adam optimizer state diagnostics after optimizer.step().
+
+        Reads exp_avg (m) and exp_avg_sq (v) from the optimizer state to
+        compute effective step-size metrics.  The raw gradient g_t is still
+        available in p.grad at this point (AdamW reads but does not zero it).
+
+        Metrics returned (all scalars, all-reduced across FSDP shards):
+          adam/v_rms          — RMS of sqrt(v) across all params (denominator scale)
+          adam/v_mean         — mean of v across all params
+          adam/m_rms          — RMS of m across all params (numerator scale)
+          adam/update_norm    — ||m / (sqrt(v) + eps)||  (preconditioned update norm)
+          adam/raw_grad_norm  — ||g_t||  (post-clip gradient used for the step)
+          adam/update_to_grad_ratio — update_norm / (raw_grad_norm + 1e-12)
+          adam/eta_eff        — <u, g> / (||g||^2 + 1e-12)  (effective LR on g direction)
+          adam/cos_update_grad — cos(u, g)
+          adam/v_max          — max element of v (tracks extreme denominator)
+        """
+        device = None
+        sum_v = torch.zeros(1, dtype=torch.float64)
+        sum_v_sqrt = torch.zeros(1, dtype=torch.float64)
+        sum_m_sq = torch.zeros(1, dtype=torch.float64)
+        sum_u_sq = torch.zeros(1, dtype=torch.float64)
+        sum_g_sq = torch.zeros(1, dtype=torch.float64)
+        sum_ug = torch.zeros(1, dtype=torch.float64)
+        max_v = torch.zeros(1, dtype=torch.float64)
+        n_elements = torch.zeros(1, dtype=torch.float64)
+        has_state = False
+
+        eps = 1e-8
+        for pg in self.actor_optimizer.param_groups:
+            eps = pg.get("eps", 1e-8)
+            break
+
+        for pg in self.actor_optimizer.param_groups:
+            for p in pg["params"]:
+                if p not in self.actor_optimizer.state:
+                    continue
+                state = self.actor_optimizer.state[p]
+                if "exp_avg_sq" not in state:
+                    continue
+                has_state = True
+                v = state["exp_avg_sq"]
+                m = state["exp_avg"]
+                if device is None:
+                    device = v.device
+                    sum_v = sum_v.to(device)
+                    sum_v_sqrt = sum_v_sqrt.to(device)
+                    sum_m_sq = sum_m_sq.to(device)
+                    sum_u_sq = sum_u_sq.to(device)
+                    sum_g_sq = sum_g_sq.to(device)
+                    sum_ug = sum_ug.to(device)
+                    max_v = max_v.to(device)
+                    n_elements = n_elements.to(device)
+
+                v_flat = v.detach().to(torch.float64).flatten()
+                m_flat = m.detach().to(torch.float64).flatten()
+                denom = v_flat.sqrt() + eps
+                u_flat = m_flat / denom
+
+                sum_v[0] += v_flat.sum()
+                sum_v_sqrt[0] += denom.sum()
+                sum_m_sq[0] += (m_flat * m_flat).sum()
+                sum_u_sq[0] += (u_flat * u_flat).sum()
+                cur_max = v_flat.max()
+                if cur_max > max_v[0]:
+                    max_v[0] = cur_max
+                n_elements[0] += v_flat.numel()
+
+                g = p.grad
+                if g is not None:
+                    g_flat = g.detach().to(torch.float64).flatten()
+                    sum_g_sq[0] += (g_flat * g_flat).sum()
+                    sum_ug[0] += (u_flat * g_flat).sum()
+
+        if not has_state:
+            return {}
+
+        if torch.distributed.is_initialized():
+            for t in [sum_v, sum_v_sqrt, sum_m_sq, sum_u_sq, sum_g_sq, sum_ug, n_elements]:
+                torch.distributed.all_reduce(t)
+            torch.distributed.all_reduce(max_v, op=torch.distributed.ReduceOp.MAX)
+
+        n = n_elements[0].item()
+        if n == 0:
+            return {}
+
+        v_mean = (sum_v[0] / n).item()
+        v_rms = ((sum_v[0] / n).sqrt()).item()
+        m_rms = ((sum_m_sq[0] / n).sqrt()).item()
+        update_norm = (sum_u_sq[0].sqrt()).item()
+        raw_grad_norm = (sum_g_sq[0].sqrt()).item()
+        dot_ug = sum_ug[0].item()
+
+        update_to_grad_ratio = update_norm / (raw_grad_norm + 1e-12)
+        eta_eff = dot_ug / (sum_g_sq[0].item() + 1e-12)
+        cos_ug = dot_ug / (update_norm * raw_grad_norm + 1e-12)
+
+        return {
+            "adam/v_rms": v_rms,
+            "adam/v_mean": v_mean,
+            "adam/v_max": max_v[0].item(),
+            "adam/m_rms": m_rms,
+            "adam/update_norm": update_norm,
+            "adam/raw_grad_norm": raw_grad_norm,
+            "adam/update_to_grad_ratio": update_to_grad_ratio,
+            "adam/eta_eff": eta_eff,
+            "adam/cos_update_grad": cos_ug,
+        }
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
@@ -487,8 +597,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        calculate_lm_head_grad_norm = self.config.get("calculate_lm_head_grad_norm", False)
+        if calculate_lm_head_grad_norm and "response_mask" in data.batch:
+            select_keys.append("response_mask")
         if self.use_prefix_grouper:
-            select_keys += [k for k in ["prompts", "response_mask"] if k in data.batch]
+            select_keys += [k for k in ["prompts", "response_mask"] if k in data.batch and k not in select_keys]
             if "uid" in data.non_tensor_batch:
                 non_tensor_select_keys.append("uid")
 
@@ -534,7 +647,760 @@ class DataParallelPPOActor(BasePPOActor):
             outputs["entropys"] = entropys
         if calculate_sum_pi_squared:
             outputs["sum_pi_squared"] = sum_pi_squared
+
+        calculate_lm_head_grad_norm = self.config.get("calculate_lm_head_grad_norm", False)
+        if calculate_lm_head_grad_norm and not self.use_fused_kernels:
+            grad_norm_freq = self.config.get("lm_head_grad_norm_freq", 5)
+            step_counter = data.meta_info.get("global_step", 0)
+            if step_counter % grad_norm_freq == 0:
+                grad_norms, sampled_indices = self.compute_lm_head_grad_norms(
+                    data,
+                    max_responses=self.config.get("lm_head_grad_norm_max_responses", 64),
+                )
+                batch_size = log_probs.shape[0]
+                full_norms = torch.full(
+                    (batch_size,), -1.0, dtype=torch.float32, device=log_probs.device
+                )
+                if grad_norms.numel() > 0:
+                    full_norms[sampled_indices] = grad_norms.float().to(full_norms.device)
+                outputs["lm_head_grad_norm_sq"] = full_norms
+
         return outputs
+
+    @torch.no_grad()
+    def compute_lm_head_grad_norms(self, data: DataProto, max_responses: int = 64):
+        """Compute per-response exact lm_head gradient norms for a subsample.
+
+        Runs a separate forward pass with output_hidden_states=True on a small
+        subsample to obtain pre-lm_head hidden states and logits, then computes
+        ||∂S_b/∂W_lm_head||²_F per response using the analytical Gram-matrix
+        formula (no orthogonality assumption).
+
+        Only works when use_fused_kernels=False (standard HF forward returns logits).
+        Returns empty tensors if fused kernels are active.
+
+        Args:
+            data: DataProto with input_ids, attention_mask, position_ids, responses,
+                  response_mask.  meta_info must contain 'temperature'.
+            max_responses: max number of responses to process.
+
+        Returns:
+            (grad_norm_sq, indices): grad_norm_sq is (n,) float64, indices is (n,) long
+            indicating which batch rows were sampled.
+        """
+        empty = (torch.tensor([], dtype=torch.float64), torch.tensor([], dtype=torch.long))
+        if self.use_fused_kernels:
+            return empty
+
+        from verl.trainer.ppo.lm_head_grad_norm import compute_response_lm_head_grad_norms
+
+        self.actor_module.eval()
+        device = get_device_id()
+        temperature = data.meta_info["temperature"]
+
+        batch_size = data.batch["input_ids"].shape[0]
+        num_to_process = min(max_responses, batch_size)
+        indices = torch.randperm(batch_size)[:num_to_process].sort().values
+        response_length = data.batch["responses"].shape[-1]
+
+        all_norms = []
+        micro_batch_size = 2
+
+        for mb_start in range(0, num_to_process, micro_batch_size):
+            mb_end = min(mb_start + micro_batch_size, num_to_process)
+            mb_indices = indices[mb_start:mb_end]
+
+            input_ids = data.batch["input_ids"][mb_indices].to(device)
+            attention_mask = data.batch["attention_mask"][mb_indices].to(device)
+            position_ids = data.batch["position_ids"][mb_indices].to(device)
+            responses = data.batch["responses"][mb_indices].to(device)
+            response_mask = data.batch["response_mask"][mb_indices].to(device)
+
+            with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    output_hidden_states=True,
+                )
+
+            last_hidden = output.hidden_states[-1]
+            logits_full = output.logits
+
+            hs_resp = last_hidden[:, -response_length - 1 : -1, :]
+            logits_resp = logits_full[:, -response_length - 1 : -1, :]
+
+            norms = compute_response_lm_head_grad_norms(
+                hidden_states=hs_resp,
+                logits=logits_resp,
+                response_token_ids=responses,
+                response_mask=response_mask,
+                temperature=temperature,
+                token_chunk_size=512,
+            )
+            all_norms.append(norms)
+
+        result = torch.cat(all_norms, dim=0)
+        return result, indices
+
+    @torch.no_grad()
+    def compute_pos_neg_grad_decomposition(self, data: DataProto, max_responses: int = 64):
+        """Positive/negative advantage lm_head gradient decomposition.
+
+        Computes g+ = Σ_{A>0} A·G_b and g- = Σ_{A<0} A·G_b where G_b is the
+        per-response exact lm_head score-function gradient, then reports norms,
+        cosine similarity, and per-success-rate-bucket metrics.
+
+        Subsamples at the prompt-group level so bucketing by success rate is valid.
+        Must be called when advantages are available (i.e. during update_policy).
+
+        Args:
+            data: DataProto with input_ids, attention_mask, position_ids,
+                  responses, response_mask, advantages.
+            max_responses: max number of responses to process.
+
+        Returns:
+            Dict of scalar metrics under the ``grad_decomp/`` prefix.
+        """
+        if self.use_fused_kernels:
+            return {}
+
+        from verl.trainer.ppo.lm_head_grad_norm import compute_single_response_lm_head_grad
+
+        self.actor_module.eval()
+        device = get_device_id()
+        temperature = data.meta_info["temperature"]
+        rollout_n = self.config.rollout_n
+
+        batch_size = data.batch["input_ids"].shape[0]
+        response_length = data.batch["responses"].shape[-1]
+
+        advantages_raw = data.batch["advantages"]
+        response_mask_all = data.batch["response_mask"]
+        adv_per_resp = (advantages_raw * response_mask_all).sum(-1) / response_mask_all.sum(-1).clamp(min=1)
+
+        n_prompts = batch_size // rollout_n
+        max_groups = max(1, max_responses // rollout_n)
+        n_sample_groups = min(max_groups, n_prompts)
+        group_perm = torch.randperm(n_prompts)[:n_sample_groups]
+
+        indices = []
+        for g_idx in group_perm:
+            start = g_idx.item() * rollout_n
+            indices.extend(range(start, start + rollout_n))
+        indices = torch.tensor(indices, dtype=torch.long)
+
+        adv_grouped = adv_per_resp.reshape(n_prompts, rollout_n)
+        success_rate_all = (adv_grouped > 0).float().mean(dim=1)
+
+        prompt_bucket = torch.full((n_prompts,), -1, dtype=torch.long)
+        mixed = (success_rate_all > 0) & (success_rate_all < 1)
+        prompt_bucket[mixed & (success_rate_all < 0.5)] = 0
+        prompt_bucket[mixed & (success_rate_all >= 0.5)] = 1
+
+        g_accum = {}
+        counts = {}
+        token_counts = {}
+        for bk in [0, 1]:
+            g_accum[bk] = {"pos": None, "neg": None}
+            counts[bk] = {"pos": 0, "neg": 0}
+            token_counts[bk] = {"pos": 0, "neg": 0}
+        n_zero = 0
+
+        has_old_log_probs = "old_log_probs" in data.batch
+        advantages_token = data.batch["advantages"]
+
+        group_names = ["low_pos", "low_neg", "high_pos", "high_neg", "pos", "neg"]
+        w_abs_sums = {g: 0.0 for g in group_names}
+        w_sq_sums = {g: 0.0 for g in group_names}
+        w_token_counts = {g: 0 for g in group_names}
+        ratio_collections = {g: [] for g in group_names}
+        nonzero_w_tokens = {g: 0 for g in group_names}
+
+        # ── Orthogonality control pre-assignments ──────────────────────────────────
+        n_sel = len(indices)
+        selected_adv_ctrl = adv_per_resp[indices]
+        n_rand_splits = 3
+
+        # Control 1: K independent random split labels (each response → side 0 or 1)
+        rand_labels = [torch.randint(0, 2, (n_sel,)) for _ in range(n_rand_splits)]
+
+        # Control 2: same-sign half-split labels (assign each pos/neg resp to half 0 or 1)
+        pos_ctrl_idx = (selected_adv_ctrl > 1e-8).nonzero(as_tuple=True)[0]
+        neg_ctrl_idx = (selected_adv_ctrl < -1e-8).nonzero(as_tuple=True)[0]
+        same_sign_half = torch.full((n_sel,), -1, dtype=torch.long)
+        if len(pos_ctrl_idx) >= 2:
+            same_sign_half[pos_ctrl_idx] = torch.randperm(len(pos_ctrl_idx)) % 2
+        if len(neg_ctrl_idx) >= 2:
+            same_sign_half[neg_ctrl_idx] = torch.randperm(len(neg_ctrl_idx)) % 2
+
+        # Control 3: prompt-level (up to 5 mixed prompts from the sampled set)
+        sampled_mixed_pids = [g.item() for g in group_perm if mixed[g].item()]
+        n_ctrl_prompts = min(5, len(sampled_mixed_pids))
+        ctrl_prompt_ids = set(sampled_mixed_pids[:n_ctrl_prompts])
+
+        # Accumulators for controls
+        g_rand = [[None, None] for _ in range(n_rand_splits)]
+        g_pos_half = [None, None]
+        g_neg_half = [None, None]
+        g_prompt_ctrl = {pid: {"pos": None, "neg": None} for pid in ctrl_prompt_ids}
+        # ────────────────────────────────────────────────────────────────────────────
+
+        micro_batch_size = 2
+        for mb_start in range(0, len(indices), micro_batch_size):
+            mb_end = min(mb_start + micro_batch_size, len(indices))
+            mb_idx = indices[mb_start:mb_end]
+
+            input_ids = data.batch["input_ids"][mb_idx].to(device)
+            attention_mask = data.batch["attention_mask"][mb_idx].to(device)
+            position_ids = data.batch["position_ids"][mb_idx].to(device)
+            responses = data.batch["responses"][mb_idx].to(device)
+            response_mask = data.batch["response_mask"][mb_idx].to(device)
+            mb_adv = adv_per_resp[mb_idx]
+
+            if has_old_log_probs:
+                mb_old_lp = data.batch["old_log_probs"][mb_idx].to(device)
+            mb_adv_token = advantages_token[mb_idx].to(device)
+
+            with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    output_hidden_states=True,
+                )
+
+            last_hidden = output.hidden_states[-1]
+            logits_full = output.logits
+            hs_resp = last_hidden[:, -response_length - 1 : -1, :]
+            logits_resp = logits_full[:, -response_length - 1 : -1, :]
+
+            if has_old_log_probs:
+                log_probs_resp = logprobs_from_logits(
+                    logits_full[:, -response_length - 1 : -1, :], responses
+                )
+
+            for local_i in range(mb_end - mb_start):
+                mask_i = response_mask[local_i].bool()
+                T_valid = mask_i.sum().item()
+                if T_valid == 0:
+                    continue
+
+                h_i = hs_resp[local_i][mask_i].float()
+                logits_i = logits_resp[local_i][mask_i].float() / temperature
+                y_i = responses[local_i][mask_i]
+
+                G_i = compute_single_response_lm_head_grad(h_i, logits_i, y_i, token_chunk_size=256)
+
+                A_i = mb_adv[local_i].item()
+                global_resp_idx = mb_idx[local_i].item()
+                prompt_id = global_resp_idx // rollout_n
+                bucket = prompt_bucket[prompt_id].item()
+
+                if abs(A_i) < 1e-8:
+                    n_zero += 1
+                    del G_i
+                    continue
+
+                sign_key = "pos" if A_i > 0 else "neg"
+                bucket_sign = f"{'low' if bucket == 0 else 'high'}_{sign_key}" if bucket >= 0 else None
+
+                if bucket >= 0:
+                    if g_accum[bucket][sign_key] is None:
+                        g_accum[bucket][sign_key] = torch.zeros_like(G_i)
+                    g_accum[bucket][sign_key].add_(G_i, alpha=A_i)
+                    counts[bucket][sign_key] += 1
+                    token_counts[bucket][sign_key] += T_valid
+
+                # ── Control accumulations (all non-zero-adv responses) ────────────
+                sel_idx = mb_start + local_i
+
+                # 4.1 Random split: K independent splits
+                for _k in range(n_rand_splits):
+                    _side = rand_labels[_k][sel_idx].item()
+                    if g_rand[_k][_side] is None:
+                        g_rand[_k][_side] = torch.zeros_like(G_i)
+                    g_rand[_k][_side].add_(G_i, alpha=A_i)
+
+                # 4.2 Same-sign half-split
+                _half = same_sign_half[sel_idx].item()
+                if _half >= 0:
+                    _half_buf = g_pos_half if sign_key == "pos" else g_neg_half
+                    if _half_buf[_half] is None:
+                        _half_buf[_half] = torch.zeros_like(G_i)
+                    _half_buf[_half].add_(G_i, alpha=A_i)
+
+                # 4.3 Prompt-level
+                if prompt_id in ctrl_prompt_ids:
+                    _gd = g_prompt_ctrl[prompt_id]
+                    if _gd[sign_key] is None:
+                        _gd[sign_key] = torch.zeros_like(G_i)
+                    _gd[sign_key].add_(G_i, alpha=A_i)
+                # ─────────────────────────────────────────────────────────────────
+
+                del G_i
+
+                adv_tok = mb_adv_token[local_i][mask_i]
+                w_tok = -adv_tok.float()
+                abs_w = w_tok.abs()
+                w_abs_sum = abs_w.sum().item()
+                w_sq_sum = (w_tok * w_tok).sum().item()
+                nonzero_count = (abs_w > 1e-8).sum().item()
+
+                w_abs_sums[sign_key] += w_abs_sum
+                w_sq_sums[sign_key] += w_sq_sum
+                w_token_counts[sign_key] += T_valid
+                nonzero_w_tokens[sign_key] += nonzero_count
+                if bucket_sign is not None:
+                    w_abs_sums[bucket_sign] += w_abs_sum
+                    w_sq_sums[bucket_sign] += w_sq_sum
+                    w_token_counts[bucket_sign] += T_valid
+                    nonzero_w_tokens[bucket_sign] += nonzero_count
+
+                if has_old_log_probs:
+                    lp_cur = log_probs_resp[local_i][mask_i].detach().float()
+                    lp_old = mb_old_lp[local_i][mask_i].float()
+                    ratio_tok = torch.exp(torch.clamp(lp_cur - lp_old, -20.0, 20.0))
+                    ratio_collections[sign_key].append(ratio_tok.cpu())
+                    if bucket_sign is not None:
+                        ratio_collections[bucket_sign].append(ratio_tok.cpu())
+
+        self.actor_module.train()
+
+        metrics = {}
+
+        g_lp = g_accum[0]["pos"]
+        g_ln = g_accum[0]["neg"]
+        g_hp = g_accum[1]["pos"]
+        g_hn = g_accum[1]["neg"]
+        atoms = {"low_pos": g_lp, "low_neg": g_ln, "high_pos": g_hp, "high_neg": g_hn}
+
+        def _norm_sq(g):
+            return (g * g).sum().item() if g is not None else 0.0
+
+        def _dot(ga, gb):
+            if ga is not None and gb is not None:
+                return (ga * gb).sum().item()
+            return 0.0
+
+        nsq = {k: _norm_sq(v) for k, v in atoms.items()}
+
+        dots = {}
+        atom_keys = list(atoms.keys())
+        for i in range(len(atom_keys)):
+            for j in range(i + 1, len(atom_keys)):
+                ka, kb = atom_keys[i], atom_keys[j]
+                dots[(ka, kb)] = _dot(atoms[ka], atoms[kb])
+
+        def _get_dot(ka, kb):
+            if ka == kb:
+                return nsq[ka]
+            return dots.get((ka, kb), dots.get((kb, ka), 0.0))
+
+        def _composite_norm_sq(members):
+            total = sum(nsq.get(m, 0.0) for m in members)
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    total += 2.0 * _get_dot(members[i], members[j])
+            return total
+
+        def _composite_dot(members_a, members_b):
+            total = 0.0
+            for ma in members_a:
+                for mb in members_b:
+                    total += _get_dot(ma, mb)
+            return total
+
+        composites = {
+            "pos": ["low_pos", "high_pos"],
+            "neg": ["low_neg", "high_neg"],
+            "pos_neg": ["low_pos", "high_pos", "low_neg", "high_neg"],
+            "high_pos_neg": ["high_pos", "high_neg"],
+            "low_pos_neg": ["low_pos", "low_neg"],
+        }
+        comp_nsq = {k: _composite_norm_sq(v) for k, v in composites.items()}
+
+        all_nsq = {**nsq, **comp_nsq}
+        eps = 1e-30
+
+        for name, val in all_nsq.items():
+            metrics[f"lm_grad/norm_{name}"] = val ** 0.5
+
+        def _cos_cancel(name_a, name_b, members_a, members_b, prefix):
+            nsq_a = all_nsq.get(name_a, _composite_norm_sq(members_a) if members_a else 0.0)
+            nsq_b = all_nsq.get(name_b, _composite_norm_sq(members_b) if members_b else 0.0)
+            dot_ab = _composite_dot(members_a, members_b)
+            nsq_ab = nsq_a + nsq_b + 2.0 * dot_ab
+            norm_a = nsq_a ** 0.5
+            norm_b = nsq_b ** 0.5
+            norm_ab = nsq_ab ** 0.5
+
+            cos_val = dot_ab / max(norm_a * norm_b, eps)
+            cancel_val = 1.0 - norm_ab / max(norm_a + norm_b, eps)
+
+            metrics[f"{prefix}/cos"] = cos_val
+            metrics[f"{prefix}/cancel"] = cancel_val
+            metrics[f"{prefix}/norm_a"] = norm_a
+            metrics[f"{prefix}/norm_b"] = norm_b
+            metrics[f"{prefix}/norm_sum"] = norm_ab
+            if norm_b > 1.0 and norm_a > 1.0:
+                metrics[f"{prefix}/norm_ratio"] = norm_a / norm_b
+            else:
+                metrics[f"{prefix}/norm_ratio"] = float("nan")
+
+        _cos_cancel("pos", "neg", composites["pos"], composites["neg"], "lm_grad/pos_vs_neg")
+        _cos_cancel("high_pos", "high_neg", ["high_pos"], ["high_neg"], "lm_grad/high_pos_vs_neg")
+        _cos_cancel("low_pos", "low_neg", ["low_pos"], ["low_neg"], "lm_grad/low_pos_vs_neg")
+
+        composites["high_mixed"] = ["high_pos", "high_neg"]
+        composites["low_mixed"] = ["low_pos", "low_neg"]
+        all_nsq["high_mixed"] = _composite_norm_sq(composites["high_mixed"])
+        all_nsq["low_mixed"] = _composite_norm_sq(composites["low_mixed"])
+        metrics["lm_grad/norm_high_mixed"] = all_nsq["high_mixed"] ** 0.5
+        metrics["lm_grad/norm_low_mixed"] = all_nsq["low_mixed"] ** 0.5
+
+        _cos_cancel("high_mixed", "low_mixed",
+                     composites["high_mixed"], composites["low_mixed"],
+                     "lm_grad/high_mixed_vs_low_mixed")
+
+        # ── Orthogonality controls ───────────────────────────────────────────────
+        def _ctrl_cos(ga, gb):
+            if ga is None or gb is None:
+                return float("nan")
+            nsq_a = _norm_sq(ga)
+            nsq_b = _norm_sq(gb)
+            if nsq_a < eps or nsq_b < eps:
+                return float("nan")
+            return _dot(ga, gb) / (nsq_a ** 0.5 * nsq_b ** 0.5)
+
+        # 4.1 Random split baseline (K independent splits → mean / std / p05 / p95 / z-score)
+        rand_cos_vals = [_ctrl_cos(g_rand[k][0], g_rand[k][1]) for k in range(n_rand_splits)]
+        for k, v in enumerate(rand_cos_vals):
+            metrics[f"lm_grad/ctrl/random_split_cos_{k}"] = v
+        valid_rand = [v for v in rand_cos_vals if v == v]
+        if valid_rand:
+            mu_rand = sum(valid_rand) / len(valid_rand)
+            metrics["lm_grad/ctrl/random_split_cos_mean"] = mu_rand
+            if len(valid_rand) >= 2:
+                std_rand = (sum((v - mu_rand) ** 2 for v in valid_rand) / len(valid_rand)) ** 0.5
+                sorted_rand = sorted(valid_rand)
+                metrics["lm_grad/ctrl/random_split_cos_std"] = std_rand
+                metrics["lm_grad/ctrl/random_split_cos_p05"] = sorted_rand[max(0, int(0.05 * len(sorted_rand)))]
+                metrics["lm_grad/ctrl/random_split_cos_p95"] = sorted_rand[min(len(sorted_rand) - 1, int(0.95 * len(sorted_rand)))]
+                pn_cos = metrics.get("lm_grad/pos_vs_neg/cos", float("nan"))
+                metrics["lm_grad/ctrl/zscore_posneg_vs_random"] = (
+                    (pn_cos - mu_rand) / (std_rand + eps) if pn_cos == pn_cos else float("nan")
+                )
+            else:
+                for key in ("std", "p05", "p95"):
+                    metrics[f"lm_grad/ctrl/random_split_cos_{key}"] = float("nan")
+                metrics["lm_grad/ctrl/zscore_posneg_vs_random"] = float("nan")
+        else:
+            for key in ("mean", "std", "p05", "p95"):
+                metrics[f"lm_grad/ctrl/random_split_cos_{key}"] = float("nan")
+            metrics["lm_grad/ctrl/zscore_posneg_vs_random"] = float("nan")
+
+        # 4.2 Same-sign half-split: within-pos and within-neg coherence
+        metrics["lm_grad/ctrl/pos_half_split_cos"] = _ctrl_cos(g_pos_half[0], g_pos_half[1])
+        metrics["lm_grad/ctrl/neg_half_split_cos"] = _ctrl_cos(g_neg_half[0], g_neg_half[1])
+
+        # 4.3 Prompt-level pos/neg cosine (mean ± std over sampled mixed prompts)
+        prompt_ctrl_cos = []
+        for _gd in g_prompt_ctrl.values():
+            c = _ctrl_cos(_gd["pos"], _gd["neg"])
+            if c == c:
+                prompt_ctrl_cos.append(c)
+        if prompt_ctrl_cos:
+            mu_p = sum(prompt_ctrl_cos) / len(prompt_ctrl_cos)
+            metrics["lm_grad/ctrl/prompt_level_cos_mean"] = mu_p
+            metrics["lm_grad/ctrl/prompt_level_n"] = float(len(prompt_ctrl_cos))
+            metrics["lm_grad/ctrl/prompt_level_cos_std"] = (
+                (sum((c - mu_p) ** 2 for c in prompt_ctrl_cos) / len(prompt_ctrl_cos)) ** 0.5
+                if len(prompt_ctrl_cos) >= 2 else float("nan")
+            )
+        else:
+            metrics["lm_grad/ctrl/prompt_level_cos_mean"] = float("nan")
+            metrics["lm_grad/ctrl/prompt_level_n"] = 0.0
+            metrics["lm_grad/ctrl/prompt_level_cos_std"] = float("nan")
+
+        # Cleanup ctrl accumulators
+        for k in range(n_rand_splits):
+            for side in [0, 1]:
+                if g_rand[k][side] is not None:
+                    del g_rand[k][side]
+        for _buf in [g_pos_half, g_neg_half]:
+            for side in [0, 1]:
+                if _buf[side] is not None:
+                    del _buf[side]
+        for _gd in g_prompt_ctrl.values():
+            for sk in ("pos", "neg"):
+                if _gd[sk] is not None:
+                    del _gd[sk]
+        # ────────────────────────────────────────────────────────────────────────────
+
+        atom_pairs = [
+            ("high_pos", "high_neg"), ("low_pos", "low_neg"),
+            ("high_pos", "low_pos"), ("high_neg", "low_neg"),
+            ("high_pos", "low_neg"), ("high_neg", "low_pos"),
+        ]
+        for ka, kb in atom_pairs:
+            dot_val = _get_dot(ka, kb)
+            na = all_nsq.get(ka, 0.0) ** 0.5
+            nb = all_nsq.get(kb, 0.0) ** 0.5
+            cos_val = dot_val / max(na * nb, eps)
+            metrics[f"lm_grad/cos_{ka}_{kb}"] = cos_val
+
+        norm_total = all_nsq["pos_neg"] ** 0.5
+        norm_pos = all_nsq["pos"] ** 0.5
+        norm_neg = all_nsq["neg"] ** 0.5
+
+        dot_pos_total = _composite_dot(composites["pos"], composites["pos_neg"])
+        dot_neg_total = _composite_dot(composites["neg"], composites["pos_neg"])
+        metrics["lm_grad/cos_pos_posneg"] = dot_pos_total / max(norm_pos * norm_total, eps)
+        metrics["lm_grad/cos_neg_posneg"] = dot_neg_total / max(norm_neg * norm_total, eps)
+
+        nsq_total = all_nsq["pos_neg"]
+        proj_groups = {
+            "pos": composites["pos"], "neg": composites["neg"],
+            "high_pos": ["high_pos"], "high_neg": ["high_neg"],
+            "low_pos": ["low_pos"], "low_neg": ["low_neg"],
+            "high_mixed": composites["high_mixed"],
+            "low_mixed": composites["low_mixed"],
+        }
+        for pg_name, pg_members in proj_groups.items():
+            dot_gc_total = _composite_dot(pg_members, composites["pos_neg"])
+            proj_coeff = dot_gc_total / max(nsq_total, eps)
+            metrics[f"lm_grad/proj_{pg_name}_on_posneg"] = proj_coeff
+
+        n_pos_global = counts[0]["pos"] + counts[1]["pos"]
+        n_neg_global = counts[0]["neg"] + counts[1]["neg"]
+        tok_pos_global = token_counts[0]["pos"] + token_counts[1]["pos"]
+        tok_neg_global = token_counts[0]["neg"] + token_counts[1]["neg"]
+
+        if tok_pos_global > 0 and tok_neg_global > 0:
+            scale_pos = tok_pos_global + tok_neg_global
+            mean_factor_pos = scale_pos / tok_pos_global
+            mean_factor_neg = scale_pos / tok_neg_global
+            metrics["lm_grad/norm_pos_mean"] = norm_pos * mean_factor_pos
+            metrics["lm_grad/norm_neg_mean"] = norm_neg * mean_factor_neg
+
+        metrics["lm_grad/n_pos"] = n_pos_global
+        metrics["lm_grad/n_neg"] = n_neg_global
+        metrics["lm_grad/n_zero"] = n_zero
+        metrics["lm_grad/n_prompts_sampled"] = n_sample_groups
+        n_mixed = mixed[group_perm].sum().item()
+        metrics["lm_grad/n_prompts_mixed"] = n_mixed
+        metrics["lm_grad/frac_uninformative"] = 1.0 - n_mixed / max(n_sample_groups, 1)
+
+        for bk_name, bk_id in [("low", 0), ("high", 1)]:
+            metrics[f"lm_grad/n_{bk_name}_pos"] = counts[bk_id]["pos"]
+            metrics[f"lm_grad/n_{bk_name}_neg"] = counts[bk_id]["neg"]
+            metrics[f"lm_grad/tok_{bk_name}_pos"] = token_counts[bk_id]["pos"]
+            metrics[f"lm_grad/tok_{bk_name}_neg"] = token_counts[bk_id]["neg"]
+
+        n_empty = sum(1 for k, v in nsq.items() if atoms[k] is None)
+        metrics["lm_grad/sanity/num_empty_groups"] = n_empty
+
+        rel_err_pn = abs(all_nsq["pos_neg"] - _composite_norm_sq(composites["pos_neg"])) / max(all_nsq["pos_neg"], eps)
+        metrics["lm_grad/sanity/rel_err_pos_neg_union"] = rel_err_pn
+
+        has_nan = any(v != v for v in metrics.values() if isinstance(v, float))
+        metrics["lm_grad/sanity/has_nan"] = float(has_nan)
+
+        clip_ratio_val = getattr(self.config, "clip_ratio", 0.2)
+        for gname in group_names:
+            tc = w_token_counts[gname]
+            if tc > 0:
+                metrics[f"w_stats/mean_abs_w_{gname}"] = w_abs_sums[gname] / tc
+                metrics[f"w_stats/sum_w2_{gname}"] = w_sq_sums[gname]
+                metrics[f"clip_stats/nonzero_w_frac_{gname}"] = nonzero_w_tokens[gname] / tc
+            else:
+                metrics[f"w_stats/mean_abs_w_{gname}"] = float("nan")
+                metrics[f"w_stats/sum_w2_{gname}"] = 0.0
+                metrics[f"clip_stats/nonzero_w_frac_{gname}"] = float("nan")
+
+            ratios = ratio_collections[gname]
+            if ratios:
+                all_ratios = torch.cat(ratios)
+                if all_ratios.numel() > 0:
+                    sorted_r, _ = all_ratios.sort()
+                    idx95 = min(int(0.95 * len(sorted_r)), len(sorted_r) - 1)
+                    metrics[f"ratio_stats/p95_ratio_{gname}"] = sorted_r[idx95].item()
+                    metrics[f"ratio_stats/mean_ratio_{gname}"] = all_ratios.mean().item()
+                    clipped_frac = ((all_ratios > 1 + clip_ratio_val) | (all_ratios < 1 - clip_ratio_val)).float().mean().item()
+                    metrics[f"ratio_stats/clip_frac_{gname}"] = clipped_frac
+                else:
+                    metrics[f"ratio_stats/p95_ratio_{gname}"] = float("nan")
+                    metrics[f"ratio_stats/mean_ratio_{gname}"] = float("nan")
+                    metrics[f"ratio_stats/clip_frac_{gname}"] = float("nan")
+            else:
+                metrics[f"ratio_stats/p95_ratio_{gname}"] = float("nan")
+                metrics[f"ratio_stats/mean_ratio_{gname}"] = float("nan")
+                metrics[f"ratio_stats/clip_frac_{gname}"] = float("nan")
+
+        for bk in g_accum:
+            for sign_key in list(g_accum[bk].keys()):
+                v = g_accum[bk][sign_key]
+                if v is not None:
+                    del v
+                g_accum[bk][sign_key] = None
+
+        return metrics
+
+    def compute_full_model_grad_decomposition(self, data: DataProto, max_responses: int = 64):
+        """Route B: Full-model masked backward for gradient geometry verification.
+
+        Does multiple backward passes with group-masked loss to compute
+        full-model gradient norms per group. Uses the cosine-from-norms trick:
+            cos(g_a, g_b) = (||g_{a+b}||^2 - ||g_a||^2 - ||g_b||^2) / (2*||g_a||*||g_b||)
+
+        Groups computed: pos, neg, pos_neg, high_pos, high_neg, low_pos, low_neg,
+                         high_pos_neg, low_pos_neg
+
+        Returns:
+            Dict of metrics under ``full_grad/`` prefix.
+        """
+        if self.use_fused_kernels:
+            return {}
+
+        self.actor_module.train()
+        device = get_device_id()
+        rollout_n = self.config.rollout_n
+
+        batch_size = data.batch["input_ids"].shape[0]
+        response_length = data.batch["responses"].shape[-1]
+
+        advantages_raw = data.batch["advantages"]
+        response_mask_all = data.batch["response_mask"]
+        adv_per_resp = (advantages_raw * response_mask_all).sum(-1) / response_mask_all.sum(-1).clamp(min=1)
+
+        n_prompts = batch_size // rollout_n
+        max_groups = max(1, max_responses // rollout_n)
+        n_sample_groups = min(max_groups, n_prompts)
+        group_perm = torch.randperm(n_prompts)[:n_sample_groups]
+
+        indices = []
+        for g_idx in group_perm:
+            start = g_idx.item() * rollout_n
+            indices.extend(range(start, start + rollout_n))
+        indices = torch.tensor(indices, dtype=torch.long)
+
+        adv_grouped = adv_per_resp.reshape(n_prompts, rollout_n)
+        success_rate_all = (adv_grouped > 0).float().mean(dim=1)
+        prompt_bucket = torch.full((n_prompts,), -1, dtype=torch.long)
+        mixed = (success_rate_all > 0) & (success_rate_all < 1)
+        prompt_bucket[mixed & (success_rate_all < 0.5)] = 0
+        prompt_bucket[mixed & (success_rate_all >= 0.5)] = 1
+
+        resp_adv = adv_per_resp[indices]
+        resp_prompt_id = torch.arange(len(indices)) // rollout_n
+        resp_bucket = prompt_bucket[group_perm][resp_prompt_id]
+
+        group_masks = {}
+        pos_mask = resp_adv > 1e-8
+        neg_mask = resp_adv < -1e-8
+        low_mask = resp_bucket == 0
+        high_mask = resp_bucket == 1
+        mixed_mask = low_mask | high_mask
+
+        group_masks["pos"] = pos_mask & mixed_mask
+        group_masks["neg"] = neg_mask & mixed_mask
+        group_masks["pos_neg"] = (pos_mask | neg_mask) & mixed_mask
+        group_masks["high_pos"] = pos_mask & high_mask
+        group_masks["high_neg"] = neg_mask & high_mask
+        group_masks["high_pos_neg"] = (pos_mask | neg_mask) & high_mask
+        group_masks["low_pos"] = pos_mask & low_mask
+        group_masks["low_neg"] = neg_mask & low_mask
+        group_masks["low_pos_neg"] = (pos_mask | neg_mask) & low_mask
+
+        input_ids_sub = data.batch["input_ids"][indices].to(device)
+        attention_mask_sub = data.batch["attention_mask"][indices].to(device)
+        position_ids_sub = data.batch["position_ids"][indices].to(device)
+        responses_sub = data.batch["responses"][indices].to(device)
+        response_mask_sub = data.batch["response_mask"][indices].to(device)
+        advantages_sub = data.batch["advantages"][indices].to(device)
+
+        def _compute_group_grad_norm_sq(group_name):
+            """Forward + backward for a group, return sum of squared gradients."""
+            mask = group_masks[group_name]
+            if mask.sum().item() == 0:
+                return 0.0
+
+            self.actor_module.zero_grad()
+
+            resp_mask_group = torch.zeros_like(response_mask_sub)
+            for i in range(len(mask)):
+                if mask[i]:
+                    resp_mask_group[i] = response_mask_sub[i]
+
+            with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+                output = self.actor_module(
+                    input_ids=input_ids_sub,
+                    attention_mask=attention_mask_sub,
+                    position_ids=position_ids_sub,
+                    use_cache=False,
+                )
+
+            logits_resp = output.logits[:, -response_length - 1:-1, :]
+            log_probs = torch.log_softmax(logits_resp.float(), dim=-1)
+            selected_lp = torch.gather(log_probs, 2, responses_sub.unsqueeze(-1)).squeeze(-1)
+
+            token_mask = resp_mask_group.float()
+            loss_per_token = -selected_lp * advantages_sub
+            denom = token_mask.sum().clamp(min=1.0)
+            loss = (loss_per_token * token_mask).sum() / denom
+
+            loss.backward()
+
+            norm_sq = 0.0
+            for param in self.actor_module.parameters():
+                if param.grad is not None:
+                    norm_sq += (param.grad.detach().float() ** 2).sum().item()
+
+            self.actor_module.zero_grad()
+            return norm_sq
+
+        nsq = {}
+        needed_groups = ["pos", "neg", "pos_neg", "high_pos", "high_neg",
+                         "high_pos_neg", "low_pos", "low_neg", "low_pos_neg"]
+
+        for gname in needed_groups:
+            nsq[gname] = _compute_group_grad_norm_sq(gname)
+
+        self.actor_module.train()
+
+        metrics = {}
+        eps = 1e-30
+
+        for gname in needed_groups:
+            metrics[f"full_grad/norm_{gname}"] = nsq[gname] ** 0.5
+
+        def _cos_from_norms(nsq_a, nsq_b, nsq_ab, prefix):
+            norm_a = nsq_a ** 0.5
+            norm_b = nsq_b ** 0.5
+            dot_ab = (nsq_ab - nsq_a - nsq_b) / 2.0
+            cos_val = dot_ab / max(norm_a * norm_b, eps)
+            metrics[f"{prefix}/cos"] = cos_val
+            if norm_a > 1.0 and norm_b > 1.0:
+                metrics[f"{prefix}/norm_ratio"] = norm_a / norm_b
+
+        _cos_from_norms(nsq["pos"], nsq["neg"], nsq["pos_neg"], "full_grad/pos_vs_neg")
+        _cos_from_norms(nsq["high_pos"], nsq["high_neg"], nsq["high_pos_neg"], "full_grad/high_pos_vs_neg")
+        _cos_from_norms(nsq["low_pos"], nsq["low_neg"], nsq["low_pos_neg"], "full_grad/low_pos_vs_neg")
+
+        nsq_high_mixed = nsq["high_pos_neg"]
+        nsq_low_mixed = nsq["low_pos_neg"]
+        _cos_from_norms(nsq_high_mixed, nsq_low_mixed, nsq["pos_neg"], "full_grad/high_mixed_vs_low_mixed")
+
+        norm_total_sq = nsq["pos_neg"]
+        norm_total = norm_total_sq ** 0.5
+
+        metrics["full_grad/n_groups"] = len(needed_groups)
+        metrics["full_grad/n_responses"] = len(indices)
+
+        return metrics
 
     def _update_policy_signal_fraction(self, data: DataProto, temperature: float, pad_token_id: int) -> dict:
         """Signal-fraction adaptive LR: two backward passes on A1/A2 halves.
@@ -810,6 +1676,7 @@ class DataParallelPPOActor(BasePPOActor):
         # Optimizer step  θ_t → θ_{t+1}
         # ================================================================== #
         grad_norm_pre_clip, grad_norm_post_clip = self._optimizer_step()
+        adam_diag = self._compute_adam_diagnostics()
 
         # ================================================================== #
         # Calibration continued: forward on C at θ_{t+1}, compute φ_t
@@ -844,6 +1711,7 @@ class DataParallelPPOActor(BasePPOActor):
         }
         if sched is not None:
             metrics.update(sched.get_signal_fraction_metrics())
+        metrics.update(adam_diag)
 
         return reduce_metrics(metrics)
 
@@ -890,9 +1758,30 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
+        # Positive/negative advantage gradient decomposition diagnostic
+        decomp_metrics = {}
+        if self.config.get("calculate_pos_neg_grad_decomp", False) and not self.use_fused_kernels:
+            decomp_freq = self.config.get("pos_neg_grad_decomp_freq", 5)
+            decomp_step = data.meta_info.get("global_step", 0)
+            if decomp_step % decomp_freq == 0:
+                decomp_metrics = self.compute_pos_neg_grad_decomposition(
+                    data,
+                    max_responses=self.config.get("pos_neg_grad_decomp_max_responses", 64),
+                )
+
+            full_grad_freq = self.config.get("full_model_grad_decomp_freq", 0)
+            if full_grad_freq > 0 and decomp_step % full_grad_freq == 0:
+                full_metrics = self.compute_full_model_grad_decomposition(
+                    data,
+                    max_responses=self.config.get("pos_neg_grad_decomp_max_responses", 64),
+                )
+                decomp_metrics.update(full_metrics)
+
         # Signal-fraction scheduler: redirect to dedicated implementation
         if self.config.optim.get("lr_scheduler_type", "constant") == "signal_fraction":
-            return self._update_policy_signal_fraction(data, temperature=temperature, pad_token_id=pad_token_id)
+            sf_result = self._update_policy_signal_fraction(data, temperature=temperature, pad_token_id=pad_token_id)
+            sf_result.update(decomp_metrics)
+            return sf_result
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -1097,6 +1986,8 @@ class DataParallelPPOActor(BasePPOActor):
                     "actor/grad_norm_pre_clip": grad_norm_pre_clip.detach().item(),
                     "actor/grad_norm_post_clip": grad_norm_post_clip.detach().item(),
                 }
+                adam_diag = self._compute_adam_diagnostics()
+                mini_batch_metrics.update(adam_diag)
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         # Convert entropy_var_weight accumulator to mean; drop count key.
@@ -1110,4 +2001,5 @@ class DataParallelPPOActor(BasePPOActor):
         # lengths → np.mean fails in the trainer's reduce_metrics call. Pre-reducing
         # here ensures each worker returns scalars, making the cross-worker aggregation
         # consistent regardless of micro-batch count differences.
+        metrics.update(decomp_metrics)
         return reduce_metrics(metrics)

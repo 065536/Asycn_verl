@@ -562,6 +562,90 @@ def compute_variance_decomposition_metrics(
         )
         metrics["noise_decomp/success_rate_bin_1"] = float((prompt_success_arr == 1.0).mean())
 
+        # ── Type 1: Group composition — advantage sign ──
+        eps_adv = 1e-8
+        pos_mask_resp = adv_scalar > eps_adv
+        neg_mask_resp = adv_scalar < -eps_adv
+        n_pos = int(pos_mask_resp.sum().item())
+        n_neg = int(neg_mask_resp.sum().item())
+        n_total = int(bsz)
+        adv_pos = adv_scalar[pos_mask_resp]
+        adv_neg = adv_scalar[neg_mask_resp]
+
+        metrics["group_comp/num_pos"] = float(n_pos)
+        metrics["group_comp/num_neg"] = float(n_neg)
+        metrics["group_comp/frac_pos"] = float(n_pos) / max(n_total, 1)
+        metrics["group_comp/frac_neg"] = float(n_neg) / max(n_total, 1)
+        if n_pos > 0:
+            metrics["group_comp/mean_A_pos"] = float(adv_pos.mean().item())
+            metrics["group_comp/mean_abs_A_pos"] = float(adv_pos.abs().mean().item())
+            metrics["group_comp/sum_A_pos"] = float(adv_pos.sum().item())
+            metrics["group_comp/sum_abs_A_pos"] = float(adv_pos.abs().sum().item())
+            metrics["group_comp/sum_A2_pos"] = float((adv_pos ** 2).sum().item())
+        if n_neg > 0:
+            metrics["group_comp/mean_A_neg"] = float(adv_neg.mean().item())
+            metrics["group_comp/mean_abs_A_neg"] = float(adv_neg.abs().mean().item())
+            metrics["group_comp/sum_A_neg"] = float(adv_neg.sum().item())
+            metrics["group_comp/sum_abs_A_neg"] = float(adv_neg.abs().sum().item())
+            metrics["group_comp/sum_A2_neg"] = float((adv_neg ** 2).sum().item())
+
+        # ── Type 2: Group composition — prompt success rate (0.5 boundary) ──
+        is_all_wrong = prompt_success_arr == 0.0
+        is_all_correct = prompt_success_arr == 1.0
+        is_low_mixed = (prompt_success_arr > 0.0) & (prompt_success_arr < 0.5)
+        is_high_mixed = (prompt_success_arr >= 0.5) & (prompt_success_arr < 1.0)
+
+        n_aw = int(is_all_wrong.sum())
+        n_lm = int(is_low_mixed.sum())
+        n_hm = int(is_high_mixed.sum())
+        n_ac = int(is_all_correct.sum())
+
+        metrics["group_comp/num_prompts_all_wrong"] = float(n_aw)
+        metrics["group_comp/num_prompts_low_mixed"] = float(n_lm)
+        metrics["group_comp/num_prompts_high_mixed"] = float(n_hm)
+        metrics["group_comp/num_prompts_all_correct"] = float(n_ac)
+        metrics["group_comp/num_rollouts_all_wrong"] = float(n_aw * K)
+        metrics["group_comp/num_rollouts_low_mixed"] = float(n_lm * K)
+        metrics["group_comp/num_rollouts_high_mixed"] = float(n_hm * K)
+        metrics["group_comp/num_rollouts_all_correct"] = float(n_ac * K)
+
+        adv_sq_per_resp = adv_scalar ** 2
+        for bucket_name, bucket_mask in [("low_mixed", is_low_mixed), ("high_mixed", is_high_mixed)]:
+            bucket_indices = []
+            for idx, (uid, indices) in enumerate(uid_to_indices.items()):
+                if bucket_mask[idx]:
+                    bucket_indices.extend(indices)
+            if bucket_indices:
+                bucket_idx_t = torch.tensor(bucket_indices, device=adv_scalar.device)
+                a2_bucket = adv_sq_per_resp[bucket_idx_t]
+                metrics[f"group_comp/mean_A2_{bucket_name}"] = float(a2_bucket.mean().item())
+                metrics[f"group_comp/sum_A2_{bucket_name}"] = float(a2_bucket.sum().item())
+
+        # ── Type 1b: sign × success rate composition (4 atomic groups) ──
+        for bucket_name, bucket_mask in [("low", is_low_mixed), ("high", is_high_mixed)]:
+            bucket_indices = []
+            for idx, (uid, indices) in enumerate(uid_to_indices.items()):
+                if bucket_mask[idx]:
+                    bucket_indices.extend(indices)
+            if not bucket_indices:
+                continue
+            bucket_idx_t = torch.tensor(bucket_indices, device=adv_scalar.device)
+            adv_bucket = adv_scalar[bucket_idx_t]
+            resp_mask_bucket = response_mask[bucket_idx_t]
+            tok_per_resp = resp_mask_bucket.sum(dim=-1)
+
+            for sign_name, sign_mask_val in [("pos", adv_bucket > eps_adv), ("neg", adv_bucket < -eps_adv)]:
+                group_name = f"{bucket_name}_{sign_name}"
+                n_group = int(sign_mask_val.sum().item())
+                metrics[f"group_comp/num_{group_name}"] = float(n_group)
+                metrics[f"group_comp/frac_{group_name}"] = float(n_group) / max(n_total, 1)
+                if n_group > 0:
+                    adv_group = adv_bucket[sign_mask_val]
+                    tok_group = tok_per_resp[sign_mask_val]
+                    metrics[f"group_comp/token_count_{group_name}"] = float(tok_group.sum().item())
+                    metrics[f"group_comp/sum_A_{group_name}"] = float(adv_group.sum().item())
+                    metrics[f"group_comp/sum_A2_{group_name}"] = float((adv_group ** 2).sum().item())
+
         # ── Advantage-based between/within (unconditional, runs without score energy) ──
         if n_prompts > 1:
             prompt_adv_means = []
@@ -599,6 +683,52 @@ def compute_variance_decomposition_metrics(
             a_sq_all = adv_scalar ** 2
             q_all = q_response
             h_all = a_sq_all * q_all
+
+            # ── H pos/neg split (denominator pressure diagnostics) ──
+            pos_mask = adv_scalar > 0
+            neg_mask = adv_scalar < 0
+            n_pos = int(pos_mask.sum().item())
+            n_neg = int(neg_mask.sum().item())
+            h_total_sum = float(h_all.sum().item())
+
+            metrics["grpo/n_pos_responses"] = float(n_pos)
+            metrics["grpo/n_neg_responses"] = float(n_neg)
+
+            if h_total_sum > 1e-12:
+                metrics["grpo/H_pos_frac"] = float(h_all[pos_mask].sum().item()) / h_total_sum if n_pos > 0 else 0.0
+                metrics["grpo/H_neg_frac"] = float(h_all[neg_mask].sum().item()) / h_total_sum if n_neg > 0 else 0.0
+            if n_pos > 0:
+                metrics["grpo/H_pos_mean"] = float(h_all[pos_mask].mean().item())
+            if n_neg > 0:
+                metrics["grpo/H_neg_mean"] = float(h_all[neg_mask].mean().item())
+
+            # Mixed-prompt H split: only prompts with 0 < success_rate < 1
+            mixed_pos_h = []
+            mixed_neg_h = []
+            n_mixed_prompts = 0
+            for uid, indices in uid_to_indices.items():
+                indices_t = torch.tensor(indices, device=adv_scalar.device)
+                advs_g = adv_scalar[indices_t]
+                has_pos = (advs_g > 0).any().item()
+                has_neg = (advs_g < 0).any().item()
+                if has_pos and has_neg:
+                    n_mixed_prompts += 1
+                    h_g = h_all[indices_t]
+                    mixed_pos_h.append(h_g[advs_g > 0])
+                    mixed_neg_h.append(h_g[advs_g < 0])
+
+            metrics["grpo/n_mixed_prompts"] = float(n_mixed_prompts)
+            metrics["grpo/frac_mixed_prompts"] = float(n_mixed_prompts) / n_prompts if n_prompts > 0 else 0.0
+            if mixed_pos_h:
+                cat_pos = torch.cat(mixed_pos_h)
+                cat_neg = torch.cat(mixed_neg_h)
+                metrics["grpo/H_pos_mixed"] = float(cat_pos.mean().item())
+                metrics["grpo/H_neg_mixed"] = float(cat_neg.mean().item())
+                metrics["grpo/H_pos_mixed_sum"] = float(cat_pos.sum().item())
+                metrics["grpo/H_neg_mixed_sum"] = float(cat_neg.sum().item())
+                mixed_total = float(cat_pos.sum().item()) + float(cat_neg.sum().item())
+                if mixed_total > 1e-12:
+                    metrics["grpo/H_neg_mixed_frac"] = float(cat_neg.sum().item()) / mixed_total
 
             a2q_all_t = torch.tensor(
                 [v for pm in prompt_mean_a2q for v in [pm]], dtype=torch.float64
@@ -717,6 +847,68 @@ def compute_variance_decomposition_metrics(
                 metrics["noise_decomp/cfact_frac_a_only"] = var_h_a_only / h_var_v
                 metrics["noise_decomp/cfact_frac_q_only"] = var_h_q_only / h_var_v
                 metrics["noise_decomp/cfact_frac_interaction"] = var_interaction / h_var_v
+
+            # ── Exact lm_head gradient norm metrics (replaces A²Q proxy) ──
+            has_exact_grad = "lm_head_grad_norm_sq" in batch.batch
+            if has_exact_grad:
+                grad_norm_sq = batch.batch["lm_head_grad_norm_sq"].double()
+                sampled_mask = grad_norm_sq >= 0
+                n_sampled = int(sampled_mask.sum().item())
+                metrics["noise_decomp/exact_grad/n_sampled"] = float(n_sampled)
+
+                if n_sampled > 0:
+                    gn_sampled = grad_norm_sq[sampled_mask]
+                    a2_sampled = a_sq_f64[sampled_mask]
+                    h_exact_sampled = a2_sampled * gn_sampled
+
+                    metrics["noise_decomp/exact_grad/mean_gnorm_sq"] = float(gn_sampled.mean().item())
+                    metrics["noise_decomp/exact_grad/std_gnorm_sq"] = float(gn_sampled.std(unbiased=False).item())
+                    metrics["noise_decomp/exact_grad/mean_h_exact"] = float(h_exact_sampled.mean().item())
+
+                    q_sampled = q_f64[sampled_mask]
+                    q_safe = q_sampled.clamp(min=1e-12)
+                    cross_ratio = gn_sampled / q_safe
+                    metrics["noise_decomp/exact_grad/cross_term_ratio_mean"] = float(cross_ratio.mean().item())
+                    metrics["noise_decomp/exact_grad/cross_term_ratio_std"] = float(cross_ratio.std(unbiased=False).item())
+
+                    corr_gn_q = float(
+                        ((gn_sampled - gn_sampled.mean()) * (q_sampled - q_sampled.mean())).mean().item()
+                        / (gn_sampled.std(unbiased=False).item() * q_sampled.std(unbiased=False).item() + eps)
+                    )
+                    metrics["noise_decomp/exact_grad/corr_gnorm_q"] = corr_gn_q
+
+                    if n_prompts > 1:
+                        prompt_means_gn = []
+                        within_vars_gn = []
+                        prompt_means_hex = []
+                        within_vars_hex = []
+                        for uid, indices in uid_to_indices.items():
+                            idx_t = torch.tensor(indices, device=grad_norm_sq.device)
+                            mask_g = sampled_mask[idx_t]
+                            if mask_g.sum() == 0:
+                                continue
+                            gn_grp = grad_norm_sq[idx_t][mask_g]
+                            hex_grp = (a_sq_f64[idx_t][mask_g]) * gn_grp
+                            prompt_means_gn.append(gn_grp.mean().item())
+                            prompt_means_hex.append(hex_grp.mean().item())
+                            if mask_g.sum() > 1:
+                                within_vars_gn.append(gn_grp.var(unbiased=False).item())
+                                within_vars_hex.append(hex_grp.var(unbiased=False).item())
+
+                        for suffix, pm_list, wv_list in [
+                            ("gnorm", prompt_means_gn, within_vars_gn),
+                            ("h_exact", prompt_means_hex, within_vars_hex),
+                        ]:
+                            if len(pm_list) > 1:
+                                btwn = float(np.var(pm_list))
+                                wthn = float(np.mean(wv_list)) if wv_list else 0.0
+                                total_v = btwn + wthn
+                                pfx = f"noise_decomp/exact_grad/{suffix}"
+                                metrics[f"{pfx}/between_var"] = btwn
+                                metrics[f"{pfx}/within_var"] = wthn
+                                if total_v > 0:
+                                    metrics[f"{pfx}/between_frac"] = btwn / total_v
+                                    metrics[f"{pfx}/within_frac"] = wthn / total_v
 
             # ── Legacy a2q metrics (backward compat) ──
             if len(prompt_mean_a2q) > 1:

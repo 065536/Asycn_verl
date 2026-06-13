@@ -34,7 +34,7 @@ EXP_NAME_BASE="deepseek1.5b_sync_8gpu_diag_constant_${DIAG_TAG}"
 EXP_NAME=${EXP_NAME:-"${EXP_NAME_BASE}_seed${SEED}"}
 CKPT_PREFIX="DeepSeek1.5B-Sync-8gpu-diag-constant-${DIAG_TAG}-seed${SEED}"
 
-RESUME_MODE=${RESUME_MODE:-"disable"}
+RESUME_MODE=${RESUME_MODE:-"auto"}
 RESUME_FROM_PATH=${RESUME_FROM_PATH:-""}
 USER_CKPTS_DIR=${CKPTS_DIR:-""}
 MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-2}
@@ -78,13 +78,22 @@ export MODEL_PATH="$MODEL_PATH"
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_USE_V1=1
 
+export NCCL_IB_TIMEOUT=22
+export NCCL_IB_RETRY_CNT=13
+export NCCL_IB_AR_THRESHOLD=0
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_DEBUG=WARN
+
+export SWANLAB_API_KEY=HriKVFllq5QQaTxswilZo
+export SWANLAB_MODE=cloud
+
 export NNODES=1
 export NGPUS_PER_NODE=8
 export CKPTS_DIR="$CKPTS_DIR"
 
 IS_HEAD=0
 NODE_RANK_CAND="${SENSECORE_PYTORCH_NODE_RANK:-${NODE_RANK:-}}"
-if [ "${NODE_RANK_CAND:-}" = "0" ] || [ "${RANK:-}" = "0" ]; then IS_HEAD=1; fi
+if [ "${NODE_RANK_CAND:-}" = "0" ] || [ "${RANK:-}" = "0" ] || [ -z "${NODE_RANK_CAND:-}" -a -z "${RANK:-}" ]; then IS_HEAD=1; fi
 echo "HEAD_IP=$HEAD_IP IS_HEAD=$IS_HEAD DIAG_LR=$DIAG_LR DIAG_TAG=$DIAG_TAG SEED=$SEED"
 
 RAY=/data/250010176/yrh/miniconda3/envs/verl2/bin/ray
@@ -145,7 +154,13 @@ if [ "$IS_HEAD" = "1" ]; then
     ++actor_rollout_ref.actor.optim.signal_fraction_r_min=0.01 \
     ++actor_rollout_ref.actor.optim.signal_fraction_calib_frac=0.0 \
     ++actor_rollout_ref.actor.optim.signal_fraction_sign_gate_gamma=1.0 \
-    ++actor_rollout_ref.actor.calculate_sum_pi_squared=True \
+    ++actor_rollout_ref.actor.calculate_lm_head_grad_norm=true \
+    ++actor_rollout_ref.actor.lm_head_grad_norm_freq=5 \
+    ++actor_rollout_ref.actor.lm_head_grad_norm_max_responses=64 \
+    ++actor_rollout_ref.actor.calculate_pos_neg_grad_decomp=true \
+    ++actor_rollout_ref.actor.pos_neg_grad_decomp_freq=5 \
+    ++actor_rollout_ref.actor.pos_neg_grad_decomp_max_responses=64 \
+    ++actor_rollout_ref.actor.full_model_grad_decomp_freq=50 \
     ++actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     ++actor_rollout_ref.actor.ppo_micro_batch_size=null \
     ++actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null \
@@ -187,7 +202,7 @@ if [ "$IS_HEAD" = "1" ]; then
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
     trainer.test_freq=10 \
-    trainer.save_freq=50 \
+    trainer.save_freq=10 \
     trainer.total_epochs=10 \
     trainer.total_training_steps=300 \
     trainer.default_local_dir="${CKPTS_DIR}" \
@@ -196,6 +211,7 @@ if [ "$IS_HEAD" = "1" ]; then
     trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP} \
     trainer.max_critic_ckpt_to_keep=${MAX_CRITIC_CKPT_TO_KEEP} \
     trainer.log_val_generations=10 \
+    ${EXTRA_HYDRA:-} \
     2>&1 | tee -a "$LOG_FILE"
 
   echo "Diagnostic run completed: DIAG_LR=$DIAG_LR DIAG_TAG=$DIAG_TAG"

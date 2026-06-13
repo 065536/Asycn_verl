@@ -618,3 +618,10 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    a2q_reweight_enabled: bool = False
+    a2q_reweight_mode: str = "hierarchical"
+    a2q_reweight_percentile_r: float = 95.0
+    a2q_reweight_percentile_p: float = 90.0
+    a2q_reweight_ema_beta: float = 0.9
+    a2q_reweight_warmup_steps: int = 10
+    a2q_reweight_normalize: bool = True
